@@ -7,59 +7,65 @@ on:
 
 jobs:
   build-and-deploy:
-    runs-on: ubuntu-22.04  # Use Ubuntu 22.04 instead of latest
+    runs-on: ubuntu-latest
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Set up Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: stable
-
-      - name: Cache cargo registry
-        uses: actions/cache@v4
-        with:
-          path: ~/.cargo/registry
-          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-registry-
-
-      - name: Cache cargo index
-        uses: actions/cache@v4
-        with:
-          path: ~/.cargo/git
-          key: ${{ runner.os }}-cargo-git-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-git-
-
-      - name: Cache target directory
-        uses: actions/cache@v4
-        with:
-          path: target
-          key: ${{ runner.os }}-target-release-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-target-release-
-
-      - name: Install dependencies
+      - name: Build in Docker (Ubuntu 22.04 - matches VPS)
+        env:
+          SQLX_OFFLINE: true
         run: |
-          sudo apt-get update
-          sudo apt-get install -y pkg-config libssl-dev
-
-      - name: Build Rust application for Ubuntu
-        run: |
-          # Build for Linux (Ubuntu) - native build, no cross-compilation needed
-          cargo build --release --verbose
-          # Check if binary exists and show directory contents
-          echo "Checking binary in target/release/:"
-          ls -la target/release/
-          # Strip the binary to reduce size
-          strip target/release/apex || echo "Strip failed, continuing..."
-          # Make the binary executable
-          chmod +x target/release/apex
-          # Verify binary size
-          ls -lh target/release/apex
+          # Create a Dockerfile for building
+          cat > Dockerfile.build << 'EOF'
+          FROM ubuntu:22.04
+          
+          # Prevent interactive prompts
+          ENV DEBIAN_FRONTEND=noninteractive
+          
+          # Install build dependencies
+          RUN apt-get update && apt-get install -y \
+              curl \
+              build-essential \
+              pkg-config \
+              libssl-dev \
+              ca-certificates \
+              && rm -rf /var/lib/apt/lists/*
+          
+          # Install Rust
+          RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+          ENV PATH="/root/.cargo/bin:${PATH}"
+          
+          WORKDIR /app
+          
+          # Copy the project files
+          COPY . .
+          
+          # Build the project
+          RUN cargo build --release --verbose
+          
+          # Strip the binary
+          RUN strip target/release/apex-rust || true
+          
+          # List the result
+          RUN ls -lh target/release/apex-rust
+          EOF
+          
+          # Build the Docker image (this compiles the Rust code)
+          docker build -t apex-rust-builder -f Dockerfile.build .
+          
+          # Extract the binary from the Docker image
+          docker create --name temp-container apex-rust-builder
+          docker cp temp-container:/app/target/release/apex-rust ./apex-rust
+          docker rm temp-container
+          
+          # Verify binary was extracted
+          ls -la apex-rust
+          file apex-rust
+          
+          # Make executable
+          chmod +x apex-rust
 
       - name: Prepare deployment package
         run: |
@@ -67,7 +73,7 @@ jobs:
           mkdir -p deployment
 
           # Copy the binary
-          cp target/release/apex deployment/
+          cp apex-rust deployment/
 
           # Copy migrations if they exist
           cp -r migrations deployment/ || true
@@ -114,12 +120,12 @@ jobs:
           sudo systemctl stop ${SERVICE_NAME} || true
 
           # Backup existing binary
-          if [ -f ${DEPLOY_DIR}/apex ]; then
+          if [ -f ${DEPLOY_DIR}/apex-rust ]; then
             echo "Backing up existing binary..."
             TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-            sudo cp ${DEPLOY_DIR}/apex ${BACKUP_DIR}/apex.${TIMESTAMP}
+            sudo cp ${DEPLOY_DIR}/apex-rust ${BACKUP_DIR}/apex-rust.${TIMESTAMP}
             # Keep only last 5 backups
-            sudo ls -t ${BACKUP_DIR}/apex.* | tail -n +6 | xargs -r sudo rm
+            sudo ls -t ${BACKUP_DIR}/apex-rust.* | tail -n +6 | xargs -r sudo rm
           fi
 
           # Extract new files
@@ -132,10 +138,10 @@ jobs:
           ls -la ${DEPLOY_DIR}/
 
           # Make sure binary is executable
-          sudo chmod +x ${DEPLOY_DIR}/apex
+          sudo chmod +x ${DEPLOY_DIR}/apex-rust
 
-          # Set ownership (adjust user/group as needed)
-          sudo chown -R www-data:www-data ${DEPLOY_DIR}
+          # Set ownership
+          sudo chown -R root:root ${DEPLOY_DIR}
 
           # Keep .env file if it exists (don't overwrite with .env.example)
           if [ ! -f ${DEPLOY_DIR}/.env ] && [ -f ${DEPLOY_DIR}/.env.example ]; then
@@ -190,8 +196,8 @@ jobs:
           echo "Waiting for service to be ready..."
           sleep 5
           
-          # Try health check
-          ssh -i ~/.ssh/deploy_key -P ${{ secrets.SSH_PORT }} ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} "curl -f http://localhost:8080/health || echo 'Health check endpoint not available'"
+          # Try health check via HTTPS
+          ssh -i ~/.ssh/deploy_key -P ${{ secrets.SSH_PORT }} ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} "curl -k -f https://localhost:3002/health || echo 'Health check endpoint not available'"
 
       - name: Verify deployment
         run: |
