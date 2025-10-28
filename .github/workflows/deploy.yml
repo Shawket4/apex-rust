@@ -7,7 +7,7 @@ on:
 
 jobs:
   build-and-deploy:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04  # Use Ubuntu 22.04 instead of latest
 
     steps:
       - name: Checkout code
@@ -55,11 +55,11 @@ jobs:
           echo "Checking binary in target/release/:"
           ls -la target/release/
           # Strip the binary to reduce size
-          strip target/release/apex-rust || echo "Strip failed, continuing..."
+          strip target/release/apex || echo "Strip failed, continuing..."
           # Make the binary executable
-          chmod +x target/release/apex-rust
+          chmod +x target/release/apex
           # Verify binary size
-          ls -lh target/release/apex-rust
+          ls -lh target/release/apex
 
       - name: Prepare deployment package
         run: |
@@ -67,7 +67,7 @@ jobs:
           mkdir -p deployment
 
           # Copy the binary
-          cp target/release/apex-rust deployment/
+          cp target/release/apex deployment/
 
           # Copy migrations if they exist
           cp -r migrations deployment/ || true
@@ -114,12 +114,12 @@ jobs:
           sudo systemctl stop ${SERVICE_NAME} || true
 
           # Backup existing binary
-          if [ -f ${DEPLOY_DIR}/apex-rust ]; then
+          if [ -f ${DEPLOY_DIR}/apex ]; then
             echo "Backing up existing binary..."
             TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-            sudo cp ${DEPLOY_DIR}/apex-rust ${BACKUP_DIR}/apex-rust.${TIMESTAMP}
+            sudo cp ${DEPLOY_DIR}/apex ${BACKUP_DIR}/apex.${TIMESTAMP}
             # Keep only last 5 backups
-            sudo ls -t ${BACKUP_DIR}/apex-rust.* | tail -n +6 | xargs -r sudo rm
+            sudo ls -t ${BACKUP_DIR}/apex.* | tail -n +6 | xargs -r sudo rm
           fi
 
           # Extract new files
@@ -132,7 +132,7 @@ jobs:
           ls -la ${DEPLOY_DIR}/
 
           # Make sure binary is executable
-          sudo chmod +x ${DEPLOY_DIR}/apex-rust
+          sudo chmod +x ${DEPLOY_DIR}/apex
 
           # Set ownership (adjust user/group as needed)
           sudo chown -R www-data:www-data ${DEPLOY_DIR}
