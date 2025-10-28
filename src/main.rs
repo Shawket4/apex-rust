@@ -4,24 +4,31 @@ mod models;
 mod handlers;
 mod db;
 mod utils;
+
 use std::env;
 use actix_web::{web, App, HttpServer, middleware};
 use openssl::ssl::{SslAcceptor, SslFiletype, SslMethod};
 use actix_cors::Cors;
 use sqlx::postgres::PgPoolOptions;
 use log::info;
-
 use crate::config::CONFIG;
 use crate::auth::JwtAuth;
 use crate::handlers::*;
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
-    // Load environment variables
-    dotenv::dotenv().ok();
+    env_logger::init();
     
-    let host = env::var("SERVER_HOST").unwrap_or_else(|_| "0.0.0.0".to_string());
-    let port = env::var("SERVER_PORT").unwrap_or_else(|_| "3002".to_string());
+    info!("Starting Trip Statistics Rust Microservice");
+    info!("Connecting to database...");
+    
+    let pool = PgPoolOptions::new()
+        .max_connections(10)
+        .connect(&CONFIG.database_url)
+        .await
+        .expect("Failed to connect to database");
+    
+    info!("Database connected successfully");
     
     // SSL certificate paths
     let ssl_cert = env::var("SSL_CERT_PATH")
@@ -33,19 +40,27 @@ async fn main() -> std::io::Result<()> {
     let cors_origins = env::var("CORS_ALLOWED_ORIGINS")
         .unwrap_or_else(|_| "https://apextransport.ddns.net".to_string());
     
-    println!("🚀 Starting HTTPS server at {}:{}", host, port);
-    println!("🔒 Using SSL cert: {}", ssl_cert);
-    println!("🌐 CORS origins: {}", cors_origins);
-
+    let server_addr = format!("{}:{}", CONFIG.server_host, CONFIG.server_port);
+    
+    info!("Starting HTTPS server on https://{}", server_addr);
+    info!("Using SSL cert: {}", ssl_cert);
+    info!("Using SSL key: {}", ssl_key);
+    info!("CORS origins: {}", cors_origins);
+    
     // Configure SSL
-    let mut builder = SslAcceptor::mozilla_intermediate(SslMethod::tls()).unwrap();
+    let mut builder = SslAcceptor::mozilla_intermediate(SslMethod::tls())
+        .expect("Failed to create SSL acceptor");
+    
     builder
         .set_private_key_file(&ssl_key, SslFiletype::PEM)
-        .unwrap();
-    builder.set_certificate_chain_file(&ssl_cert).unwrap();
-
+        .expect("Failed to set private key");
+    
+    builder
+        .set_certificate_chain_file(&ssl_cert)
+        .expect("Failed to set certificate chain");
+    
     HttpServer::new(move || {
-        // Configure CORS
+        // Configure CORS with specific origins
         let mut cors = Cors::default()
             .allowed_methods(vec!["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"])
             .allowed_headers(vec![
@@ -55,7 +70,7 @@ async fn main() -> std::io::Result<()> {
             ])
             .supports_credentials()
             .max_age(3600);
-
+        
         // Add allowed origins from environment variable
         for origin in cors_origins.split(',') {
             let origin = origin.trim();
@@ -63,13 +78,13 @@ async fn main() -> std::io::Result<()> {
                 cors = cors.allowed_origin(origin);
             }
         }
-
+        
         App::new()
+            .app_data(web::Data::new(pool.clone()))
             .wrap(cors)
             .wrap(middleware::Logger::default())
             .wrap(middleware::Compress::default())
-            // Your routes here
-            .route("/health", web::get().to(|| async { "OK" }))
+            .route("/health", web::get().to(health_check))
             .service(
                 web::scope("/api/v1")
                     .route(
@@ -77,10 +92,11 @@ async fn main() -> std::io::Result<()> {
                         web::get()
                             .to(get_trip_statistics)
                             .wrap(JwtAuth { required_permission: Some(3) })
-            )
+                    )
             )
     })
-    .bind_openssl(format!("{}:{}", host, port), builder)?
+    .workers(CONFIG.workers)
+    .bind_openssl(&server_addr, builder)?
     .run()
     .await
 }
