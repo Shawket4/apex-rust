@@ -2,7 +2,9 @@
 name = "apex"
 version = "0.1.0"
 edition = "2021"
-
+[[bin]]
+name = "apex-rust"
+path = "src/main.rs"
 [dependencies]
 # Web framework
 actix-web = "4.4"
