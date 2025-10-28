@@ -8,8 +8,8 @@ async fn main() -> std::io::Result<()> {
     // Load environment variables
     dotenv::dotenv().ok();
     
-    let host = env::var("SERVER_PORT").unwrap_or_else(|_| "0.0.0.0".to_string());
-    let port = env::var("SERVER_HOST").unwrap_or_else(|_| "3002".to_string());
+    let host = env::var("SERVER_HOST").unwrap_or_else(|_| "0.0.0.0".to_string());
+    let port = env::var("SERVER_PORT").unwrap_or_else(|_| "3002".to_string());
     
     // SSL certificate paths
     let ssl_cert = env::var("SSL_CERT_PATH")
