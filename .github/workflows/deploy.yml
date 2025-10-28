@@ -17,7 +17,6 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: stable
-          targets: x86_64-unknown-linux-gnu
 
       - name: Cache cargo registry
         uses: actions/cache@v4
@@ -46,16 +45,21 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y pkg-config libssl-dev musl-tools
+          sudo apt-get install -y pkg-config libssl-dev
 
       - name: Build Rust application for Ubuntu
         run: |
-          # Build for Linux (Ubuntu)
-          cargo build --release --target x86_64-unknown-linux-gnu
+          # Build for Linux (Ubuntu) - native build, no cross-compilation needed
+          cargo build --release --verbose
+          # Check if binary exists and show directory contents
+          echo "Checking binary in target/release/:"
+          ls -la target/release/
           # Strip the binary to reduce size
-          strip target/x86_64-unknown-linux-gnu/release/apex-rust
+          strip target/release/apex-rust || echo "Strip failed, continuing..."
           # Make the binary executable
-          chmod +x target/x86_64-unknown-linux-gnu/release/apex-rust
+          chmod +x target/release/apex-rust
+          # Verify binary size
+          ls -lh target/release/apex-rust
 
       - name: Prepare deployment package
         run: |
@@ -63,7 +67,7 @@ jobs:
           mkdir -p deployment
 
           # Copy the binary
-          cp target/x86_64-unknown-linux-gnu/release/apex-rust deployment/
+          cp target/release/apex-rust deployment/
 
           # Copy migrations if they exist
           cp -r migrations deployment/ || true
@@ -73,6 +77,10 @@ jobs:
 
           # Create a tarball for easier transfer
           tar -czf deployment.tar.gz -C deployment .
+          
+          # Show what's in the deployment package
+          echo "Deployment package contents:"
+          tar -tzf deployment.tar.gz
 
       - name: Setup SSH
         run: |
@@ -118,6 +126,10 @@ jobs:
           echo "Extracting new files..."
           cd ${DEPLOY_DIR}
           sudo tar -xzf /tmp/deployment.tar.gz
+
+          # List what was extracted
+          echo "Files in deployment directory:"
+          ls -la ${DEPLOY_DIR}/
 
           # Make sure binary is executable
           sudo chmod +x ${DEPLOY_DIR}/apex-rust
