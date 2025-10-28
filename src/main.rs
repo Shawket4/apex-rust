@@ -1,7 +1,19 @@
-use actix_web::{web, App, HttpServer, middleware};
-use actix_cors::Cors;
-use openssl::ssl::{SslAcceptor, SslFiletype, SslMethod};
+mod config;
+mod auth;
+mod models;
+mod handlers;
+mod db;
+mod utils;
 use std::env;
+use actix_web::{web, App, HttpServer, middleware};
+use openssl::ssl::{SslAcceptor, SslFiletype, SslMethod};
+use actix_cors::Cors;
+use sqlx::postgres::PgPoolOptions;
+use log::info;
+
+use crate::config::CONFIG;
+use crate::auth::JwtAuth;
+use crate::handlers::*;
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
@@ -59,8 +71,13 @@ async fn main() -> std::io::Result<()> {
             // Your routes here
             .route("/health", web::get().to(|| async { "OK" }))
             .service(
-                web::scope("/api")
-                    // Add your routes
+                web::scope("/api/v1")
+                    .route(
+                        "/trip-statistics",
+                        web::get()
+                            .to(get_trip_statistics)
+                            .wrap(JwtAuth { required_permission: Some(3) })
+            )
             )
     })
     .bind_openssl(format!("{}:{}", host, port), builder)?
