@@ -53,9 +53,9 @@ jobs:
           # Build for Linux (Ubuntu)
           cargo build --release --target x86_64-unknown-linux-gnu
           # Strip the binary to reduce size
-          strip target/x86_64-unknown-linux-gnu/release/trip-stats-rust
+          strip target/x86_64-unknown-linux-gnu/release/apex-rust
           # Make the binary executable
-          chmod +x target/x86_64-unknown-linux-gnu/release/trip-stats-rust
+          chmod +x target/x86_64-unknown-linux-gnu/release/apex-rust
 
       - name: Prepare deployment package
         run: |
@@ -63,7 +63,7 @@ jobs:
           mkdir -p deployment
 
           # Copy the binary
-          cp target/x86_64-unknown-linux-gnu/release/trip-stats-rust deployment/
+          cp target/x86_64-unknown-linux-gnu/release/apex-rust deployment/
 
           # Copy migrations if they exist
           cp -r migrations deployment/ || true
@@ -106,12 +106,12 @@ jobs:
           sudo systemctl stop ${SERVICE_NAME} || true
 
           # Backup existing binary
-          if [ -f ${DEPLOY_DIR}/trip-stats-rust ]; then
+          if [ -f ${DEPLOY_DIR}/apex-rust ]; then
             echo "Backing up existing binary..."
             TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-            sudo cp ${DEPLOY_DIR}/trip-stats-rust ${BACKUP_DIR}/trip-stats-rust.${TIMESTAMP}
+            sudo cp ${DEPLOY_DIR}/apex-rust ${BACKUP_DIR}/apex-rust.${TIMESTAMP}
             # Keep only last 5 backups
-            sudo ls -t ${BACKUP_DIR}/trip-stats-rust.* | tail -n +6 | xargs -r sudo rm
+            sudo ls -t ${BACKUP_DIR}/apex-rust.* | tail -n +6 | xargs -r sudo rm
           fi
 
           # Extract new files
@@ -120,7 +120,7 @@ jobs:
           sudo tar -xzf /tmp/deployment.tar.gz
 
           # Make sure binary is executable
-          sudo chmod +x ${DEPLOY_DIR}/trip-stats-rust
+          sudo chmod +x ${DEPLOY_DIR}/apex-rust
 
           # Set ownership (adjust user/group as needed)
           sudo chown -R www-data:www-data ${DEPLOY_DIR}
