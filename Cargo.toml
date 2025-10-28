@@ -7,9 +7,9 @@ name = "apex-rust"
 path = "src/main.rs"
 [dependencies]
 # Web framework
-actix-web = "4.4"
+actix-web = { version = "4.4", features = ["openssl"] }
 actix-cors = "0.7"
-openssl = "0.10"
+openssl = { version = "0.10", features = ["vendored"] }
 
 # Async runtime
 tokio = { version = "1.35", features = ["full"] }
