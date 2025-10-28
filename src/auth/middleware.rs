@@ -1,0 +1,114 @@
+use actix_web::{
+    dev::{forward_ready, Service, ServiceRequest, ServiceResponse, Transform},
+    Error, HttpMessage,  // Remove HttpResponse, add HttpMessage
+};
+use futures_util::future::LocalBoxFuture;
+use jsonwebtoken::{decode, DecodingKey, Validation};
+use std::future::{ready, Ready};
+
+use crate::auth::claims::Claims;
+use crate::config::CONFIG;
+
+pub struct JwtAuth {
+    pub required_permission: Option<i32>,
+}
+
+impl<S, B> Transform<S, ServiceRequest> for JwtAuth
+where
+    S: Service<ServiceRequest, Response = ServiceResponse<B>, Error = Error>,
+    S::Future: 'static,
+    B: 'static,
+{
+    type Response = ServiceResponse<B>;
+    type Error = Error;
+    type InitError = ();
+    type Transform = JwtAuthMiddleware<S>;
+    type Future = Ready<Result<Self::Transform, Self::InitError>>;
+
+    fn new_transform(&self, service: S) -> Self::Future {
+        ready(Ok(JwtAuthMiddleware {
+            service,
+            required_permission: self.required_permission,
+        }))
+    }
+}
+
+pub struct JwtAuthMiddleware<S> {
+    service: S,
+    required_permission: Option<i32>,
+}
+
+impl<S, B> Service<ServiceRequest> for JwtAuthMiddleware<S>
+where
+    S: Service<ServiceRequest, Response = ServiceResponse<B>, Error = Error>,
+    S::Future: 'static,
+    B: 'static,
+{
+    type Response = ServiceResponse<B>;
+    type Error = Error;
+    type Future = LocalBoxFuture<'static, Result<Self::Response, Self::Error>>;
+
+    forward_ready!(service);
+
+    fn call(&self, req: ServiceRequest) -> Self::Future {
+        let required_perm = self.required_permission;
+        
+        let token = req
+            .cookie("jwt")
+            .map(|c| c.value().to_string())
+            .or_else(|| {
+                req.headers()
+                    .get("Authorization")
+                    .and_then(|h| h.to_str().ok())
+                    .and_then(|h| {
+                        if h.starts_with("Bearer ") {
+                            Some(h[7..].to_string())
+                        } else {
+                            None
+                        }
+                    })
+            });
+
+        if token.is_none() {
+            return Box::pin(async move {
+                Err(actix_web::error::ErrorUnauthorized("Not authenticated"))
+            });
+        }
+
+        let token = token.unwrap();
+        
+        let validation = Validation::default();
+        let token_data = decode::<Claims>(
+            &token,
+            &DecodingKey::from_secret(CONFIG.jwt_secret.as_bytes()),
+            &validation,
+        );
+
+        match token_data {
+            Ok(data) => {
+                let claims = data.claims;
+                
+                if let Some(_perm) = required_perm {
+                    if !claims.is_admin() {
+                        return Box::pin(async move {
+                            Err(actix_web::error::ErrorForbidden(
+                                "Admin access required"
+                            ))
+                        });
+                    }
+                }
+                
+                req.extensions_mut().insert(claims);
+                
+                let fut = self.service.call(req);
+                Box::pin(async move {
+                    let res = fut.await?;
+                    Ok(res)
+                })
+            }
+            Err(_) => Box::pin(async move {
+                Err(actix_web::error::ErrorUnauthorized("Invalid token"))
+            }),
+        }
+    }
+}

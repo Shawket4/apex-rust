@@ -1,0 +1,199 @@
+name: Build and Deploy Rust App
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          targets: x86_64-unknown-linux-gnu
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/registry
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-registry-
+
+      - name: Cache cargo index
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/git
+          key: ${{ runner.os }}-cargo-git-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-git-
+
+      - name: Cache target directory
+        uses: actions/cache@v4
+        with:
+          path: target
+          key: ${{ runner.os }}-target-release-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-target-release-
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libssl-dev musl-tools
+
+      - name: Build Rust application for Ubuntu
+        run: |
+          # Build for Linux (Ubuntu)
+          cargo build --release --target x86_64-unknown-linux-gnu
+          # Strip the binary to reduce size
+          strip target/x86_64-unknown-linux-gnu/release/trip-stats-rust
+          # Make the binary executable
+          chmod +x target/x86_64-unknown-linux-gnu/release/trip-stats-rust
+
+      - name: Prepare deployment package
+        run: |
+          # Create a directory for all files to deploy
+          mkdir -p deployment
+
+          # Copy the binary
+          cp target/x86_64-unknown-linux-gnu/release/trip-stats-rust deployment/
+
+          # Copy migrations if they exist
+          cp -r migrations deployment/ || true
+
+          # Copy any config files you might need
+          cp .env.example deployment/.env.example || true
+
+          # Create a tarball for easier transfer
+          tar -czf deployment.tar.gz -C deployment .
+
+      - name: Setup SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          echo "${{ secrets.SSH_KNOWN_HOSTS }}" > ~/.ssh/known_hosts
+          chmod 644 ~/.ssh/known_hosts
+
+      - name: Deploy to VPS
+        run: |
+          # Create a deployment script to run on the server
+          cat > deploy.sh << 'EOF'
+          #!/bin/bash
+          set -e
+
+          # Configuration
+          DEPLOY_DIR="/opt/apex-rust"
+          SERVICE_NAME="apex-rust"
+          BACKUP_DIR="/opt/apex-rust/backups"
+
+          echo "Starting deployment..."
+
+          # Create directories if they don't exist
+          sudo mkdir -p ${DEPLOY_DIR}
+          sudo mkdir -p ${BACKUP_DIR}
+          sudo mkdir -p ${DEPLOY_DIR}/logs
+
+          # Stop the service
+          echo "Stopping service..."
+          sudo systemctl stop ${SERVICE_NAME} || true
+
+          # Backup existing binary
+          if [ -f ${DEPLOY_DIR}/trip-stats-rust ]; then
+            echo "Backing up existing binary..."
+            TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+            sudo cp ${DEPLOY_DIR}/trip-stats-rust ${BACKUP_DIR}/trip-stats-rust.${TIMESTAMP}
+            # Keep only last 5 backups
+            sudo ls -t ${BACKUP_DIR}/trip-stats-rust.* | tail -n +6 | xargs -r sudo rm
+          fi
+
+          # Extract new files
+          echo "Extracting new files..."
+          cd ${DEPLOY_DIR}
+          sudo tar -xzf /tmp/deployment.tar.gz
+
+          # Make sure binary is executable
+          sudo chmod +x ${DEPLOY_DIR}/trip-stats-rust
+
+          # Set ownership (adjust user/group as needed)
+          sudo chown -R www-data:www-data ${DEPLOY_DIR}
+
+          # Keep .env file if it exists (don't overwrite with .env.example)
+          if [ ! -f ${DEPLOY_DIR}/.env ] && [ -f ${DEPLOY_DIR}/.env.example ]; then
+            echo "Creating .env from .env.example..."
+            sudo cp ${DEPLOY_DIR}/.env.example ${DEPLOY_DIR}/.env
+            echo "⚠️  Please configure ${DEPLOY_DIR}/.env with your settings"
+          fi
+
+          # Run migrations if they exist
+          if [ -d ${DEPLOY_DIR}/migrations ]; then
+            echo "Migrations directory found. Run manually if needed:"
+            echo "cd ${DEPLOY_DIR} && sqlx migrate run"
+          fi
+
+          # Restart service
+          echo "Restarting service..."
+          sudo systemctl daemon-reload
+          sudo systemctl enable ${SERVICE_NAME}
+          sudo systemctl restart ${SERVICE_NAME}
+
+          # Wait a moment for service to start
+          sleep 3
+
+          # Check service status
+          echo "Checking service status..."
+          if sudo systemctl is-active --quiet ${SERVICE_NAME}; then
+            echo "✅ Service is running"
+            sudo systemctl status ${SERVICE_NAME} --no-pager
+          else
+            echo "❌ Service failed to start"
+            echo "Last 20 log lines:"
+            sudo journalctl -u ${SERVICE_NAME} -n 20 --no-pager
+            exit 1
+          fi
+
+          echo "Deployment completed successfully!"
+          EOF
+
+          chmod +x deploy.sh
+
+          # Copy the deployment package to the VPS
+          echo "Uploading deployment package..."
+          scp -i ~/.ssh/deploy_key -P ${{ secrets.SSH_PORT }} deployment.tar.gz ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}:/tmp/
+
+          # Copy and execute the deployment script
+          echo "Deploying on VPS..."
+          scp -i ~/.ssh/deploy_key -P ${{ secrets.SSH_PORT }} deploy.sh ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}:/tmp/
+          ssh -i ~/.ssh/deploy_key -P ${{ secrets.SSH_PORT }} ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} "bash /tmp/deploy.sh"
+
+      - name: Health check
+        run: |
+          echo "Waiting for service to be ready..."
+          sleep 5
+          
+          # Try health check
+          ssh -i ~/.ssh/deploy_key -P ${{ secrets.SSH_PORT }} ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} "curl -f http://localhost:8080/health || echo 'Health check endpoint not available'"
+
+      - name: Verify deployment
+        run: |
+          echo "Verifying service status..."
+          ssh -i ~/.ssh/deploy_key -P ${{ secrets.SSH_PORT }} ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} "systemctl status apex-rust --no-pager" || true
+
+      - name: Show recent logs
+        if: always()
+        run: |
+          echo "Recent service logs:"
+          ssh -i ~/.ssh/deploy_key -P ${{ secrets.SSH_PORT }} ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} "sudo journalctl -u apex-rust -n 30 --no-pager" || true
+
+      - name: Cleanup
+        if: always()
+        run: |
+          rm -f ~/.ssh/deploy_key
+          echo "Cleaned up SSH keys"

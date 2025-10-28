@@ -1,0 +1,27 @@
+[Unit]
+Description=Trip Statistics Rust Microservice
+After=network.target postgresql.service
+Wants=postgresql.service
+
+[Service]
+Type=simple
+User=www-data
+Group=www-data
+WorkingDirectory=/opt/apex
+EnvironmentFile=/opt/apex/.env
+ExecStart=/opt/apex/target/release/apex
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=apex
+
+# Security
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/apex
+
+[Install]
+WantedBy=multi-user.target
