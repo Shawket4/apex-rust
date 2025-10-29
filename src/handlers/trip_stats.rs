@@ -90,7 +90,7 @@ pub async fn get_trip_statistics(
         
         let (total_revenue, total_car_rent, total_vat, total_amount) = if has_financial_access {
             let revenue: f64 = details.iter()
-                .filter_map(|d| d.total_revenue)
+                .map(|d| d.total_revenue)
                 .sum();
             let car_rent: f64 = details.iter()
                 .filter_map(|d| d.car_rental)
@@ -106,7 +106,7 @@ pub async fn get_trip_statistics(
             let final_car_rent = if car_rent == 0.0 { None } else { Some(car_rent) };
             let final_vat = if vat == 0.0 { None } else { Some(vat) };
             let final_amount = if amount == 0.0 { 
-                // If no total_with_vat in details, calculate from revenue only
+                // If no total_with_vat in details, use revenue only
                 Some(revenue)
             } else { 
                 Some(amount) 
@@ -117,6 +117,17 @@ pub async fn get_trip_statistics(
             (0.0, None, None, None)
         };
 
+        // Get route details
+        let route_details = get_route_details(
+            pool.get_ref(),
+            &company,
+            &query.start_date,
+            &query.end_date,
+            has_financial_access,
+        )
+        .await
+        .map_err(actix_web::error::ErrorInternalServerError)?;
+
         statistics.push(TripStatistics {
             company: company.clone(),
             total_trips,
@@ -126,24 +137,9 @@ pub async fn get_trip_statistics(
             total_car_rent,
             total_vat,
             total_amount,
-            details,
-            route_details: vec![], // Populated below
+            details: Some(details),
+            route_details: Some(route_details),
         });
-    }
-
-    // Populate route_details for each company
-    for stat in &mut statistics {
-        let route_details = get_route_details(
-            pool.get_ref(),
-            &stat.company,
-            &query.start_date,
-            &query.end_date,
-            has_financial_access,
-        )
-        .await
-        .map_err(actix_web::error::ErrorInternalServerError)?;
-        
-        stat.route_details = route_details;
     }
 
     // Get stats by date

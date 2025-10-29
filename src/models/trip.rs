@@ -1,18 +1,8 @@
 use serde::{Deserialize, Serialize};
-use sqlx::FromRow;
 
-#[derive(Debug, FromRow)]
-pub struct Trip {
-    pub id: i32,
-    pub company: String,
-    pub terminal: String,
-    pub drop_off_point: String,
-    pub car_no_plate: String,
-    pub driver_name: Option<String>,
-    pub date: String,
-    pub tank_capacity: i32,
-    pub parent_trip_id: Option<i32>,
-}
+// ============================================================================
+// Core Trip Statistics Models
+// ============================================================================
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct TripStatisticsDetails {
@@ -20,8 +10,7 @@ pub struct TripStatisticsDetails {
     pub total_trips: i64,
     pub total_volume: f64,
     pub total_distance: f64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub total_revenue: Option<f64>,
+    pub total_revenue: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub car_rental: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -94,11 +83,40 @@ pub struct TripStatistics {
     pub total_vat: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub total_amount: Option<f64>,
-    pub details: Vec<TripStatisticsDetails>,
-    pub route_details: Vec<RouteRevenueStats>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub details: Option<Vec<TripStatisticsDetails>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub route_details: Option<Vec<RouteRevenueStats>>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct CompanyRevenueDetails {
+    pub company: String,
+    pub total_trips: i64,
+    pub total_volume: f64,
+    pub total_distance: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_revenue: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vat: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub car_rental: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_with_vat: Option<f64>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct TripRevenueDateResponse {
+    pub date: String,
+    pub total_trips: i64,
+    pub total_volume: f64,
+    pub total_distance: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_revenue: Option<f64>,
+    pub company_details: Vec<CompanyRevenueDetails>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 pub struct CarTotal {
     pub car_no_plate: String,
     pub liters: f64,
@@ -106,4 +124,16 @@ pub struct CarTotal {
     pub base_revenue: f64,
     pub vat: f64,
     pub rent: f64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct TripStatisticsResponse {
+    pub message: String,
+    pub data: Vec<TripStatistics>,
+    #[serde(rename = "statsByDate")]
+    pub stats_by_date: Vec<TripRevenueDateResponse>,
+    #[serde(rename = "hasFinancialAccess")]
+    pub has_financial_access: bool,
+    #[serde(rename = "carTotals")]
+    pub car_totals: Vec<CarTotal>,
 }

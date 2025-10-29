@@ -2,8 +2,7 @@ use sqlx::{PgPool, Row};
 use anyhow::Result;
 use std::collections::HashMap;
 
-use crate::models::trip::*;
-use crate::models::response::*;
+use crate::models::*;
 
 pub async fn get_companies(
     pool: &PgPool,
@@ -80,10 +79,10 @@ pub async fn get_petrol_arrows_stats(
             END), 0))::bigint as total_trips,
             COALESCE(SUM(t.tank_capacity), 0.0)::float8 as total_volume,
             COALESCE(SUM(fm.distance), 0.0)::float8 as total_distance,
-            COALESCE(MAX(fm.fee), 0.0)::float8 as fee,
+            COALESCE(MAX(fm.fee::float8), 0.0)::float8 as fee,
             CASE 
-                WHEN $3 THEN COALESCE(MAX(fm.fee) * SUM(t.tank_capacity) / 1000.0, 0.0)::float8 
-                ELSE NULL 
+                WHEN $3 THEN COALESCE(MAX(fm.fee::float8) * SUM(t.tank_capacity) / 1000.0, 0.0)::float8 
+                ELSE 0.0
             END as total_revenue
         FROM trips t
         LEFT JOIN fee_mappings fm 
@@ -111,7 +110,7 @@ pub async fn get_petrol_arrows_stats(
             total_trips: row.get("total_trips"),
             total_volume: row.get("total_volume"),
             total_distance: row.get("total_distance"),
-            total_revenue: row.try_get("total_revenue").ok().flatten(),
+            total_revenue: row.get("total_revenue"),
             fee: row.try_get("fee").ok(),
             car_rental: None,
             vat: None,
@@ -203,7 +202,7 @@ pub async fn get_taqa_stats(
                         WHEN a.terminal IN ('Alex', 'Suez') THEN (a.total_distance * 40.7)::float8
                         ELSE 0.0
                     END
-                ELSE NULL 
+                ELSE 0.0
             END as base_revenue,
             CASE WHEN $3 THEN COALESCE(cr.total_car_rental, 0.0)::float8 ELSE NULL END as car_rental,
             CASE 
@@ -233,13 +232,13 @@ pub async fn get_taqa_stats(
     let details = rows
         .into_iter()
         .map(|row| {
-            let base_revenue: Option<f64> = row.try_get("base_revenue").ok().flatten();
+            let base_revenue: f64 = row.get("base_revenue");
             let car_rental: Option<f64> = row.try_get("car_rental").ok().flatten();
             let vat: Option<f64> = row.try_get("vat").ok().flatten();
             
             let total_with_vat = if has_financial_access {
                 Some(
-                    base_revenue.unwrap_or(0.0) + 
+                    base_revenue + 
                     car_rental.unwrap_or(0.0) + 
                     vat.unwrap_or(0.0)
                 )
@@ -257,9 +256,9 @@ pub async fn get_taqa_stats(
                 vat,
                 total_with_vat,
                 fee: row.try_get("fee").ok(),
-                distinct_cars: row.try_get("distinct_cars").ok(),
-                distinct_days: row.try_get("distinct_days").ok(),
-                car_days: row.try_get("car_days").ok(),
+                distinct_cars: Some(row.get("distinct_cars")),
+                distinct_days: Some(row.get("distinct_days")),
+                car_days: Some(row.get("car_days")),
             }
         })
         .collect();
@@ -325,7 +324,7 @@ pub async fn get_petromin_stats(
             a.distinct_cars,
             a.distinct_days,
             cd.total_car_days as car_days,
-            CASE WHEN $3 THEN (a.total_distance * 42.5)::float8 ELSE NULL END as base_revenue,
+            CASE WHEN $3 THEN (a.total_distance * 42.5)::float8 ELSE 0.0 END as base_revenue,
             CASE WHEN $3 THEN (cd.total_car_days * 2000.0)::float8 ELSE NULL END as car_rental,
             CASE WHEN $3 THEN ((a.total_distance * 42.5 + cd.total_car_days * 2000.0) * 0.14)::float8 ELSE NULL END as vat,
             42.5 as fee
@@ -344,13 +343,13 @@ pub async fn get_petromin_stats(
     let details = rows
         .into_iter()
         .map(|row| {
-            let base_revenue: Option<f64> = row.try_get("base_revenue").ok().flatten();
+            let base_revenue: f64 = row.get("base_revenue");
             let car_rental: Option<f64> = row.try_get("car_rental").ok().flatten();
             let vat: Option<f64> = row.try_get("vat").ok().flatten();
             
             let total_with_vat = if has_financial_access {
                 Some(
-                    base_revenue.unwrap_or(0.0) + 
+                    base_revenue + 
                     car_rental.unwrap_or(0.0) + 
                     vat.unwrap_or(0.0)
                 )
@@ -368,9 +367,9 @@ pub async fn get_petromin_stats(
                 vat,
                 total_with_vat,
                 fee: row.try_get("fee").ok(),
-                distinct_cars: row.try_get("distinct_cars").ok(),
-                distinct_days: row.try_get("distinct_days").ok(),
-                car_days: row.try_get("car_days").ok(),
+                distinct_cars: Some(row.get("distinct_cars")),
+                distinct_days: Some(row.get("distinct_days")),
+                car_days: Some(row.get("car_days")),
             }
         })
         .collect();
@@ -390,7 +389,7 @@ pub async fn get_watanya_stats(
                 t.parent_trip_id,
                 t.tank_capacity,
                 COALESCE(fm.distance, 0.0) as distance,
-                fm.fee
+                fm.fee::float8 as fee
             FROM trips t
             LEFT JOIN fee_mappings fm 
                 ON t.company = fm.company 
@@ -434,7 +433,7 @@ pub async fn get_watanya_stats(
                         WHEN 5 THEN 170.5
                         ELSE 0.0
                     END / 1000.0)::float8
-                ELSE NULL 
+                ELSE 0.0
             END as base_revenue,
             CASE 
                 WHEN $3 THEN 
@@ -463,11 +462,11 @@ pub async fn get_watanya_stats(
     let details = rows
         .into_iter()
         .map(|row| {
-            let base_revenue: Option<f64> = row.try_get("base_revenue").ok().flatten();
+            let base_revenue: f64 = row.get("base_revenue");
             let vat: Option<f64> = row.try_get("vat").ok().flatten();
             
             let total_with_vat = if has_financial_access {
-                Some(base_revenue.unwrap_or(0.0) + vat.unwrap_or(0.0))
+                Some(base_revenue + vat.unwrap_or(0.0))
             } else {
                 None
             };
@@ -499,193 +498,257 @@ pub async fn get_route_details(
     end_date: &str,
     has_financial_access: bool,
 ) -> Result<Vec<RouteRevenueStats>> {
-    let (query, fee_multiplier, has_rental) = match company {
-        "TAQA" => (
-            r#"
-            WITH trip_data AS (
-                SELECT 
-                    t.car_no_plate,
-                    t.parent_trip_id,
-                    t.date,
-                    t.tank_capacity,
-                    COALESCE(fm.distance, 0.0) as distance
-                FROM trips t
-                LEFT JOIN fee_mappings fm 
-                    ON t.company = fm.company 
-                    AND t.terminal = fm.terminal 
-                    AND t.drop_off_point = fm.drop_off_point
-                WHERE t.company = $1
-                    AND t.deleted_at IS NULL
-                    AND t.date BETWEEN $2 AND $3
-            ),
-            car_stats AS (
-                SELECT 
-                    car_no_plate,
-                    (COALESCE(COUNT(DISTINCT CASE 
-                        WHEN parent_trip_id IS NOT NULL AND parent_trip_id != 0 
-                        THEN parent_trip_id 
-                    END), 0) + 
-                    COALESCE(COUNT(CASE 
-                        WHEN parent_trip_id IS NULL OR parent_trip_id = 0 
-                        THEN 1 
-                    END), 0))::bigint as total_trips,
-                    COALESCE(SUM(tank_capacity), 0.0)::float8 as total_volume,
-                    COALESCE(SUM(distance), 0.0)::float8 as total_distance,
-                    COUNT(DISTINCT date)::bigint as working_days,
-                    CASE 
-                        WHEN COUNT(DISTINCT date) >= 28 THEN 43000.0
-                        ELSE GREATEST(0.0, 43000.0 - ((28 - COUNT(DISTINCT date)) * 1433.0))
-                    END as car_rental,
-                    (COALESCE(SUM(distance), 0.0) * 40.7)::float8 as base_revenue
-                FROM trip_data
-                GROUP BY car_no_plate
-            )
-            SELECT 
-                car_no_plate,
-                total_trips,
-                total_volume,
-                total_distance,
-                working_days,
-                CASE WHEN $4 THEN base_revenue ELSE NULL END as total_revenue,
-                CASE WHEN $4 THEN car_rental ELSE NULL END as car_rental,
-                CASE WHEN $4 THEN ((base_revenue + car_rental) * 0.14)::float8 ELSE NULL END as vat,
-                CASE WHEN $4 THEN (base_revenue + car_rental + (base_revenue + car_rental) * 0.14)::float8 ELSE NULL END as total_with_vat
-            FROM car_stats
-            ORDER BY car_no_plate
-            "#,
-            40.7,
-            true
-        ),
-        "Petromin" => (
-            r#"
-            WITH trip_data AS (
-                SELECT 
-                    t.car_no_plate,
-                    t.parent_trip_id,
-                    t.date,
-                    t.tank_capacity,
-                    COALESCE(fm.distance, 0.0) as distance
-                FROM trips t
-                LEFT JOIN fee_mappings fm 
-                    ON t.company = fm.company 
-                    AND t.terminal = fm.terminal 
-                    AND t.drop_off_point = fm.drop_off_point
-                WHERE t.company = $1
-                    AND t.deleted_at IS NULL
-                    AND t.date BETWEEN $2 AND $3
-            ),
-            car_stats AS (
-                SELECT 
-                    car_no_plate,
-                    (COALESCE(COUNT(DISTINCT CASE 
-                        WHEN parent_trip_id IS NOT NULL AND parent_trip_id != 0 
-                        THEN parent_trip_id 
-                    END), 0) + 
-                    COALESCE(COUNT(CASE 
-                        WHEN parent_trip_id IS NULL OR parent_trip_id = 0 
-                        THEN 1 
-                    END), 0))::bigint as total_trips,
-                    COALESCE(SUM(tank_capacity), 0.0)::float8 as total_volume,
-                    COALESCE(SUM(distance), 0.0)::float8 as total_distance,
-                    COUNT(DISTINCT date)::bigint as working_days,
-                    (COUNT(DISTINCT date) * 2000.0)::float8 as car_rental,
-                    (COALESCE(SUM(distance), 0.0) * 42.5)::float8 as base_revenue
-                FROM trip_data
-                GROUP BY car_no_plate
-            )
-            SELECT 
-                car_no_plate,
-                total_trips,
-                total_volume,
-                total_distance,
-                working_days,
-                CASE WHEN $4 THEN base_revenue ELSE NULL END as total_revenue,
-                CASE WHEN $4 THEN car_rental ELSE NULL END as car_rental,
-                CASE WHEN $4 THEN ((base_revenue + car_rental) * 0.14)::float8 ELSE NULL END as vat,
-                CASE WHEN $4 THEN (base_revenue + car_rental + (base_revenue + car_rental) * 0.14)::float8 ELSE NULL END as total_with_vat
-            FROM car_stats
-            ORDER BY car_no_plate
-            "#,
-            42.5,
-            true
-        ),
-        _ => (
-            r#"
+    match company {
+        "Watanya" => get_watanya_route_details(pool, start_date, end_date, has_financial_access).await,
+        "TAQA" => get_taqa_route_details(pool, start_date, end_date, has_financial_access).await,
+        "Petromin" => get_petromin_route_details(pool, start_date, end_date, has_financial_access).await,
+        "Petrol Arrows" => get_petrol_arrows_route_details(pool, start_date, end_date, has_financial_access).await,
+        _ => Ok(vec![]),
+    }
+}
+
+async fn get_watanya_route_details(
+    pool: &PgPool,
+    start_date: &str,
+    end_date: &str,
+    has_financial_access: bool,
+) -> Result<Vec<RouteRevenueStats>> {
+    let query = r#"
+        WITH trip_data AS (
             SELECT 
                 t.car_no_plate,
-                (COALESCE(COUNT(DISTINCT CASE 
-                    WHEN t.parent_trip_id IS NOT NULL AND t.parent_trip_id != 0 
-                    THEN t.parent_trip_id 
-                END), 0) + 
-                COALESCE(COUNT(CASE 
-                    WHEN t.parent_trip_id IS NULL OR t.parent_trip_id = 0 
-                    THEN 1 
-                END), 0))::bigint as total_trips,
-                COALESCE(SUM(t.tank_capacity), 0.0)::float8 as total_volume,
-                COALESCE(SUM(fm.distance), 0.0)::float8 as total_distance,
-                COUNT(DISTINCT t.date)::bigint as working_days,
-                NULL::float8 as total_revenue,
-                NULL::float8 as car_rental,
-                NULL::float8 as vat,
-                NULL::float8 as total_with_vat
+                t.parent_trip_id,
+                t.date,
+                t.tank_capacity,
+                COALESCE(fm.distance, 0.0) as distance,
+                fm.fee::float8 as fee
             FROM trips t
             LEFT JOIN fee_mappings fm 
                 ON t.company = fm.company 
                 AND t.terminal = fm.terminal 
                 AND t.drop_off_point = fm.drop_off_point
-            WHERE t.company = $1
+            WHERE t.company = 'Watanya'
                 AND t.deleted_at IS NULL
-                AND t.date BETWEEN $2 AND $3
-            GROUP BY t.car_no_plate
-            ORDER BY t.car_no_plate
-            "#,
-            0.0,
-            false
+                AND t.date BETWEEN $1 AND $2
+                AND fm.fee IS NOT NULL
+        ),
+        car_stats AS (
+            SELECT 
+                fee,
+                car_no_plate,
+                (COALESCE(COUNT(DISTINCT CASE 
+                    WHEN parent_trip_id IS NOT NULL AND parent_trip_id != 0 
+                    THEN parent_trip_id 
+                END), 0) + 
+                COALESCE(COUNT(CASE 
+                    WHEN parent_trip_id IS NULL OR parent_trip_id = 0 
+                    THEN 1 
+                END), 0))::bigint as total_trips,
+                COALESCE(SUM(tank_capacity), 0.0)::float8 as total_volume,
+                COALESCE(SUM(distance), 0.0)::float8 as total_distance,
+                COUNT(DISTINCT date)::bigint as working_days,
+                (COALESCE(SUM(tank_capacity), 0.0) * 
+                    CASE fee::int
+                        WHEN 1 THEN 82.5
+                        WHEN 2 THEN 104.5
+                        WHEN 3 THEN 126.5
+                        WHEN 4 THEN 148.5
+                        WHEN 5 THEN 170.5
+                        ELSE 0.0
+                    END / 1000.0)::float8 as base_revenue
+            FROM trip_data
+            GROUP BY fee, car_no_plate
         )
-    };
+        SELECT 
+            fee,
+            car_no_plate,
+            total_trips,
+            total_volume,
+            total_distance,
+            working_days,
+            CASE WHEN $3 THEN base_revenue ELSE NULL END as total_revenue,
+            CASE WHEN $3 THEN (base_revenue * 0.14)::float8 ELSE NULL END as vat,
+            CASE WHEN $3 THEN (base_revenue + base_revenue * 0.14)::float8 ELSE NULL END as total_with_vat
+        FROM car_stats
+        ORDER BY fee, car_no_plate
+    "#;
 
     let rows = sqlx::query(query)
-        .bind(company)
         .bind(start_date)
         .bind(end_date)
         .bind(has_financial_access)
         .fetch_all(pool)
         .await?;
 
-    let mut car_stats = Vec::new();
-    
+    let mut fee_stats: HashMap<i32, Vec<CarStats>> = HashMap::new();
+
     for row in rows {
-        car_stats.push(CarStats {
+        let fee: f64 = row.try_get("fee").unwrap_or(0.0);
+        let fee_int = fee as i32;
+        
+        let car = CarStats {
             car_no_plate: row.get("car_no_plate"),
             total_trips: row.get("total_trips"),
             total_volume: row.get("total_volume"),
             total_distance: row.get("total_distance"),
-            working_days: row.get("working_days"),
             total_revenue: row.try_get("total_revenue").ok().flatten(),
-            car_rental: row.try_get("car_rental").ok().flatten(),
+            working_days: row.get("working_days"),
+            car_rental: None,
             vat: row.try_get("vat").ok().flatten(),
             total_with_vat: row.try_get("total_with_vat").ok().flatten(),
+        };
+
+        fee_stats.entry(fee_int).or_insert_with(Vec::new).push(car);
+    }
+
+    let mut result = Vec::new();
+
+    for (fee, cars) in fee_stats {
+        let total_trips: i64 = cars.iter().map(|c| c.total_trips).sum();
+        let total_volume: f64 = cars.iter().map(|c| c.total_volume).sum();
+        let total_distance: f64 = cars.iter().map(|c| c.total_distance).sum();
+
+        let (total_revenue, vat, total_with_vat) = if has_financial_access {
+            (
+                Some(cars.iter().filter_map(|c| c.total_revenue).sum()),
+                Some(cars.iter().filter_map(|c| c.vat).sum()),
+                Some(cars.iter().filter_map(|c| c.total_with_vat).sum()),
+            )
+        } else {
+            (None, None, None)
+        };
+
+        result.push(RouteRevenueStats {
+            route_name: format!("Fee Category {}", fee),
+            total_trips,
+            total_volume,
+            total_distance,
+            total_revenue,
+            vat,
+            car_rental: None,
+            total_with_vat,
+            fee: Some(fee as f64),
+            route_type: "fee".to_string(),
+            terminal: None,
+            drop_off_point: None,
+            fee_category: Some(fee),
+            cars,
         });
     }
 
-    if !car_stats.is_empty() {
-        let total_trips: i64 = car_stats.iter().map(|c| c.total_trips).sum();
-        let total_volume: f64 = car_stats.iter().map(|c| c.total_volume).sum();
-        let total_distance: f64 = car_stats.iter().map(|c| c.total_distance).sum();
+    result.sort_by_key(|r| r.fee_category);
+    Ok(result)
+}
+
+async fn get_taqa_route_details(
+    pool: &PgPool,
+    start_date: &str,
+    end_date: &str,
+    has_financial_access: bool,
+) -> Result<Vec<RouteRevenueStats>> {
+    let query = r#"
+        WITH trip_data AS (
+            SELECT 
+                t.terminal,
+                t.car_no_plate,
+                t.parent_trip_id,
+                t.date,
+                t.tank_capacity,
+                COALESCE(fm.distance, 0.0) as distance
+            FROM trips t
+            LEFT JOIN fee_mappings fm 
+                ON t.company = fm.company 
+                AND t.terminal = fm.terminal 
+                AND t.drop_off_point = fm.drop_off_point
+            WHERE t.company = 'TAQA'
+                AND t.deleted_at IS NULL
+                AND t.date BETWEEN $1 AND $2
+        ),
+        car_stats AS (
+            SELECT 
+                terminal,
+                car_no_plate,
+                (COALESCE(COUNT(DISTINCT CASE 
+                    WHEN parent_trip_id IS NOT NULL AND parent_trip_id != 0 
+                    THEN parent_trip_id 
+                END), 0) + 
+                COALESCE(COUNT(CASE 
+                    WHEN parent_trip_id IS NULL OR parent_trip_id = 0 
+                    THEN 1 
+                END), 0))::bigint as total_trips,
+                COALESCE(SUM(tank_capacity), 0.0)::float8 as total_volume,
+                COALESCE(SUM(distance), 0.0)::float8 as total_distance,
+                COUNT(DISTINCT date)::bigint as working_days,
+                CASE 
+                    WHEN COUNT(DISTINCT date) >= 28 THEN 43000.0
+                    ELSE GREATEST(0.0, 43000.0 - ((28 - COUNT(DISTINCT date)) * 1433.0))
+                END as car_rental,
+                (COALESCE(SUM(distance), 0.0) * 40.7)::float8 as base_revenue
+            FROM trip_data
+            GROUP BY terminal, car_no_plate
+        )
+        SELECT 
+            terminal,
+            car_no_plate,
+            total_trips,
+            total_volume,
+            total_distance,
+            working_days,
+            CASE WHEN $3 THEN base_revenue ELSE NULL END as total_revenue,
+            CASE WHEN $3 THEN car_rental ELSE NULL END as car_rental,
+            CASE WHEN $3 THEN ((base_revenue + car_rental) * 0.14)::float8 ELSE NULL END as vat,
+            CASE WHEN $3 THEN (base_revenue + car_rental + (base_revenue + car_rental) * 0.14)::float8 ELSE NULL END as total_with_vat
+        FROM car_stats
+        ORDER BY terminal, car_no_plate
+    "#;
+
+    let rows = sqlx::query(query)
+        .bind(start_date)
+        .bind(end_date)
+        .bind(has_financial_access)
+        .fetch_all(pool)
+        .await?;
+
+    let mut terminal_stats: HashMap<String, Vec<CarStats>> = HashMap::new();
+
+    for row in rows {
+        let terminal: String = row.get("terminal");
         
+        let car = CarStats {
+            car_no_plate: row.get("car_no_plate"),
+            total_trips: row.get("total_trips"),
+            total_volume: row.get("total_volume"),
+            total_distance: row.get("total_distance"),
+            total_revenue: row.try_get("total_revenue").ok().flatten(),
+            working_days: row.get("working_days"),
+            car_rental: row.try_get("car_rental").ok().flatten(),
+            vat: row.try_get("vat").ok().flatten(),
+            total_with_vat: row.try_get("total_with_vat").ok().flatten(),
+        };
+
+        terminal_stats.entry(terminal).or_insert_with(Vec::new).push(car);
+    }
+
+    let mut result = Vec::new();
+
+    for (terminal, cars) in terminal_stats {
+        let total_trips: i64 = cars.iter().map(|c| c.total_trips).sum();
+        let total_volume: f64 = cars.iter().map(|c| c.total_volume).sum();
+        let total_distance: f64 = cars.iter().map(|c| c.total_distance).sum();
+
         let (total_revenue, car_rental, vat, total_with_vat) = if has_financial_access {
             (
-                Some(car_stats.iter().filter_map(|c| c.total_revenue).sum()),
-                Some(car_stats.iter().filter_map(|c| c.car_rental).sum()),
-                Some(car_stats.iter().filter_map(|c| c.vat).sum()),
-                Some(car_stats.iter().filter_map(|c| c.total_with_vat).sum()),
+                Some(cars.iter().filter_map(|c| c.total_revenue).sum()),
+                Some(cars.iter().filter_map(|c| c.car_rental).sum()),
+                Some(cars.iter().filter_map(|c| c.vat).sum()),
+                Some(cars.iter().filter_map(|c| c.total_with_vat).sum()),
             )
         } else {
             (None, None, None, None)
         };
-        
-        Ok(vec![RouteRevenueStats {
-            route_name: format!("{} - All Routes", company),
+
+        result.push(RouteRevenueStats {
+            route_name: terminal.clone(),
             total_trips,
             total_volume,
             total_distance,
@@ -693,16 +756,276 @@ pub async fn get_route_details(
             vat,
             car_rental,
             total_with_vat,
-            fee: if fee_multiplier > 0.0 { Some(fee_multiplier) } else { None },
-            route_type: "summary".to_string(),
-            terminal: None,
+            fee: Some(40.7),
+            route_type: "terminal".to_string(),
+            terminal: Some(terminal),
             drop_off_point: None,
             fee_category: None,
-            cars: car_stats,
-        }])
-    } else {
-        Ok(vec![])
+            cars,
+        });
     }
+
+    result.sort_by(|a, b| a.terminal.cmp(&b.terminal));
+    Ok(result)
+}
+
+async fn get_petromin_route_details(
+    pool: &PgPool,
+    start_date: &str,
+    end_date: &str,
+    has_financial_access: bool,
+) -> Result<Vec<RouteRevenueStats>> {
+    let query = r#"
+        WITH trip_data AS (
+            SELECT 
+                t.terminal,
+                t.car_no_plate,
+                t.parent_trip_id,
+                t.date,
+                t.tank_capacity,
+                COALESCE(fm.distance, 0.0) as distance
+            FROM trips t
+            LEFT JOIN fee_mappings fm 
+                ON t.company = fm.company 
+                AND t.terminal = fm.terminal 
+                AND t.drop_off_point = fm.drop_off_point
+            WHERE t.company = 'Petromin'
+                AND t.deleted_at IS NULL
+                AND t.date BETWEEN $1 AND $2
+        ),
+        car_stats AS (
+            SELECT 
+                terminal,
+                car_no_plate,
+                (COALESCE(COUNT(DISTINCT CASE 
+                    WHEN parent_trip_id IS NOT NULL AND parent_trip_id != 0 
+                    THEN parent_trip_id 
+                END), 0) + 
+                COALESCE(COUNT(CASE 
+                    WHEN parent_trip_id IS NULL OR parent_trip_id = 0 
+                    THEN 1 
+                END), 0))::bigint as total_trips,
+                COALESCE(SUM(tank_capacity), 0.0)::float8 as total_volume,
+                COALESCE(SUM(distance), 0.0)::float8 as total_distance,
+                COUNT(DISTINCT date)::bigint as working_days,
+                (COUNT(DISTINCT date) * 2000.0)::float8 as car_rental,
+                (COALESCE(SUM(distance), 0.0) * 42.5)::float8 as base_revenue
+            FROM trip_data
+            GROUP BY terminal, car_no_plate
+        )
+        SELECT 
+            terminal,
+            car_no_plate,
+            total_trips,
+            total_volume,
+            total_distance,
+            working_days,
+            CASE WHEN $3 THEN base_revenue ELSE NULL END as total_revenue,
+            CASE WHEN $3 THEN car_rental ELSE NULL END as car_rental,
+            CASE WHEN $3 THEN ((base_revenue + car_rental) * 0.14)::float8 ELSE NULL END as vat,
+            CASE WHEN $3 THEN (base_revenue + car_rental + (base_revenue + car_rental) * 0.14)::float8 ELSE NULL END as total_with_vat
+        FROM car_stats
+        ORDER BY terminal, car_no_plate
+    "#;
+
+    let rows = sqlx::query(query)
+        .bind(start_date)
+        .bind(end_date)
+        .bind(has_financial_access)
+        .fetch_all(pool)
+        .await?;
+
+    let mut terminal_stats: HashMap<String, Vec<CarStats>> = HashMap::new();
+
+    for row in rows {
+        let terminal: String = row.get("terminal");
+        
+        let car = CarStats {
+            car_no_plate: row.get("car_no_plate"),
+            total_trips: row.get("total_trips"),
+            total_volume: row.get("total_volume"),
+            total_distance: row.get("total_distance"),
+            total_revenue: row.try_get("total_revenue").ok().flatten(),
+            working_days: row.get("working_days"),
+            car_rental: row.try_get("car_rental").ok().flatten(),
+            vat: row.try_get("vat").ok().flatten(),
+            total_with_vat: row.try_get("total_with_vat").ok().flatten(),
+        };
+
+        terminal_stats.entry(terminal).or_insert_with(Vec::new).push(car);
+    }
+
+    let mut result = Vec::new();
+
+    for (terminal, cars) in terminal_stats {
+        let total_trips: i64 = cars.iter().map(|c| c.total_trips).sum();
+        let total_volume: f64 = cars.iter().map(|c| c.total_volume).sum();
+        let total_distance: f64 = cars.iter().map(|c| c.total_distance).sum();
+
+        let (total_revenue, car_rental, vat, total_with_vat) = if has_financial_access {
+            (
+                Some(cars.iter().filter_map(|c| c.total_revenue).sum()),
+                Some(cars.iter().filter_map(|c| c.car_rental).sum()),
+                Some(cars.iter().filter_map(|c| c.vat).sum()),
+                Some(cars.iter().filter_map(|c| c.total_with_vat).sum()),
+            )
+        } else {
+            (None, None, None, None)
+        };
+
+        result.push(RouteRevenueStats {
+            route_name: terminal.clone(),
+            total_trips,
+            total_volume,
+            total_distance,
+            total_revenue,
+            vat,
+            car_rental,
+            total_with_vat,
+            fee: Some(42.5),
+            route_type: "terminal".to_string(),
+            terminal: Some(terminal),
+            drop_off_point: None,
+            fee_category: None,
+            cars,
+        });
+    }
+
+    result.sort_by(|a, b| a.terminal.cmp(&b.terminal));
+    Ok(result)
+}
+
+async fn get_petrol_arrows_route_details(
+    pool: &PgPool,
+    start_date: &str,
+    end_date: &str,
+    has_financial_access: bool,
+) -> Result<Vec<RouteRevenueStats>> {
+    let query = r#"
+        WITH trip_data AS (
+            SELECT 
+                t.terminal,
+                t.drop_off_point,
+                t.car_no_plate,
+                t.parent_trip_id,
+                t.date,
+                t.tank_capacity,
+                COALESCE(fm.distance, 0.0) as distance,
+                COALESCE(fm.fee::float8, 0.0) as fee
+            FROM trips t
+            LEFT JOIN fee_mappings fm 
+                ON t.company = fm.company 
+                AND t.terminal = fm.terminal 
+                AND t.drop_off_point = fm.drop_off_point
+            WHERE t.company = 'Petrol Arrows'
+                AND t.deleted_at IS NULL
+                AND t.date BETWEEN $1 AND $2
+        ),
+        car_stats AS (
+            SELECT 
+                terminal,
+                drop_off_point,
+                fee,
+                car_no_plate,
+                (COALESCE(COUNT(DISTINCT CASE 
+                    WHEN parent_trip_id IS NOT NULL AND parent_trip_id != 0 
+                    THEN parent_trip_id 
+                END), 0) + 
+                COALESCE(COUNT(CASE 
+                    WHEN parent_trip_id IS NULL OR parent_trip_id = 0 
+                    THEN 1 
+                END), 0))::bigint as total_trips,
+                COALESCE(SUM(tank_capacity), 0.0)::float8 as total_volume,
+                COALESCE(SUM(distance), 0.0)::float8 as total_distance,
+                COUNT(DISTINCT date)::bigint as working_days,
+                (COALESCE(MAX(fee), 0.0) * COALESCE(SUM(tank_capacity), 0.0) / 1000.0)::float8 as base_revenue
+            FROM trip_data
+            GROUP BY terminal, drop_off_point, fee, car_no_plate
+        )
+        SELECT 
+            terminal,
+            drop_off_point,
+            fee,
+            car_no_plate,
+            total_trips,
+            total_volume,
+            total_distance,
+            working_days,
+            CASE WHEN $3 THEN base_revenue ELSE NULL END as total_revenue,
+            CASE WHEN $3 THEN base_revenue ELSE NULL END as total_with_vat
+        FROM car_stats
+        ORDER BY terminal, drop_off_point, car_no_plate
+    "#;
+
+    let rows = sqlx::query(query)
+        .bind(start_date)
+        .bind(end_date)
+        .bind(has_financial_access)
+        .fetch_all(pool)
+        .await?;
+
+    let mut route_stats: HashMap<(String, String), (f64, Vec<CarStats>)> = HashMap::new();
+
+    for row in rows {
+        let terminal: String = row.get("terminal");
+        let drop_off_point: String = row.get("drop_off_point");
+        let fee: f64 = row.try_get("fee").unwrap_or(0.0);
+        let key = (terminal.clone(), drop_off_point.clone());
+        
+        let car = CarStats {
+            car_no_plate: row.get("car_no_plate"),
+            total_trips: row.get("total_trips"),
+            total_volume: row.get("total_volume"),
+            total_distance: row.get("total_distance"),
+            total_revenue: row.try_get("total_revenue").ok().flatten(),
+            working_days: row.get("working_days"),
+            car_rental: None,
+            vat: None,
+            total_with_vat: row.try_get("total_with_vat").ok().flatten(),
+        };
+
+        route_stats.entry(key).or_insert_with(|| (fee, Vec::new())).1.push(car);
+    }
+
+    let mut result = Vec::new();
+
+    for ((terminal, drop_off_point), (fee, cars)) in route_stats {
+        let total_trips: i64 = cars.iter().map(|c| c.total_trips).sum();
+        let total_volume: f64 = cars.iter().map(|c| c.total_volume).sum();
+        let total_distance: f64 = cars.iter().map(|c| c.total_distance).sum();
+
+        let (total_revenue, total_with_vat) = if has_financial_access {
+            (
+                Some(cars.iter().filter_map(|c| c.total_revenue).sum()),
+                Some(cars.iter().filter_map(|c| c.total_with_vat).sum()),
+            )
+        } else {
+            (None, None)
+        };
+
+        result.push(RouteRevenueStats {
+            route_name: format!("{} to {}", terminal, drop_off_point),
+            total_trips,
+            total_volume,
+            total_distance,
+            total_revenue,
+            vat: None,
+            car_rental: None,
+            total_with_vat,
+            fee: Some(fee),
+            route_type: "terminal-dropoff".to_string(),
+            terminal: Some(terminal),
+            drop_off_point: Some(drop_off_point),
+            fee_category: None,
+            cars,
+        });
+    }
+
+    result.sort_by(|a, b| {
+        a.terminal.cmp(&b.terminal)
+            .then_with(|| a.drop_off_point.cmp(&b.drop_off_point))
+    });
+    Ok(result)
 }
 
 pub async fn get_stats_by_date(
@@ -910,24 +1233,26 @@ pub fn calculate_car_totals(statistics: &[TripStatistics]) -> Vec<CarTotal> {
     let mut car_totals_map: HashMap<String, CarTotal> = HashMap::new();
 
     for statistic in statistics {
-        for route_detail in &statistic.route_details {
-            for car in &route_detail.cars {
-                let car_total = car_totals_map
-                    .entry(car.car_no_plate.clone())
-                    .or_insert_with(|| CarTotal {
-                        car_no_plate: car.car_no_plate.clone(),
-                        liters: 0.0,
-                        distance: 0.0,
-                        base_revenue: 0.0,
-                        vat: 0.0,
-                        rent: 0.0,
-                    });
+        if let Some(route_details) = &statistic.route_details {
+            for route_detail in route_details {
+                for car in &route_detail.cars {
+                    let car_total = car_totals_map
+                        .entry(car.car_no_plate.clone())
+                        .or_insert_with(|| CarTotal {
+                            car_no_plate: car.car_no_plate.clone(),
+                            liters: 0.0,
+                            distance: 0.0,
+                            base_revenue: 0.0,
+                            vat: 0.0,
+                            rent: 0.0,
+                        });
 
-                car_total.liters += car.total_volume;
-                car_total.distance += car.total_distance;
-                car_total.base_revenue += car.total_revenue.unwrap_or(0.0);
-                car_total.vat += car.vat.unwrap_or(0.0);
-                car_total.rent += car.car_rental.unwrap_or(0.0);
+                    car_total.liters += car.total_volume;
+                    car_total.distance += car.total_distance;
+                    car_total.base_revenue += car.total_revenue.unwrap_or(0.0);
+                    car_total.vat += car.vat.unwrap_or(0.0);
+                    car_total.rent += car.car_rental.unwrap_or(0.0);
+                }
             }
         }
     }
