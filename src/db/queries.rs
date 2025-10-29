@@ -664,28 +664,42 @@ async fn get_taqa_route_details(
                 AND t.deleted_at IS NULL
                 AND t.date BETWEEN $1 AND $2
         ),
-        car_stats AS (
+        -- Calculate working days per car per terminal
+        car_working_days AS (
             SELECT 
                 terminal,
                 car_no_plate,
+                COUNT(DISTINCT date)::int as working_days
+            FROM trip_data
+            WHERE parent_trip_id IS NULL OR parent_trip_id = 0
+            GROUP BY terminal, car_no_plate
+        ),
+        car_stats AS (
+            SELECT 
+                td.terminal,
+                td.car_no_plate,
                 (COALESCE(COUNT(DISTINCT CASE 
-                    WHEN parent_trip_id IS NOT NULL AND parent_trip_id != 0 
-                    THEN parent_trip_id 
+                    WHEN td.parent_trip_id IS NOT NULL AND td.parent_trip_id != 0 
+                    THEN td.parent_trip_id 
                 END), 0) + 
                 COALESCE(COUNT(CASE 
-                    WHEN parent_trip_id IS NULL OR parent_trip_id = 0 
+                    WHEN td.parent_trip_id IS NULL OR td.parent_trip_id = 0 
                     THEN 1 
                 END), 0))::bigint as total_trips,
-                COALESCE(SUM(tank_capacity), 0.0)::float8 as total_volume,
-                COALESCE(SUM(distance), 0.0)::float8 as total_distance,
-                COUNT(DISTINCT date)::bigint as working_days,
+                COALESCE(SUM(td.tank_capacity), 0.0)::float8 as total_volume,
+                COALESCE(SUM(td.distance), 0.0)::float8 as total_distance,
+                COALESCE(cwd.working_days, 0)::bigint as working_days,
+                -- Calculate car rental based on working days
                 CASE 
-                    WHEN COUNT(DISTINCT date) >= 28 THEN 43000.0
-                    ELSE GREATEST(0.0, 43000.0 - ((28 - COUNT(DISTINCT date)) * 1433.0))
-                END as car_rental,
-                (COALESCE(SUM(distance), 0.0) * 40.7)::float8 as base_revenue
-            FROM trip_data
-            GROUP BY terminal, car_no_plate
+                    WHEN COALESCE(cwd.working_days, 0) >= 28 THEN 43000.0
+                    ELSE GREATEST(0.0, 43000.0 - ((28 - COALESCE(cwd.working_days, 0)) * 1433.0))
+                END::float8 as car_rental,
+                (COALESCE(SUM(td.distance), 0.0) * 40.7)::float8 as base_revenue
+            FROM trip_data td
+            LEFT JOIN car_working_days cwd 
+                ON td.terminal = cwd.terminal 
+                AND td.car_no_plate = cwd.car_no_plate
+            GROUP BY td.terminal, td.car_no_plate, cwd.working_days
         )
         SELECT 
             terminal,
@@ -693,7 +707,7 @@ async fn get_taqa_route_details(
             total_trips,
             total_volume,
             total_distance,
-            working_days,
+            0::bigint as working_days_display,  -- Go shows 0 here
             CASE WHEN $3 THEN base_revenue ELSE NULL END as total_revenue,
             CASE WHEN $3 THEN car_rental ELSE NULL END as car_rental,
             CASE WHEN $3 THEN ((base_revenue + car_rental) * 0.14)::float8 ELSE NULL END as vat,
@@ -720,7 +734,7 @@ async fn get_taqa_route_details(
             total_volume: row.get("total_volume"),
             total_distance: row.get("total_distance"),
             total_revenue: row.try_get("total_revenue").ok().flatten(),
-            working_days: row.get("working_days"),
+            working_days: row.get("working_days_display"),  // This will be 0 to match Go
             car_rental: row.try_get("car_rental").ok().flatten(),
             vat: row.try_get("vat").ok().flatten(),
             total_with_vat: row.try_get("total_with_vat").ok().flatten(),
@@ -793,25 +807,38 @@ async fn get_petromin_route_details(
                 AND t.deleted_at IS NULL
                 AND t.date BETWEEN $1 AND $2
         ),
-        car_stats AS (
+        -- Calculate working days per car per terminal  
+        car_working_days AS (
             SELECT 
                 terminal,
                 car_no_plate,
+                COUNT(DISTINCT date)::int as working_days
+            FROM trip_data
+            WHERE parent_trip_id IS NULL OR parent_trip_id = 0
+            GROUP BY terminal, car_no_plate
+        ),
+        car_stats AS (
+            SELECT 
+                td.terminal,
+                td.car_no_plate,
                 (COALESCE(COUNT(DISTINCT CASE 
-                    WHEN parent_trip_id IS NOT NULL AND parent_trip_id != 0 
-                    THEN parent_trip_id 
+                    WHEN td.parent_trip_id IS NOT NULL AND td.parent_trip_id != 0 
+                    THEN td.parent_trip_id 
                 END), 0) + 
                 COALESCE(COUNT(CASE 
-                    WHEN parent_trip_id IS NULL OR parent_trip_id = 0 
+                    WHEN td.parent_trip_id IS NULL OR td.parent_trip_id = 0 
                     THEN 1 
                 END), 0))::bigint as total_trips,
-                COALESCE(SUM(tank_capacity), 0.0)::float8 as total_volume,
-                COALESCE(SUM(distance), 0.0)::float8 as total_distance,
-                COUNT(DISTINCT date)::bigint as working_days,
-                (COUNT(DISTINCT date) * 2000.0)::float8 as car_rental,
-                (COALESCE(SUM(distance), 0.0) * 42.5)::float8 as base_revenue
-            FROM trip_data
-            GROUP BY terminal, car_no_plate
+                COALESCE(SUM(td.tank_capacity), 0.0)::float8 as total_volume,
+                COALESCE(SUM(td.distance), 0.0)::float8 as total_distance,
+                COALESCE(cwd.working_days, 0)::bigint as working_days,
+                (COALESCE(cwd.working_days, 0) * 2000.0)::float8 as car_rental,
+                (COALESCE(SUM(td.distance), 0.0) * 42.5)::float8 as base_revenue
+            FROM trip_data td
+            LEFT JOIN car_working_days cwd 
+                ON td.terminal = cwd.terminal 
+                AND td.car_no_plate = cwd.car_no_plate
+            GROUP BY td.terminal, td.car_no_plate, cwd.working_days
         )
         SELECT 
             terminal,
@@ -819,7 +846,7 @@ async fn get_petromin_route_details(
             total_trips,
             total_volume,
             total_distance,
-            working_days,
+            0::bigint as working_days_display,  -- Go shows 0 here
             CASE WHEN $3 THEN base_revenue ELSE NULL END as total_revenue,
             CASE WHEN $3 THEN car_rental ELSE NULL END as car_rental,
             CASE WHEN $3 THEN ((base_revenue + car_rental) * 0.14)::float8 ELSE NULL END as vat,
@@ -846,7 +873,7 @@ async fn get_petromin_route_details(
             total_volume: row.get("total_volume"),
             total_distance: row.get("total_distance"),
             total_revenue: row.try_get("total_revenue").ok().flatten(),
-            working_days: row.get("working_days"),
+            working_days: row.get("working_days_display"),  // This will be 0 to match Go
             car_rental: row.try_get("car_rental").ok().flatten(),
             vat: row.try_get("vat").ok().flatten(),
             total_with_vat: row.try_get("total_with_vat").ok().flatten(),
@@ -1044,7 +1071,11 @@ pub async fn get_stats_by_date(
                     t.company,
                     t.parent_trip_id,
                     t.tank_capacity,
-                    COALESCE(fm.distance, 0.0) as distance
+                    t.car_no_plate,
+                    t.terminal,
+                    t.drop_off_point,
+                    COALESCE(fm.distance, 0.0) as distance,
+                    COALESCE(fm.fee::float8, 0.0) as fee
                 FROM trips t
                 LEFT JOIN fee_mappings fm 
                     ON t.company = fm.company 
@@ -1067,7 +1098,34 @@ pub async fn get_stats_by_date(
                         THEN 1 
                     END), 0))::bigint as total_trips,
                     COALESCE(SUM(tank_capacity), 0.0)::float8 as total_volume,
-                    COALESCE(SUM(distance), 0.0)::float8 as total_distance
+                    COALESCE(SUM(distance), 0.0)::float8 as total_distance,
+                    -- Calculate revenue based on company
+                    CASE 
+                        WHEN company = 'Watanya' THEN
+                            COALESCE(SUM(
+                                tank_capacity * 
+                                CASE fee::int
+                                    WHEN 1 THEN 82.5
+                                    WHEN 2 THEN 104.5
+                                    WHEN 3 THEN 126.5
+                                    WHEN 4 THEN 148.5
+                                    WHEN 5 THEN 170.5
+                                    ELSE 0.0
+                                END / 1000.0
+                            ), 0.0)::float8
+                        WHEN company = 'TAQA' THEN
+                            COALESCE(SUM(
+                                CASE 
+                                    WHEN terminal IN ('Alex', 'Suez') THEN distance * 40.7
+                                    ELSE 0.0
+                                END
+                            ), 0.0)::float8
+                        WHEN company = 'Petromin' THEN
+                            COALESCE(SUM(distance * 42.5), 0.0)::float8
+                        WHEN company = 'Petrol Arrows' THEN
+                            COALESCE(SUM(fee * tank_capacity / 1000.0), 0.0)::float8
+                        ELSE 0.0
+                    END as total_revenue
                 FROM trip_data
                 GROUP BY date, company
             ),
@@ -1076,7 +1134,8 @@ pub async fn get_stats_by_date(
                     date,
                     COALESCE(SUM(total_trips), 0)::bigint as total_trips,
                     COALESCE(SUM(total_volume), 0.0)::float8 as total_volume,
-                    COALESCE(SUM(total_distance), 0.0)::float8 as total_distance
+                    COALESCE(SUM(total_distance), 0.0)::float8 as total_distance,
+                    COALESCE(SUM(total_revenue), 0.0)::float8 as total_revenue
                 FROM company_stats
                 GROUP BY date
             )
@@ -1085,18 +1144,20 @@ pub async fn get_stats_by_date(
                 dt.total_trips,
                 dt.total_volume,
                 dt.total_distance,
+                dt.total_revenue,
                 json_agg(
                     json_build_object(
                         'company', cs.company,
                         'total_trips', cs.total_trips,
                         'total_volume', cs.total_volume,
-                        'total_distance', cs.total_distance
+                        'total_distance', cs.total_distance,
+                        'total_revenue', cs.total_revenue
                     )
                     ORDER BY cs.company
                 ) as company_details
             FROM date_totals dt
             JOIN company_stats cs ON dt.date = cs.date
-            GROUP BY dt.date, dt.total_trips, dt.total_volume, dt.total_distance
+            GROUP BY dt.date, dt.total_trips, dt.total_volume, dt.total_distance, dt.total_revenue
             ORDER BY dt.date ASC
             "#
         }
@@ -1108,7 +1169,11 @@ pub async fn get_stats_by_date(
                     t.company,
                     t.parent_trip_id,
                     t.tank_capacity,
-                    COALESCE(fm.distance, 0.0) as distance
+                    t.car_no_plate,
+                    t.terminal,
+                    t.drop_off_point,
+                    COALESCE(fm.distance, 0.0) as distance,
+                    COALESCE(fm.fee::float8, 0.0) as fee
                 FROM trips t
                 LEFT JOIN fee_mappings fm 
                     ON t.company = fm.company 
@@ -1130,7 +1195,34 @@ pub async fn get_stats_by_date(
                         THEN 1 
                     END), 0))::bigint as total_trips,
                     COALESCE(SUM(tank_capacity), 0.0)::float8 as total_volume,
-                    COALESCE(SUM(distance), 0.0)::float8 as total_distance
+                    COALESCE(SUM(distance), 0.0)::float8 as total_distance,
+                    -- Calculate revenue based on company
+                    CASE 
+                        WHEN company = 'Watanya' THEN
+                            COALESCE(SUM(
+                                tank_capacity * 
+                                CASE fee::int
+                                    WHEN 1 THEN 82.5
+                                    WHEN 2 THEN 104.5
+                                    WHEN 3 THEN 126.5
+                                    WHEN 4 THEN 148.5
+                                    WHEN 5 THEN 170.5
+                                    ELSE 0.0
+                                END / 1000.0
+                            ), 0.0)::float8
+                        WHEN company = 'TAQA' THEN
+                            COALESCE(SUM(
+                                CASE 
+                                    WHEN terminal IN ('Alex', 'Suez') THEN distance * 40.7
+                                    ELSE 0.0
+                                END
+                            ), 0.0)::float8
+                        WHEN company = 'Petromin' THEN
+                            COALESCE(SUM(distance * 42.5), 0.0)::float8
+                        WHEN company = 'Petrol Arrows' THEN
+                            COALESCE(SUM(fee * tank_capacity / 1000.0), 0.0)::float8
+                        ELSE 0.0
+                    END as total_revenue
                 FROM trip_data
                 GROUP BY date, company
             ),
@@ -1139,7 +1231,8 @@ pub async fn get_stats_by_date(
                     date,
                     COALESCE(SUM(total_trips), 0)::bigint as total_trips,
                     COALESCE(SUM(total_volume), 0.0)::float8 as total_volume,
-                    COALESCE(SUM(total_distance), 0.0)::float8 as total_distance
+                    COALESCE(SUM(total_distance), 0.0)::float8 as total_distance,
+                    COALESCE(SUM(total_revenue), 0.0)::float8 as total_revenue
                 FROM company_stats
                 GROUP BY date
             )
@@ -1148,18 +1241,20 @@ pub async fn get_stats_by_date(
                 dt.total_trips,
                 dt.total_volume,
                 dt.total_distance,
+                dt.total_revenue,
                 json_agg(
                     json_build_object(
                         'company', cs.company,
                         'total_trips', cs.total_trips,
                         'total_volume', cs.total_volume,
-                        'total_distance', cs.total_distance
+                        'total_distance', cs.total_distance,
+                        'total_revenue', cs.total_revenue
                     )
                     ORDER BY cs.company
                 ) as company_details
             FROM date_totals dt
             JOIN company_stats cs ON dt.date = cs.date
-            GROUP BY dt.date, dt.total_trips, dt.total_volume, dt.total_distance
+            GROUP BY dt.date, dt.total_trips, dt.total_volume, dt.total_distance, dt.total_revenue
             ORDER BY dt.date ASC
             "#
         }
@@ -1190,6 +1285,7 @@ pub async fn get_stats_by_date(
         let total_trips: i64 = row.get("total_trips");
         let total_volume: f64 = row.get("total_volume");
         let total_distance: f64 = row.get("total_distance");
+        let total_revenue: f64 = row.get("total_revenue");
         
         let company_details_json: serde_json::Value = row.get("company_details");
         let mut company_details = Vec::new();
@@ -1202,12 +1298,14 @@ pub async fn get_stats_by_date(
                     item.get("total_volume").and_then(|v| v.as_f64()),
                     item.get("total_distance").and_then(|v| v.as_f64()),
                 ) {
+                    let revenue = item.get("total_revenue").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                    
                     company_details.push(CompanyRevenueDetails {
                         company: company.to_string(),
                         total_trips: trips,
                         total_volume: volume,
                         total_distance: distance,
-                        total_revenue: if has_financial_access { Some(0.0) } else { None },
+                        total_revenue: if has_financial_access { Some(revenue) } else { None },
                         vat: None,
                         car_rental: None,
                         total_with_vat: None,
@@ -1221,13 +1319,14 @@ pub async fn get_stats_by_date(
             total_trips,
             total_volume,
             total_distance,
-            total_revenue: if has_financial_access { Some(0.0) } else { None },
+            total_revenue: if has_financial_access { Some(total_revenue) } else { None },
             company_details,
         });
     }
 
     Ok(result)
 }
+
 
 pub fn calculate_car_totals(statistics: &[TripStatistics]) -> Vec<CarTotal> {
     let mut car_totals_map: HashMap<String, CarTotal> = HashMap::new();
