@@ -1,3 +1,5 @@
+// db.rs - Regenerated with correct logic
+
 use sqlx::{PgPool, Row};
 use anyhow::Result;
 use std::collections::HashMap;
@@ -16,7 +18,8 @@ pub async fn get_companies(
                 "SELECT DISTINCT company FROM trips 
                  WHERE deleted_at IS NULL 
                  AND date BETWEEN $1 AND $2 
-                 AND company = $3"
+                 AND company = $3
+                 ORDER BY company"
             )
             .bind(start_date)
             .bind(end_date)
@@ -40,7 +43,8 @@ pub async fn get_companies(
             sqlx::query_scalar(
                 "SELECT DISTINCT company FROM trips 
                  WHERE deleted_at IS NULL 
-                 AND company = $1"
+                 AND company = $1
+                 ORDER BY company"
             )
             .bind(company)
             .fetch_all(pool)
@@ -67,33 +71,46 @@ pub async fn get_petrol_arrows_stats(
     has_financial_access: bool,
 ) -> Result<Vec<TripStatisticsDetails>> {
     let query = r#"
+        WITH trip_data AS (
+            SELECT 
+                t.drop_off_point,
+                t.parent_trip_id,
+                t.tank_capacity,
+                COALESCE(fm.distance, 0.0) as distance,
+                COALESCE(fm.fee::float8, 0.0) as fee,
+                -- Calculate revenue per row
+                (t.tank_capacity * COALESCE(fm.fee::float8, 0.0) / 1000.0)::float8 as trip_revenue
+            FROM trips t
+            LEFT JOIN fee_mappings fm 
+                ON t.company = fm.company 
+                AND t.terminal = fm.terminal 
+                AND t.drop_off_point = fm.drop_off_point
+            WHERE t.company = 'Petrol Arrows'
+                AND t.deleted_at IS NULL
+                AND t.date BETWEEN $1 AND $2
+        ),
+        aggregates AS (
+            SELECT 
+                drop_off_point,
+                -- Count distinct parent trips + standalone trips
+                COALESCE(COUNT(DISTINCT parent_trip_id) FILTER (WHERE parent_trip_id IS NOT NULL AND parent_trip_id != 0), 0) +
+                COALESCE(COUNT(*) FILTER (WHERE parent_trip_id IS NULL OR parent_trip_id = 0), 0) as total_trips,
+                COALESCE(SUM(tank_capacity), 0.0)::float8 as total_volume,
+                COALESCE(SUM(distance), 0.0)::float8 as total_distance,
+                COALESCE(MAX(fee), 0.0)::float8 as fee,
+                COALESCE(SUM(trip_revenue), 0.0)::float8 as total_revenue
+            FROM trip_data
+            GROUP BY drop_off_point
+        )
         SELECT 
-            t.drop_off_point as group_name,
-            (COALESCE(COUNT(DISTINCT CASE 
-                WHEN t.parent_trip_id IS NOT NULL AND t.parent_trip_id != 0 
-                THEN t.parent_trip_id 
-            END), 0) + 
-            COALESCE(COUNT(CASE 
-                WHEN t.parent_trip_id IS NULL OR t.parent_trip_id = 0 
-                THEN 1 
-            END), 0))::bigint as total_trips,
-            COALESCE(SUM(t.tank_capacity), 0.0)::float8 as total_volume,
-            COALESCE(SUM(fm.distance), 0.0)::float8 as total_distance,
-            COALESCE(MAX(fm.fee::float8), 0.0)::float8 as fee,
-            CASE 
-                WHEN $3 THEN COALESCE(MAX(fm.fee::float8) * SUM(t.tank_capacity) / 1000.0, 0.0)::float8 
-                ELSE 0.0
-            END as total_revenue
-        FROM trips t
-        LEFT JOIN fee_mappings fm 
-            ON t.company = fm.company 
-            AND t.terminal = fm.terminal 
-            AND t.drop_off_point = fm.drop_off_point
-        WHERE t.company = 'Petrol Arrows'
-            AND t.deleted_at IS NULL
-            AND t.date BETWEEN $1 AND $2
-        GROUP BY t.drop_off_point
-        ORDER BY t.drop_off_point
+            drop_off_point as group_name,
+            total_trips::bigint,
+            total_volume,
+            total_distance,
+            fee,
+            CASE WHEN $3 THEN total_revenue ELSE 0.0 END as total_revenue
+        FROM aggregates
+        ORDER BY drop_off_point
     "#;
 
     let rows = sqlx::query(query)
@@ -138,7 +155,12 @@ pub async fn get_taqa_stats(
                 t.car_no_plate,
                 t.date,
                 t.tank_capacity,
-                COALESCE(fm.distance, 0.0) as distance
+                COALESCE(fm.distance, 0.0) as distance,
+                -- Calculate distance-based revenue per row
+                (CASE 
+                    WHEN t.terminal IN ('Alex', 'Suez') THEN COALESCE(fm.distance, 0.0) * 40.7
+                    ELSE 0.0
+                END)::float8 as trip_revenue
             FROM trips t
             LEFT JOIN fee_mappings fm 
                 ON t.company = fm.company 
@@ -148,6 +170,7 @@ pub async fn get_taqa_stats(
                 AND t.deleted_at IS NULL
                 AND t.date BETWEEN $1 AND $2
         ),
+        -- Calculate working days per car for car rental
         car_working_days AS (
             SELECT 
                 terminal,
@@ -157,6 +180,7 @@ pub async fn get_taqa_stats(
             WHERE parent_trip_id IS NULL OR parent_trip_id = 0
             GROUP BY terminal, car_no_plate
         ),
+        -- Calculate car rental per terminal
         car_rentals AS (
             SELECT 
                 terminal,
@@ -170,49 +194,31 @@ pub async fn get_taqa_stats(
             FROM car_working_days
             GROUP BY terminal
         ),
+        -- Aggregate trip data
         aggregates AS (
             SELECT 
                 terminal,
-                (COALESCE(COUNT(DISTINCT CASE 
-                    WHEN parent_trip_id IS NOT NULL AND parent_trip_id != 0 
-                    THEN parent_trip_id 
-                END), 0) + 
-                COALESCE(COUNT(CASE 
-                    WHEN parent_trip_id IS NULL OR parent_trip_id = 0 
-                    THEN 1 
-                END), 0))::bigint as total_trips,
+                COALESCE(COUNT(DISTINCT parent_trip_id) FILTER (WHERE parent_trip_id IS NOT NULL AND parent_trip_id != 0), 0) +
+                COALESCE(COUNT(*) FILTER (WHERE parent_trip_id IS NULL OR parent_trip_id = 0), 0) as total_trips,
                 COALESCE(SUM(tank_capacity), 0.0)::float8 as total_volume,
                 COALESCE(SUM(distance), 0.0)::float8 as total_distance,
                 COUNT(DISTINCT car_no_plate)::bigint as distinct_cars,
-                COUNT(DISTINCT date)::bigint as distinct_days
+                COUNT(DISTINCT date)::bigint as distinct_days,
+                COALESCE(SUM(trip_revenue), 0.0)::float8 as base_revenue
             FROM trip_data
             GROUP BY terminal
         )
         SELECT 
             a.terminal as group_name,
-            a.total_trips,
+            a.total_trips::bigint,
             a.total_volume,
             a.total_distance,
             a.distinct_cars,
             a.distinct_days,
             COALESCE(cr.total_car_days, 0)::bigint as car_days,
-            CASE 
-                WHEN $3 THEN 
-                    CASE 
-                        WHEN a.terminal IN ('Alex', 'Suez') THEN (a.total_distance * 40.7)::float8
-                        ELSE 0.0
-                    END
-                ELSE 0.0
-            END as base_revenue,
+            CASE WHEN $3 THEN a.base_revenue ELSE 0.0 END as base_revenue,
             CASE WHEN $3 THEN COALESCE(cr.total_car_rental, 0.0)::float8 ELSE NULL END as car_rental,
-            CASE 
-                WHEN $3 THEN 
-                    ((CASE 
-                        WHEN a.terminal IN ('Alex', 'Suez') THEN a.total_distance * 40.7
-                        ELSE 0.0
-                    END + COALESCE(cr.total_car_rental, 0.0)) * 0.14)::float8
-                ELSE NULL 
-            END as vat,
+            CASE WHEN $3 THEN ((a.base_revenue + COALESCE(cr.total_car_rental, 0.0)) * 0.14)::float8 ELSE NULL END as vat,
             CASE 
                 WHEN a.terminal IN ('Alex', 'Suez') THEN 40.7
                 ELSE 0.0
@@ -280,7 +286,9 @@ pub async fn get_petromin_stats(
                 t.car_no_plate,
                 t.date,
                 t.tank_capacity,
-                COALESCE(fm.distance, 0.0) as distance
+                COALESCE(fm.distance, 0.0) as distance,
+                -- Calculate distance-based revenue per row
+                (COALESCE(fm.distance, 0.0) * 42.5)::float8 as trip_revenue
             FROM trips t
             LEFT JOIN fee_mappings fm 
                 ON t.company = fm.company 
@@ -290,6 +298,7 @@ pub async fn get_petromin_stats(
                 AND t.deleted_at IS NULL
                 AND t.date BETWEEN $1 AND $2
         ),
+        -- Calculate car-days (unique car-date combinations for standalone trips)
         car_days AS (
             SELECT 
                 terminal,
@@ -298,35 +307,31 @@ pub async fn get_petromin_stats(
             WHERE parent_trip_id IS NULL OR parent_trip_id = 0
             GROUP BY terminal
         ),
+        -- Aggregate trip data
         aggregates AS (
             SELECT 
                 terminal,
-                (COALESCE(COUNT(DISTINCT CASE 
-                    WHEN parent_trip_id IS NOT NULL AND parent_trip_id != 0 
-                    THEN parent_trip_id 
-                END), 0) + 
-                COALESCE(COUNT(CASE 
-                    WHEN parent_trip_id IS NULL OR parent_trip_id = 0 
-                    THEN 1 
-                END), 0))::bigint as total_trips,
+                COALESCE(COUNT(DISTINCT parent_trip_id) FILTER (WHERE parent_trip_id IS NOT NULL AND parent_trip_id != 0), 0) +
+                COALESCE(COUNT(*) FILTER (WHERE parent_trip_id IS NULL OR parent_trip_id = 0), 0) as total_trips,
                 COALESCE(SUM(tank_capacity), 0.0)::float8 as total_volume,
                 COALESCE(SUM(distance), 0.0)::float8 as total_distance,
                 COUNT(DISTINCT car_no_plate)::bigint as distinct_cars,
-                COUNT(DISTINCT date)::bigint as distinct_days
+                COUNT(DISTINCT date)::bigint as distinct_days,
+                COALESCE(SUM(trip_revenue), 0.0)::float8 as base_revenue
             FROM trip_data
             GROUP BY terminal
         )
         SELECT 
             a.terminal as group_name,
-            a.total_trips,
+            a.total_trips::bigint,
             a.total_volume,
             a.total_distance,
             a.distinct_cars,
             a.distinct_days,
             cd.total_car_days as car_days,
-            CASE WHEN $3 THEN (a.total_distance * 42.5)::float8 ELSE 0.0 END as base_revenue,
+            CASE WHEN $3 THEN a.base_revenue ELSE 0.0 END as base_revenue,
             CASE WHEN $3 THEN (cd.total_car_days * 2000.0)::float8 ELSE NULL END as car_rental,
-            CASE WHEN $3 THEN ((a.total_distance * 42.5 + cd.total_car_days * 2000.0) * 0.14)::float8 ELSE NULL END as vat,
+            CASE WHEN $3 THEN ((a.base_revenue + cd.total_car_days * 2000.0) * 0.14)::float8 ELSE NULL END as vat,
             42.5 as fee
         FROM aggregates a
         JOIN car_days cd ON a.terminal = cd.terminal
@@ -389,7 +394,17 @@ pub async fn get_watanya_stats(
                 t.parent_trip_id,
                 t.tank_capacity,
                 COALESCE(fm.distance, 0.0) as distance,
-                fm.fee::float8 as fee
+                fm.fee::float8 as fee,
+                -- Calculate revenue per row based on fee tier
+                (t.tank_capacity * 
+                    CASE fm.fee::int
+                        WHEN 1 THEN 82.5
+                        WHEN 2 THEN 104.5
+                        WHEN 3 THEN 126.5
+                        WHEN 4 THEN 148.5
+                        WHEN 5 THEN 170.5
+                        ELSE 0.0
+                    END / 1000.0)::float8 as trip_revenue
             FROM trips t
             LEFT JOIN fee_mappings fm 
                 ON t.company = fm.company 
@@ -403,51 +418,22 @@ pub async fn get_watanya_stats(
         aggregates AS (
             SELECT 
                 fee,
-                (COALESCE(COUNT(DISTINCT CASE 
-                    WHEN parent_trip_id IS NOT NULL AND parent_trip_id != 0 
-                    THEN parent_trip_id 
-                END), 0) + 
-                COALESCE(COUNT(CASE 
-                    WHEN parent_trip_id IS NULL OR parent_trip_id = 0 
-                    THEN 1 
-                END), 0))::bigint as total_trips,
+                COALESCE(COUNT(DISTINCT parent_trip_id) FILTER (WHERE parent_trip_id IS NOT NULL AND parent_trip_id != 0), 0) +
+                COALESCE(COUNT(*) FILTER (WHERE parent_trip_id IS NULL OR parent_trip_id = 0), 0) as total_trips,
                 COALESCE(SUM(tank_capacity), 0.0)::float8 as total_volume, 
-                COALESCE(SUM(distance), 0.0)::float8 as total_distance
+                COALESCE(SUM(distance), 0.0)::float8 as total_distance,
+                COALESCE(SUM(trip_revenue), 0.0)::float8 as base_revenue
             FROM trip_data
             GROUP BY fee
         )
         SELECT 
             'Fee ' || a.fee::text as group_name,
-            a.total_trips,
+            a.total_trips::bigint,
             a.total_volume,
             a.total_distance,
             a.fee,
-            CASE 
-                WHEN $3 THEN 
-                    (a.total_volume * 
-                    CASE a.fee::int
-                        WHEN 1 THEN 82.5
-                        WHEN 2 THEN 104.5
-                        WHEN 3 THEN 126.5
-                        WHEN 4 THEN 148.5
-                        WHEN 5 THEN 170.5
-                        ELSE 0.0
-                    END / 1000.0)::float8
-                ELSE 0.0
-            END as base_revenue,
-            CASE 
-                WHEN $3 THEN 
-                    (a.total_volume * 
-                    CASE a.fee::int
-                        WHEN 1 THEN 82.5
-                        WHEN 2 THEN 104.5
-                        WHEN 3 THEN 126.5
-                        WHEN 4 THEN 148.5
-                        WHEN 5 THEN 170.5
-                        ELSE 0.0
-                    END / 1000.0 * 0.14)::float8
-                ELSE NULL 
-            END as vat
+            CASE WHEN $3 THEN a.base_revenue ELSE 0.0 END as base_revenue,
+            CASE WHEN $3 THEN (a.base_revenue * 0.14)::float8 ELSE NULL END as vat
         FROM aggregates a
         ORDER BY a.fee
     "#;
@@ -521,7 +507,17 @@ async fn get_watanya_route_details(
                 t.date,
                 t.tank_capacity,
                 COALESCE(fm.distance, 0.0) as distance,
-                fm.fee::float8 as fee
+                fm.fee::float8 as fee,
+                -- Calculate revenue per row
+                (t.tank_capacity * 
+                    CASE fm.fee::int
+                        WHEN 1 THEN 82.5
+                        WHEN 2 THEN 104.5
+                        WHEN 3 THEN 126.5
+                        WHEN 4 THEN 148.5
+                        WHEN 5 THEN 170.5
+                        ELSE 0.0
+                    END / 1000.0)::float8 as trip_revenue
             FROM trips t
             LEFT JOIN fee_mappings fm 
                 ON t.company = fm.company 
@@ -536,33 +532,19 @@ async fn get_watanya_route_details(
             SELECT 
                 fee,
                 car_no_plate,
-                (COALESCE(COUNT(DISTINCT CASE 
-                    WHEN parent_trip_id IS NOT NULL AND parent_trip_id != 0 
-                    THEN parent_trip_id 
-                END), 0) + 
-                COALESCE(COUNT(CASE 
-                    WHEN parent_trip_id IS NULL OR parent_trip_id = 0 
-                    THEN 1 
-                END), 0))::bigint as total_trips,
+                COALESCE(COUNT(DISTINCT parent_trip_id) FILTER (WHERE parent_trip_id IS NOT NULL AND parent_trip_id != 0), 0) +
+                COALESCE(COUNT(*) FILTER (WHERE parent_trip_id IS NULL OR parent_trip_id = 0), 0) as total_trips,
                 COALESCE(SUM(tank_capacity), 0.0)::float8 as total_volume,
                 COALESCE(SUM(distance), 0.0)::float8 as total_distance,
                 COUNT(DISTINCT date)::bigint as working_days,
-                (COALESCE(SUM(tank_capacity), 0.0) * 
-                    CASE fee::int
-                        WHEN 1 THEN 82.5
-                        WHEN 2 THEN 104.5
-                        WHEN 3 THEN 126.5
-                        WHEN 4 THEN 148.5
-                        WHEN 5 THEN 170.5
-                        ELSE 0.0
-                    END / 1000.0)::float8 as base_revenue
+                COALESCE(SUM(trip_revenue), 0.0)::float8 as base_revenue
             FROM trip_data
             GROUP BY fee, car_no_plate
         )
         SELECT 
             fee,
             car_no_plate,
-            total_trips,
+            total_trips::bigint,
             total_volume,
             total_distance,
             working_days,
@@ -654,7 +636,12 @@ async fn get_taqa_route_details(
                 t.parent_trip_id,
                 t.date,
                 t.tank_capacity,
-                COALESCE(fm.distance, 0.0) as distance
+                COALESCE(fm.distance, 0.0) as distance,
+                -- Calculate distance-based revenue per row
+                (CASE 
+                    WHEN t.terminal IN ('Alex', 'Suez') THEN COALESCE(fm.distance, 0.0) * 40.7
+                    ELSE 0.0
+                END)::float8 as trip_revenue
             FROM trips t
             LEFT JOIN fee_mappings fm 
                 ON t.company = fm.company 
@@ -678,14 +665,8 @@ async fn get_taqa_route_details(
             SELECT 
                 td.terminal,
                 td.car_no_plate,
-                (COALESCE(COUNT(DISTINCT CASE 
-                    WHEN td.parent_trip_id IS NOT NULL AND td.parent_trip_id != 0 
-                    THEN td.parent_trip_id 
-                END), 0) + 
-                COALESCE(COUNT(CASE 
-                    WHEN td.parent_trip_id IS NULL OR td.parent_trip_id = 0 
-                    THEN 1 
-                END), 0))::bigint as total_trips,
+                COALESCE(COUNT(DISTINCT td.parent_trip_id) FILTER (WHERE td.parent_trip_id IS NOT NULL AND td.parent_trip_id != 0), 0) +
+                COALESCE(COUNT(*) FILTER (WHERE td.parent_trip_id IS NULL OR td.parent_trip_id = 0), 0) as total_trips,
                 COALESCE(SUM(td.tank_capacity), 0.0)::float8 as total_volume,
                 COALESCE(SUM(td.distance), 0.0)::float8 as total_distance,
                 COALESCE(cwd.working_days, 0)::bigint as working_days,
@@ -694,7 +675,7 @@ async fn get_taqa_route_details(
                     WHEN COALESCE(cwd.working_days, 0) >= 28 THEN 43000.0
                     ELSE GREATEST(0.0, 43000.0 - ((28 - COALESCE(cwd.working_days, 0)) * 1433.0))
                 END::float8 as car_rental,
-                (COALESCE(SUM(td.distance), 0.0) * 40.7)::float8 as base_revenue
+                COALESCE(SUM(td.trip_revenue), 0.0)::float8 as base_revenue
             FROM trip_data td
             LEFT JOIN car_working_days cwd 
                 ON td.terminal = cwd.terminal 
@@ -704,10 +685,10 @@ async fn get_taqa_route_details(
         SELECT 
             terminal,
             car_no_plate,
-            total_trips,
+            total_trips::bigint,
             total_volume,
             total_distance,
-            0::bigint as working_days_display,  -- Go shows 0 here
+            0::bigint as working_days_display,  -- Display 0 for UI consistency
             CASE WHEN $3 THEN base_revenue ELSE NULL END as total_revenue,
             CASE WHEN $3 THEN car_rental ELSE NULL END as car_rental,
             CASE WHEN $3 THEN ((base_revenue + car_rental) * 0.14)::float8 ELSE NULL END as vat,
@@ -734,7 +715,7 @@ async fn get_taqa_route_details(
             total_volume: row.get("total_volume"),
             total_distance: row.get("total_distance"),
             total_revenue: row.try_get("total_revenue").ok().flatten(),
-            working_days: row.get("working_days_display"),  // This will be 0 to match Go
+            working_days: row.get("working_days_display"),
             car_rental: row.try_get("car_rental").ok().flatten(),
             vat: row.try_get("vat").ok().flatten(),
             total_with_vat: row.try_get("total_with_vat").ok().flatten(),
@@ -797,7 +778,9 @@ async fn get_petromin_route_details(
                 t.parent_trip_id,
                 t.date,
                 t.tank_capacity,
-                COALESCE(fm.distance, 0.0) as distance
+                COALESCE(fm.distance, 0.0) as distance,
+                -- Calculate distance-based revenue per row
+                (COALESCE(fm.distance, 0.0) * 42.5)::float8 as trip_revenue
             FROM trips t
             LEFT JOIN fee_mappings fm 
                 ON t.company = fm.company 
@@ -821,19 +804,13 @@ async fn get_petromin_route_details(
             SELECT 
                 td.terminal,
                 td.car_no_plate,
-                (COALESCE(COUNT(DISTINCT CASE 
-                    WHEN td.parent_trip_id IS NOT NULL AND td.parent_trip_id != 0 
-                    THEN td.parent_trip_id 
-                END), 0) + 
-                COALESCE(COUNT(CASE 
-                    WHEN td.parent_trip_id IS NULL OR td.parent_trip_id = 0 
-                    THEN 1 
-                END), 0))::bigint as total_trips,
+                COALESCE(COUNT(DISTINCT td.parent_trip_id) FILTER (WHERE td.parent_trip_id IS NOT NULL AND td.parent_trip_id != 0), 0) +
+                COALESCE(COUNT(*) FILTER (WHERE td.parent_trip_id IS NULL OR td.parent_trip_id = 0), 0) as total_trips,
                 COALESCE(SUM(td.tank_capacity), 0.0)::float8 as total_volume,
                 COALESCE(SUM(td.distance), 0.0)::float8 as total_distance,
                 COALESCE(cwd.working_days, 0)::bigint as working_days,
                 (COALESCE(cwd.working_days, 0) * 2000.0)::float8 as car_rental,
-                (COALESCE(SUM(td.distance), 0.0) * 42.5)::float8 as base_revenue
+                COALESCE(SUM(td.trip_revenue), 0.0)::float8 as base_revenue
             FROM trip_data td
             LEFT JOIN car_working_days cwd 
                 ON td.terminal = cwd.terminal 
@@ -843,10 +820,10 @@ async fn get_petromin_route_details(
         SELECT 
             terminal,
             car_no_plate,
-            total_trips,
+            total_trips::bigint,
             total_volume,
             total_distance,
-            0::bigint as working_days_display,  -- Go shows 0 here
+            0::bigint as working_days_display,  -- Display 0 for UI consistency
             CASE WHEN $3 THEN base_revenue ELSE NULL END as total_revenue,
             CASE WHEN $3 THEN car_rental ELSE NULL END as car_rental,
             CASE WHEN $3 THEN ((base_revenue + car_rental) * 0.14)::float8 ELSE NULL END as vat,
@@ -873,7 +850,7 @@ async fn get_petromin_route_details(
             total_volume: row.get("total_volume"),
             total_distance: row.get("total_distance"),
             total_revenue: row.try_get("total_revenue").ok().flatten(),
-            working_days: row.get("working_days_display"),  // This will be 0 to match Go
+            working_days: row.get("working_days_display"),
             car_rental: row.try_get("car_rental").ok().flatten(),
             vat: row.try_get("vat").ok().flatten(),
             total_with_vat: row.try_get("total_with_vat").ok().flatten(),
@@ -938,7 +915,9 @@ async fn get_petrol_arrows_route_details(
                 t.date,
                 t.tank_capacity,
                 COALESCE(fm.distance, 0.0) as distance,
-                COALESCE(fm.fee::float8, 0.0) as fee
+                COALESCE(fm.fee::float8, 0.0) as fee,
+                -- Calculate revenue per row
+                (t.tank_capacity * COALESCE(fm.fee::float8, 0.0) / 1000.0)::float8 as trip_revenue
             FROM trips t
             LEFT JOIN fee_mappings fm 
                 ON t.company = fm.company 
@@ -954,18 +933,12 @@ async fn get_petrol_arrows_route_details(
                 drop_off_point,
                 fee,
                 car_no_plate,
-                (COALESCE(COUNT(DISTINCT CASE 
-                    WHEN parent_trip_id IS NOT NULL AND parent_trip_id != 0 
-                    THEN parent_trip_id 
-                END), 0) + 
-                COALESCE(COUNT(CASE 
-                    WHEN parent_trip_id IS NULL OR parent_trip_id = 0 
-                    THEN 1 
-                END), 0))::bigint as total_trips,
+                COALESCE(COUNT(DISTINCT parent_trip_id) FILTER (WHERE parent_trip_id IS NOT NULL AND parent_trip_id != 0), 0) +
+                COALESCE(COUNT(*) FILTER (WHERE parent_trip_id IS NULL OR parent_trip_id = 0), 0) as total_trips,
                 COALESCE(SUM(tank_capacity), 0.0)::float8 as total_volume,
                 COALESCE(SUM(distance), 0.0)::float8 as total_distance,
                 COUNT(DISTINCT date)::bigint as working_days,
-                (COALESCE(MAX(fee), 0.0) * COALESCE(SUM(tank_capacity), 0.0) / 1000.0)::float8 as base_revenue
+                COALESCE(SUM(trip_revenue), 0.0)::float8 as base_revenue
             FROM trip_data
             GROUP BY terminal, drop_off_point, fee, car_no_plate
         )
@@ -974,7 +947,7 @@ async fn get_petrol_arrows_route_details(
             drop_off_point,
             fee,
             car_no_plate,
-            total_trips,
+            total_trips::bigint,
             total_volume,
             total_distance,
             working_days,
@@ -1062,8 +1035,8 @@ pub async fn get_stats_by_date(
     company_filter: Option<&str>,
     has_financial_access: bool,
 ) -> Result<Vec<TripRevenueDateResponse>> {
-    let query = match company_filter {
-        Some(_) => {
+    let (query, bindings) = if let Some(company) = company_filter {
+        (
             r#"
             WITH trip_data AS (
                 SELECT 
@@ -1075,7 +1048,30 @@ pub async fn get_stats_by_date(
                     t.terminal,
                     t.drop_off_point,
                     COALESCE(fm.distance, 0.0) as distance,
-                    COALESCE(fm.fee::float8, 0.0) as fee
+                    COALESCE(fm.fee::float8, 0.0) as fee,
+                    -- Calculate revenue per row based on company
+                    CASE 
+                        WHEN t.company = 'Watanya' THEN
+                            (t.tank_capacity * 
+                                CASE fm.fee::int
+                                    WHEN 1 THEN 82.5
+                                    WHEN 2 THEN 104.5
+                                    WHEN 3 THEN 126.5
+                                    WHEN 4 THEN 148.5
+                                    WHEN 5 THEN 170.5
+                                    ELSE 0.0
+                                END / 1000.0)::float8
+                        WHEN t.company = 'TAQA' THEN
+                            (CASE 
+                                WHEN t.terminal IN ('Alex', 'Suez') THEN COALESCE(fm.distance, 0.0) * 40.7
+                                ELSE 0.0
+                            END)::float8
+                        WHEN t.company = 'Petromin' THEN
+                            (COALESCE(fm.distance, 0.0) * 42.5)::float8
+                        WHEN t.company = 'Petrol Arrows' THEN
+                            (t.tank_capacity * COALESCE(fm.fee::float8, 0.0) / 1000.0)::float8
+                        ELSE 0.0
+                    END as trip_revenue
                 FROM trips t
                 LEFT JOIN fee_mappings fm 
                     ON t.company = fm.company 
@@ -1089,43 +1085,11 @@ pub async fn get_stats_by_date(
                 SELECT 
                     date,
                     company,
-                    (COALESCE(COUNT(DISTINCT CASE 
-                        WHEN parent_trip_id IS NOT NULL AND parent_trip_id != 0 
-                        THEN parent_trip_id 
-                    END), 0) + 
-                    COALESCE(COUNT(CASE 
-                        WHEN parent_trip_id IS NULL OR parent_trip_id = 0 
-                        THEN 1 
-                    END), 0))::bigint as total_trips,
+                    COALESCE(COUNT(DISTINCT parent_trip_id) FILTER (WHERE parent_trip_id IS NOT NULL AND parent_trip_id != 0), 0) +
+                    COALESCE(COUNT(*) FILTER (WHERE parent_trip_id IS NULL OR parent_trip_id = 0), 0) as total_trips,
                     COALESCE(SUM(tank_capacity), 0.0)::float8 as total_volume,
                     COALESCE(SUM(distance), 0.0)::float8 as total_distance,
-                    -- Calculate revenue based on company
-                    CASE 
-                        WHEN company = 'Watanya' THEN
-                            COALESCE(SUM(
-                                tank_capacity * 
-                                CASE fee::int
-                                    WHEN 1 THEN 82.5
-                                    WHEN 2 THEN 104.5
-                                    WHEN 3 THEN 126.5
-                                    WHEN 4 THEN 148.5
-                                    WHEN 5 THEN 170.5
-                                    ELSE 0.0
-                                END / 1000.0
-                            ), 0.0)::float8
-                        WHEN company = 'TAQA' THEN
-                            COALESCE(SUM(
-                                CASE 
-                                    WHEN terminal IN ('Alex', 'Suez') THEN distance * 40.7
-                                    ELSE 0.0
-                                END
-                            ), 0.0)::float8
-                        WHEN company = 'Petromin' THEN
-                            COALESCE(SUM(distance * 42.5), 0.0)::float8
-                        WHEN company = 'Petrol Arrows' THEN
-                            COALESCE(SUM(fee * tank_capacity / 1000.0), 0.0)::float8
-                        ELSE 0.0
-                    END as total_revenue
+                    COALESCE(SUM(trip_revenue), 0.0)::float8 as total_revenue
                 FROM trip_data
                 GROUP BY date, company
             ),
@@ -1159,9 +1123,11 @@ pub async fn get_stats_by_date(
             JOIN company_stats cs ON dt.date = cs.date
             GROUP BY dt.date, dt.total_trips, dt.total_volume, dt.total_distance, dt.total_revenue
             ORDER BY dt.date ASC
-            "#
-        }
-        None => {
+            "#,
+            vec![start_date, end_date, company]
+        )
+    } else {
+        (
             r#"
             WITH trip_data AS (
                 SELECT 
@@ -1173,7 +1139,30 @@ pub async fn get_stats_by_date(
                     t.terminal,
                     t.drop_off_point,
                     COALESCE(fm.distance, 0.0) as distance,
-                    COALESCE(fm.fee::float8, 0.0) as fee
+                    COALESCE(fm.fee::float8, 0.0) as fee,
+                    -- Calculate revenue per row based on company
+                    CASE 
+                        WHEN t.company = 'Watanya' THEN
+                            (t.tank_capacity * 
+                                CASE fm.fee::int
+                                    WHEN 1 THEN 82.5
+                                    WHEN 2 THEN 104.5
+                                    WHEN 3 THEN 126.5
+                                    WHEN 4 THEN 148.5
+                                    WHEN 5 THEN 170.5
+                                    ELSE 0.0
+                                END / 1000.0)::float8
+                        WHEN t.company = 'TAQA' THEN
+                            (CASE 
+                                WHEN t.terminal IN ('Alex', 'Suez') THEN COALESCE(fm.distance, 0.0) * 40.7
+                                ELSE 0.0
+                            END)::float8
+                        WHEN t.company = 'Petromin' THEN
+                            (COALESCE(fm.distance, 0.0) * 42.5)::float8
+                        WHEN t.company = 'Petrol Arrows' THEN
+                            (t.tank_capacity * COALESCE(fm.fee::float8, 0.0) / 1000.0)::float8
+                        ELSE 0.0
+                    END as trip_revenue
                 FROM trips t
                 LEFT JOIN fee_mappings fm 
                     ON t.company = fm.company 
@@ -1186,43 +1175,11 @@ pub async fn get_stats_by_date(
                 SELECT 
                     date,
                     company,
-                    (COALESCE(COUNT(DISTINCT CASE 
-                        WHEN parent_trip_id IS NOT NULL AND parent_trip_id != 0 
-                        THEN parent_trip_id 
-                    END), 0) + 
-                    COALESCE(COUNT(CASE 
-                        WHEN parent_trip_id IS NULL OR parent_trip_id = 0 
-                        THEN 1 
-                    END), 0))::bigint as total_trips,
+                    COALESCE(COUNT(DISTINCT parent_trip_id) FILTER (WHERE parent_trip_id IS NOT NULL AND parent_trip_id != 0), 0) +
+                    COALESCE(COUNT(*) FILTER (WHERE parent_trip_id IS NULL OR parent_trip_id = 0), 0) as total_trips,
                     COALESCE(SUM(tank_capacity), 0.0)::float8 as total_volume,
                     COALESCE(SUM(distance), 0.0)::float8 as total_distance,
-                    -- Calculate revenue based on company
-                    CASE 
-                        WHEN company = 'Watanya' THEN
-                            COALESCE(SUM(
-                                tank_capacity * 
-                                CASE fee::int
-                                    WHEN 1 THEN 82.5
-                                    WHEN 2 THEN 104.5
-                                    WHEN 3 THEN 126.5
-                                    WHEN 4 THEN 148.5
-                                    WHEN 5 THEN 170.5
-                                    ELSE 0.0
-                                END / 1000.0
-                            ), 0.0)::float8
-                        WHEN company = 'TAQA' THEN
-                            COALESCE(SUM(
-                                CASE 
-                                    WHEN terminal IN ('Alex', 'Suez') THEN distance * 40.7
-                                    ELSE 0.0
-                                END
-                            ), 0.0)::float8
-                        WHEN company = 'Petromin' THEN
-                            COALESCE(SUM(distance * 42.5), 0.0)::float8
-                        WHEN company = 'Petrol Arrows' THEN
-                            COALESCE(SUM(fee * tank_capacity / 1000.0), 0.0)::float8
-                        ELSE 0.0
-                    END as total_revenue
+                    COALESCE(SUM(trip_revenue), 0.0)::float8 as total_revenue
                 FROM trip_data
                 GROUP BY date, company
             ),
@@ -1256,26 +1213,24 @@ pub async fn get_stats_by_date(
             JOIN company_stats cs ON dt.date = cs.date
             GROUP BY dt.date, dt.total_trips, dt.total_volume, dt.total_distance, dt.total_revenue
             ORDER BY dt.date ASC
-            "#
-        }
+            "#,
+            vec![start_date, end_date]
+        )
     };
 
-    let rows = match company_filter {
-        Some(company) => {
-            sqlx::query(query)
-                .bind(start_date)
-                .bind(end_date)
-                .bind(company)
-                .fetch_all(pool)
-                .await?
-        }
-        None => {
-            sqlx::query(query)
-                .bind(start_date)
-                .bind(end_date)
-                .fetch_all(pool)
-                .await?
-        }
+    let rows = if bindings.len() == 3 {
+        sqlx::query(query)
+            .bind(bindings[0])
+            .bind(bindings[1])
+            .bind(bindings[2])
+            .fetch_all(pool)
+            .await?
+    } else {
+        sqlx::query(query)
+            .bind(bindings[0])
+            .bind(bindings[1])
+            .fetch_all(pool)
+            .await?
     };
 
     let mut result = Vec::new();
@@ -1326,7 +1281,6 @@ pub async fn get_stats_by_date(
 
     Ok(result)
 }
-
 
 pub fn calculate_car_totals(statistics: &[TripStatistics]) -> Vec<CarTotal> {
     let mut car_totals_map: HashMap<String, CarTotal> = HashMap::new();
