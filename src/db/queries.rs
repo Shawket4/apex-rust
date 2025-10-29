@@ -1081,17 +1081,81 @@ pub async fn get_stats_by_date(
                     AND t.company = $3
                     AND t.date BETWEEN $1 AND $2
             ),
+            -- Calculate car rental for TAQA
+            taqa_car_working_days AS (
+                SELECT 
+                    date,
+                    car_no_plate,
+                    COUNT(DISTINCT date)::int as working_days
+                FROM trip_data
+                WHERE company = 'TAQA'
+                    AND (parent_trip_id IS NULL OR parent_trip_id = 0)
+                GROUP BY date, car_no_plate
+            ),
+            taqa_car_rentals AS (
+                SELECT 
+                    date,
+                    SUM(
+                        CASE 
+                            WHEN working_days >= 28 THEN 43000.0
+                            ELSE GREATEST(0.0, 43000.0 - ((28 - working_days) * 1433.0))
+                        END
+                    )::float8 as daily_car_rental
+                FROM taqa_car_working_days
+                GROUP BY date
+            ),
+            -- Calculate car rental for Petromin
+            petromin_car_days AS (
+                SELECT 
+                    date,
+                    COUNT(DISTINCT car_no_plate)::bigint as daily_cars
+                FROM trip_data
+                WHERE company = 'Petromin'
+                    AND (parent_trip_id IS NULL OR parent_trip_id = 0)
+                GROUP BY date
+            ),
             company_stats AS (
+                SELECT 
+                    td.date,
+                    td.company,
+                    COALESCE(COUNT(DISTINCT td.parent_trip_id) FILTER (WHERE td.parent_trip_id IS NOT NULL AND td.parent_trip_id != 0), 0) +
+                    COALESCE(COUNT(*) FILTER (WHERE td.parent_trip_id IS NULL OR td.parent_trip_id = 0), 0) as total_trips,
+                    COALESCE(SUM(td.tank_capacity), 0.0)::float8 as total_volume,
+                    COALESCE(SUM(td.distance), 0.0)::float8 as total_distance,
+                    COALESCE(SUM(td.trip_revenue), 0.0)::float8 as base_revenue,
+                    -- Calculate car rental based on company
+                    CASE 
+                        WHEN td.company = 'TAQA' THEN COALESCE(tcr.daily_car_rental, 0.0)
+                        WHEN td.company = 'Petromin' THEN COALESCE(pcd.daily_cars * 2000.0, 0.0)
+                        ELSE 0.0
+                    END::float8 as car_rental
+                FROM trip_data td
+                LEFT JOIN taqa_car_rentals tcr ON td.date = tcr.date AND td.company = 'TAQA'
+                LEFT JOIN petromin_car_days pcd ON td.date = pcd.date AND td.company = 'Petromin'
+                GROUP BY td.date, td.company, tcr.daily_car_rental, pcd.daily_cars
+            ),
+            company_stats_with_vat AS (
                 SELECT 
                     date,
                     company,
-                    COALESCE(COUNT(DISTINCT parent_trip_id) FILTER (WHERE parent_trip_id IS NOT NULL AND parent_trip_id != 0), 0) +
-                    COALESCE(COUNT(*) FILTER (WHERE parent_trip_id IS NULL OR parent_trip_id = 0), 0) as total_trips,
-                    COALESCE(SUM(tank_capacity), 0.0)::float8 as total_volume,
-                    COALESCE(SUM(distance), 0.0)::float8 as total_distance,
-                    COALESCE(SUM(trip_revenue), 0.0)::float8 as total_revenue
-                FROM trip_data
-                GROUP BY date, company
+                    total_trips,
+                    total_volume,
+                    total_distance,
+                    base_revenue,
+                    car_rental,
+                    -- Calculate VAT based on company
+                    CASE 
+                        WHEN company IN ('Watanya', 'TAQA', 'Petromin') THEN 
+                            ((base_revenue + car_rental) * 0.14)::float8
+                        ELSE 0.0
+                    END as vat,
+                    -- Calculate total revenue (base + car_rental + vat)
+                    CASE 
+                        WHEN company IN ('Watanya', 'TAQA', 'Petromin') THEN 
+                            (base_revenue + car_rental + (base_revenue + car_rental) * 0.14)::float8
+                        ELSE base_revenue
+                    END as total_revenue
+                FROM company_stats
             ),
             date_totals AS (
                 SELECT 
@@ -1100,7 +1164,7 @@ pub async fn get_stats_by_date(
                     COALESCE(SUM(total_volume), 0.0)::float8 as total_volume,
                     COALESCE(SUM(total_distance), 0.0)::float8 as total_distance,
                     COALESCE(SUM(total_revenue), 0.0)::float8 as total_revenue
-                FROM company_stats
+                FROM company_stats_with_vat
                 GROUP BY date
             )
             SELECT 
@@ -1115,12 +1179,14 @@ pub async fn get_stats_by_date(
                         'total_trips', cs.total_trips,
                         'total_volume', cs.total_volume,
                         'total_distance', cs.total_distance,
-                        'total_revenue', cs.total_revenue
+                        'total_revenue', cs.total_revenue,
+                        'car_rental', CASE WHEN cs.car_rental > 0 THEN cs.car_rental ELSE NULL END,
+                        'vat', CASE WHEN cs.vat > 0 THEN cs.vat ELSE NULL END
                     )
                     ORDER BY cs.company
                 ) as company_details
             FROM date_totals dt
-            JOIN company_stats cs ON dt.date = cs.date
+            JOIN company_stats_with_vat cs ON dt.date = cs.date
             GROUP BY dt.date, dt.total_trips, dt.total_volume, dt.total_distance, dt.total_revenue
             ORDER BY dt.date ASC
             "#,
@@ -1171,17 +1237,81 @@ pub async fn get_stats_by_date(
                 WHERE t.deleted_at IS NULL
                     AND t.date BETWEEN $1 AND $2
             ),
+            -- Calculate car rental for TAQA
+            taqa_car_working_days AS (
+                SELECT 
+                    date,
+                    car_no_plate,
+                    COUNT(DISTINCT date)::int as working_days
+                FROM trip_data
+                WHERE company = 'TAQA'
+                    AND (parent_trip_id IS NULL OR parent_trip_id = 0)
+                GROUP BY date, car_no_plate
+            ),
+            taqa_car_rentals AS (
+                SELECT 
+                    date,
+                    SUM(
+                        CASE 
+                            WHEN working_days >= 28 THEN 43000.0
+                            ELSE GREATEST(0.0, 43000.0 - ((28 - working_days) * 1433.0))
+                        END
+                    )::float8 as daily_car_rental
+                FROM taqa_car_working_days
+                GROUP BY date
+            ),
+            -- Calculate car rental for Petromin
+            petromin_car_days AS (
+                SELECT 
+                    date,
+                    COUNT(DISTINCT car_no_plate)::bigint as daily_cars
+                FROM trip_data
+                WHERE company = 'Petromin'
+                    AND (parent_trip_id IS NULL OR parent_trip_id = 0)
+                GROUP BY date
+            ),
             company_stats AS (
+                SELECT 
+                    td.date,
+                    td.company,
+                    COALESCE(COUNT(DISTINCT td.parent_trip_id) FILTER (WHERE td.parent_trip_id IS NOT NULL AND td.parent_trip_id != 0), 0) +
+                    COALESCE(COUNT(*) FILTER (WHERE td.parent_trip_id IS NULL OR td.parent_trip_id = 0), 0) as total_trips,
+                    COALESCE(SUM(td.tank_capacity), 0.0)::float8 as total_volume,
+                    COALESCE(SUM(td.distance), 0.0)::float8 as total_distance,
+                    COALESCE(SUM(td.trip_revenue), 0.0)::float8 as base_revenue,
+                    -- Calculate car rental based on company
+                    CASE 
+                        WHEN td.company = 'TAQA' THEN COALESCE(tcr.daily_car_rental, 0.0)
+                        WHEN td.company = 'Petromin' THEN COALESCE(pcd.daily_cars * 2000.0, 0.0)
+                        ELSE 0.0
+                    END::float8 as car_rental
+                FROM trip_data td
+                LEFT JOIN taqa_car_rentals tcr ON td.date = tcr.date AND td.company = 'TAQA'
+                LEFT JOIN petromin_car_days pcd ON td.date = pcd.date AND td.company = 'Petromin'
+                GROUP BY td.date, td.company, tcr.daily_car_rental, pcd.daily_cars
+            ),
+            company_stats_with_vat AS (
                 SELECT 
                     date,
                     company,
-                    COALESCE(COUNT(DISTINCT parent_trip_id) FILTER (WHERE parent_trip_id IS NOT NULL AND parent_trip_id != 0), 0) +
-                    COALESCE(COUNT(*) FILTER (WHERE parent_trip_id IS NULL OR parent_trip_id = 0), 0) as total_trips,
-                    COALESCE(SUM(tank_capacity), 0.0)::float8 as total_volume,
-                    COALESCE(SUM(distance), 0.0)::float8 as total_distance,
-                    COALESCE(SUM(trip_revenue), 0.0)::float8 as total_revenue
-                FROM trip_data
-                GROUP BY date, company
+                    total_trips,
+                    total_volume,
+                    total_distance,
+                    base_revenue,
+                    car_rental,
+                    -- Calculate VAT based on company
+                    CASE 
+                        WHEN company IN ('Watanya', 'TAQA', 'Petromin') THEN 
+                            ((base_revenue + car_rental) * 0.14)::float8
+                        ELSE 0.0
+                    END as vat,
+                    -- Calculate total revenue (base + car_rental + vat)
+                    CASE 
+                        WHEN company IN ('Watanya', 'TAQA', 'Petromin') THEN 
+                            (base_revenue + car_rental + (base_revenue + car_rental) * 0.14)::float8
+                        ELSE base_revenue
+                    END as total_revenue
+                FROM company_stats
             ),
             date_totals AS (
                 SELECT 
@@ -1190,7 +1320,7 @@ pub async fn get_stats_by_date(
                     COALESCE(SUM(total_volume), 0.0)::float8 as total_volume,
                     COALESCE(SUM(total_distance), 0.0)::float8 as total_distance,
                     COALESCE(SUM(total_revenue), 0.0)::float8 as total_revenue
-                FROM company_stats
+                FROM company_stats_with_vat
                 GROUP BY date
             )
             SELECT 
@@ -1205,12 +1335,14 @@ pub async fn get_stats_by_date(
                         'total_trips', cs.total_trips,
                         'total_volume', cs.total_volume,
                         'total_distance', cs.total_distance,
-                        'total_revenue', cs.total_revenue
+                        'total_revenue', cs.total_revenue,
+                        'car_rental', CASE WHEN cs.car_rental > 0 THEN cs.car_rental ELSE NULL END,
+                        'vat', CASE WHEN cs.vat > 0 THEN cs.vat ELSE NULL END
                     )
                     ORDER BY cs.company
                 ) as company_details
             FROM date_totals dt
-            JOIN company_stats cs ON dt.date = cs.date
+            JOIN company_stats_with_vat cs ON dt.date = cs.date
             GROUP BY dt.date, dt.total_trips, dt.total_volume, dt.total_distance, dt.total_revenue
             ORDER BY dt.date ASC
             "#,
@@ -1254,6 +1386,8 @@ pub async fn get_stats_by_date(
                     item.get("total_distance").and_then(|v| v.as_f64()),
                 ) {
                     let revenue = item.get("total_revenue").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                    let car_rental = item.get("car_rental").and_then(|v| v.as_f64());
+                    let vat = item.get("vat").and_then(|v| v.as_f64());
                     
                     company_details.push(CompanyRevenueDetails {
                         company: company.to_string(),
@@ -1261,9 +1395,9 @@ pub async fn get_stats_by_date(
                         total_volume: volume,
                         total_distance: distance,
                         total_revenue: if has_financial_access { Some(revenue) } else { None },
-                        vat: None,
-                        car_rental: None,
-                        total_with_vat: None,
+                        vat: if has_financial_access { vat } else { None },
+                        car_rental: if has_financial_access { car_rental } else { None },
+                        total_with_vat: if has_financial_access { Some(revenue) } else { None },
                     });
                 }
             }
