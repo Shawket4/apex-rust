@@ -1,33 +1,3 @@
-use serde::{Deserialize, Serialize};
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct Claims {
-    pub user_type: String,
-    pub user_id: Option<i32>,
-    pub driver_id: Option<i32>,
-    pub permission: Option<i32>,
-    pub exp: i64,
-}
-
-impl Claims {
-    pub fn is_admin(&self) -> bool {
-        self.user_type == "admin_user"
-    }
-    
-    pub fn is_driver(&self) -> bool {
-        self.user_type == "driver"
-    }
-    
-    pub fn has_permission(&self, required: i32) -> bool {
-        if !self.is_admin() {
-            return false;
-        }
-        
-        // Check if user has the required permission level
-        self.permission.map(|p| p >= required).unwrap_or(false)
-    }
-}
-
 use actix_web::{
     dev::{forward_ready, Service, ServiceRequest, ServiceResponse, Transform},
     Error, HttpMessage,
@@ -36,6 +6,9 @@ use futures_util::future::LocalBoxFuture;
 use jsonwebtoken::{decode, DecodingKey, Validation};
 use std::future::{ready, Ready};
 use crate::config::CONFIG;
+use crate::auth::claims::Claims;
+
+
 
 pub struct JwtAuth {
     pub required_permission: Option<i32>,

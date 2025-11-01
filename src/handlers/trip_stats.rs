@@ -26,6 +26,7 @@ pub async fn get_trip_statistics(
     // Check if user has permission level >= 3 for financial access
     // Permission 3+ = Full financial data
     // Permission 1-2 = Limited data (no revenue/VAT/car rental)
+    println!("{:?}", claims.as_ref().and_then(|c| c.permission).unwrap_or(0));
     let has_financial_access = claims
         .as_ref()
         .and_then(|c| c.permission)
