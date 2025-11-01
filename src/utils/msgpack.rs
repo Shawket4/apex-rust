@@ -3,10 +3,13 @@ use serde::Serialize;
 use anyhow::Result;
 
 pub fn msgpack_response<T: Serialize>(data: &T) -> Result<HttpResponse> {
-    let bytes = rmp_serde::to_vec(data)?;
+    // Serialize as named fields (maps) instead of arrays
+    let mut buf = Vec::new();
+    data.serialize(&mut rmp_serde::Serializer::new(&mut buf).with_struct_map())?;
+    
     Ok(HttpResponse::Ok()
         .insert_header((header::CONTENT_TYPE, "application/msgpack"))
-        .body(bytes))
+        .body(buf))
 }
 
 pub fn json_response<T: Serialize>(data: &T) -> Result<HttpResponse> {
