@@ -11,7 +11,7 @@ pub struct Claims {
 
 impl Claims {
     pub fn is_admin(&self) -> bool {
-        self.permission >= Some(3)
+        self.user_type == "admin_user"
     }
     
     pub fn is_driver(&self) -> bool {

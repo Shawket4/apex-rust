@@ -1,12 +1,40 @@
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct Claims {
+    pub user_type: String,
+    pub user_id: Option<i32>,
+    pub driver_id: Option<i32>,
+    pub permission: Option<i32>,
+    pub exp: i64,
+}
+
+impl Claims {
+    pub fn is_admin(&self) -> bool {
+        self.user_type == "admin_user"
+    }
+    
+    pub fn is_driver(&self) -> bool {
+        self.user_type == "driver"
+    }
+    
+    pub fn has_permission(&self, required: i32) -> bool {
+        if !self.is_admin() {
+            return false;
+        }
+        
+        // Check if user has the required permission level
+        self.permission.map(|p| p >= required).unwrap_or(false)
+    }
+}
+
 use actix_web::{
     dev::{forward_ready, Service, ServiceRequest, ServiceResponse, Transform},
-    Error, HttpMessage,  // Remove HttpResponse, add HttpMessage
+    Error, HttpMessage,
 };
 use futures_util::future::LocalBoxFuture;
 use jsonwebtoken::{decode, DecodingKey, Validation};
 use std::future::{ready, Ready};
-
-use crate::auth::claims::Claims;
 use crate::config::CONFIG;
 
 pub struct JwtAuth {
@@ -53,6 +81,7 @@ where
     fn call(&self, req: ServiceRequest) -> Self::Future {
         let required_perm = self.required_permission;
         
+        // Extract token from cookie or Authorization header
         let token = req
             .cookie("jwt")
             .map(|c| c.value().to_string())
@@ -77,6 +106,7 @@ where
 
         let token = token.unwrap();
         
+        // Decode and validate JWT
         let validation = Validation::default();
         let token_data = decode::<Claims>(
             &token,
@@ -88,26 +118,31 @@ where
             Ok(data) => {
                 let claims = data.claims;
                 
-                if let Some(_perm) = required_perm {
-                    if !claims.is_admin() {
+                // Check permission if required
+                if let Some(required) = required_perm {
+                    if !claims.has_permission(required) {
                         return Box::pin(async move {
                             Err(actix_web::error::ErrorForbidden(
-                                "Admin access required"
+                                format!("Insufficient permissions. Required permission level: {}", required)
                             ))
                         });
                     }
                 }
                 
+                // Insert claims into request extensions for handlers to access
                 req.extensions_mut().insert(claims);
                 
+                // Call the next service
                 let fut = self.service.call(req);
                 Box::pin(async move {
                     let res = fut.await?;
                     Ok(res)
                 })
             }
-            Err(_) => Box::pin(async move {
-                Err(actix_web::error::ErrorUnauthorized("Invalid token"))
+            Err(err) => Box::pin(async move {
+                Err(actix_web::error::ErrorUnauthorized(
+                    format!("Invalid token: {}", err)
+                ))
             }),
         }
     }
