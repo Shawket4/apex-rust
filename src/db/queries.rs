@@ -1,4 +1,4 @@
-// db.rs - Regenerated with correct logic
+// db.rs - Corrected with proper TAQA monthly car rental calculation
 
 use sqlx::{PgPool, Row};
 use anyhow::Result;
@@ -170,28 +170,46 @@ pub async fn get_taqa_stats(
                 AND t.deleted_at IS NULL
                 AND t.date BETWEEN $1 AND $2
         ),
-        -- Calculate working days per car for car rental
-        car_working_days AS (
+        -- Calculate working days per car per month per terminal
+        car_monthly_working_days AS (
             SELECT 
                 terminal,
                 car_no_plate,
-                COUNT(DISTINCT date)::int as working_days
+                DATE_TRUNC('month', date::date) as month,
+                COUNT(DISTINCT date)::int as working_days_in_month
             FROM trip_data
-            WHERE parent_trip_id IS NULL OR parent_trip_id = 0
+            GROUP BY terminal, car_no_plate, DATE_TRUNC('month', date::date)
+        ),
+        -- Calculate monthly rental per car per month
+        car_monthly_rentals AS (
+            SELECT 
+                terminal,
+                car_no_plate,
+                month,
+                working_days_in_month,
+                CASE 
+                    WHEN working_days_in_month >= 28 THEN 43000.0
+                    ELSE GREATEST(0.0, 43000.0 - ((28 - working_days_in_month) * 1535.71))
+                END::float8 as monthly_rental
+            FROM car_monthly_working_days
+        ),
+        -- Sum rentals per car across all months
+        car_total_rentals AS (
+            SELECT 
+                terminal,
+                car_no_plate,
+                SUM(monthly_rental)::float8 as total_car_rental,
+                SUM(working_days_in_month)::bigint as total_working_days
+            FROM car_monthly_rentals
             GROUP BY terminal, car_no_plate
         ),
-        -- Calculate car rental per terminal
+        -- Aggregate by terminal
         car_rentals AS (
             SELECT 
                 terminal,
-                SUM(
-                    CASE 
-                        WHEN working_days >= 28 THEN 43000.0
-                        ELSE GREATEST(0.0, 43000.0 - ((28 - working_days) * 1433.0))
-                    END
-                )::float8 as total_car_rental,
-                SUM(working_days)::bigint as total_car_days
-            FROM car_working_days
+                SUM(total_car_rental)::float8 as total_car_rental,
+                SUM(total_working_days)::bigint as total_car_days
+            FROM car_total_rentals
             GROUP BY terminal
         ),
         -- Aggregate trip data
@@ -304,7 +322,6 @@ pub async fn get_petromin_stats(
                 terminal,
                 COUNT(DISTINCT car_no_plate || '-' || date)::bigint as total_car_days
             FROM trip_data
-            WHERE parent_trip_id IS NULL OR parent_trip_id = 0
             GROUP BY terminal
         ),
         -- Aggregate trip data
@@ -651,16 +668,40 @@ async fn get_taqa_route_details(
                 AND t.deleted_at IS NULL
                 AND t.date BETWEEN $1 AND $2
         ),
-        -- Calculate working days per car per terminal
-        car_working_days AS (
+        -- Calculate working days per car per month per terminal
+        car_monthly_working_days AS (
             SELECT 
                 terminal,
                 car_no_plate,
-                COUNT(DISTINCT date)::int as working_days
+                DATE_TRUNC('month', date::date) as month,
+                COUNT(DISTINCT date)::int as working_days_in_month
             FROM trip_data
-            WHERE parent_trip_id IS NULL OR parent_trip_id = 0
+            GROUP BY terminal, car_no_plate, DATE_TRUNC('month', date::date)
+        ),
+        -- Calculate monthly rental per car
+        car_monthly_rentals AS (
+            SELECT 
+                terminal,
+                car_no_plate,
+                month,
+                working_days_in_month,
+                CASE 
+                    WHEN working_days_in_month >= 28 THEN 43000.0
+                    ELSE GREATEST(0.0, 43000.0 - ((28 - working_days_in_month) * 1535.71))
+                END::float8 as monthly_rental
+            FROM car_monthly_working_days
+        ),
+        -- Sum rentals per car across all months
+        car_rental_by_car AS (
+            SELECT 
+                terminal,
+                car_no_plate,
+                SUM(monthly_rental)::float8 as total_car_rental,
+                SUM(working_days_in_month)::bigint as total_working_days
+            FROM car_monthly_rentals
             GROUP BY terminal, car_no_plate
         ),
+        -- Aggregate trip stats per car
         car_stats AS (
             SELECT 
                 td.terminal,
@@ -669,18 +710,14 @@ async fn get_taqa_route_details(
                 COALESCE(COUNT(*) FILTER (WHERE td.parent_trip_id IS NULL OR td.parent_trip_id = 0), 0) as total_trips,
                 COALESCE(SUM(td.tank_capacity), 0.0)::float8 as total_volume,
                 COALESCE(SUM(td.distance), 0.0)::float8 as total_distance,
-                COALESCE(cwd.working_days, 0)::bigint as working_days,
-                -- Calculate car rental based on working days
-                CASE 
-                    WHEN COALESCE(cwd.working_days, 0) >= 28 THEN 43000.0
-                    ELSE GREATEST(0.0, 43000.0 - ((28 - COALESCE(cwd.working_days, 0)) * 1433.0))
-                END::float8 as car_rental,
+                COALESCE(cr.total_working_days, 0)::bigint as working_days,
+                COALESCE(cr.total_car_rental, 0.0)::float8 as car_rental,
                 COALESCE(SUM(td.trip_revenue), 0.0)::float8 as base_revenue
             FROM trip_data td
-            LEFT JOIN car_working_days cwd 
-                ON td.terminal = cwd.terminal 
-                AND td.car_no_plate = cwd.car_no_plate
-            GROUP BY td.terminal, td.car_no_plate, cwd.working_days
+            LEFT JOIN car_rental_by_car cr 
+                ON td.terminal = cr.terminal 
+                AND td.car_no_plate = cr.car_no_plate
+            GROUP BY td.terminal, td.car_no_plate, cr.total_working_days, cr.total_car_rental
         )
         SELECT 
             terminal,
@@ -688,7 +725,7 @@ async fn get_taqa_route_details(
             total_trips::bigint,
             total_volume,
             total_distance,
-            0::bigint as working_days_display,  -- Display 0 for UI consistency
+            working_days,
             CASE WHEN $3 THEN base_revenue ELSE NULL END as total_revenue,
             CASE WHEN $3 THEN car_rental ELSE NULL END as car_rental,
             CASE WHEN $3 THEN ((base_revenue + car_rental) * 0.14)::float8 ELSE NULL END as vat,
@@ -715,7 +752,7 @@ async fn get_taqa_route_details(
             total_volume: row.get("total_volume"),
             total_distance: row.get("total_distance"),
             total_revenue: row.try_get("total_revenue").ok().flatten(),
-            working_days: row.get("working_days_display"),
+            working_days: row.get("working_days"),
             car_rental: row.try_get("car_rental").ok().flatten(),
             vat: row.try_get("vat").ok().flatten(),
             total_with_vat: row.try_get("total_with_vat").ok().flatten(),
@@ -797,7 +834,6 @@ async fn get_petromin_route_details(
                 car_no_plate,
                 COUNT(DISTINCT date)::int as working_days
             FROM trip_data
-            WHERE parent_trip_id IS NULL OR parent_trip_id = 0
             GROUP BY terminal, car_no_plate
         ),
         car_stats AS (
@@ -823,7 +859,7 @@ async fn get_petromin_route_details(
             total_trips::bigint,
             total_volume,
             total_distance,
-            0::bigint as working_days_display,  -- Display 0 for UI consistency
+            working_days,
             CASE WHEN $3 THEN base_revenue ELSE NULL END as total_revenue,
             CASE WHEN $3 THEN car_rental ELSE NULL END as car_rental,
             CASE WHEN $3 THEN ((base_revenue + car_rental) * 0.14)::float8 ELSE NULL END as vat,
@@ -850,7 +886,7 @@ async fn get_petromin_route_details(
             total_volume: row.get("total_volume"),
             total_distance: row.get("total_distance"),
             total_revenue: row.try_get("total_revenue").ok().flatten(),
-            working_days: row.get("working_days_display"),
+            working_days: row.get("working_days"),
             car_rental: row.try_get("car_rental").ok().flatten(),
             vat: row.try_get("vat").ok().flatten(),
             total_with_vat: row.try_get("total_with_vat").ok().flatten(),
@@ -1081,37 +1117,63 @@ pub async fn get_stats_by_date(
                     AND t.company = $3
                     AND t.date BETWEEN $1 AND $2
             ),
-            -- Calculate car rental for TAQA
-            taqa_car_working_days AS (
-                SELECT 
-                    date,
+            -- TAQA: Calculate working days per car per month
+            taqa_car_monthly_days_raw AS (
+                SELECT DISTINCT
                     car_no_plate,
-                    COUNT(DISTINCT date)::int as working_days
+                    DATE_TRUNC('month', date::date) as month,
+                    date
                 FROM trip_data
                 WHERE company = 'TAQA'
-                    AND (parent_trip_id IS NULL OR parent_trip_id = 0)
-                GROUP BY date, car_no_plate
             ),
+            taqa_car_monthly_working_days AS (
+                SELECT 
+                    car_no_plate,
+                    month,
+                    date,
+                    COUNT(*) OVER (
+                        PARTITION BY car_no_plate, month
+                    ) as working_days_in_month
+                FROM taqa_car_monthly_days_raw
+            ),
+            -- TAQA: Calculate monthly rental per car per month
+            taqa_car_monthly_rental AS (
+                SELECT DISTINCT
+                    car_no_plate,
+                    month,
+                    working_days_in_month,
+                    CASE 
+                        WHEN working_days_in_month >= 28 THEN 43000.0
+                        ELSE GREATEST(0.0, 43000.0 - ((28 - working_days_in_month) * 1535.71))
+                    END::float8 as monthly_rental
+                FROM taqa_car_monthly_working_days
+            ),
+            -- TAQA: Allocate monthly rental to each working day
+            taqa_daily_rental_allocation AS (
+                SELECT 
+                    cmd.date,
+                    cmd.car_no_plate,
+                    cmr.monthly_rental / cmr.working_days_in_month as daily_rental_share
+                FROM taqa_car_monthly_working_days cmd
+                JOIN taqa_car_monthly_rental cmr 
+                    ON cmd.car_no_plate = cmr.car_no_plate 
+                    AND cmd.month = cmr.month
+            ),
+            -- TAQA: Aggregate car rental by date
             taqa_car_rentals AS (
                 SELECT 
                     date,
-                    SUM(
-                        CASE 
-                            WHEN working_days >= 28 THEN 43000.0
-                            ELSE GREATEST(0.0, 43000.0 - ((28 - working_days) * 1433.0))
-                        END
-                    )::float8 as daily_car_rental
-                FROM taqa_car_working_days
+                    SUM(daily_rental_share)::float8 as daily_car_rental
+                FROM taqa_daily_rental_allocation
                 GROUP BY date
             ),
-            -- Calculate car rental for Petromin
+            -- Petromin: Calculate car-days per date
             petromin_car_days AS (
                 SELECT 
                     date,
                     COUNT(DISTINCT car_no_plate)::bigint as daily_cars
                 FROM trip_data
                 WHERE company = 'Petromin'
-                    AND (parent_trip_id IS NULL OR parent_trip_id = 0)
                 GROUP BY date
             ),
             company_stats AS (
@@ -1237,37 +1299,63 @@ pub async fn get_stats_by_date(
                 WHERE t.deleted_at IS NULL
                     AND t.date BETWEEN $1 AND $2
             ),
-            -- Calculate car rental for TAQA
-            taqa_car_working_days AS (
-                SELECT 
-                    date,
+            -- TAQA: Calculate working days per car per month
+            taqa_car_monthly_days_raw AS (
+                SELECT DISTINCT
                     car_no_plate,
-                    COUNT(DISTINCT date)::int as working_days
+                    DATE_TRUNC('month', date::date) as month,
+                    date
                 FROM trip_data
                 WHERE company = 'TAQA'
-                    AND (parent_trip_id IS NULL OR parent_trip_id = 0)
-                GROUP BY date, car_no_plate
             ),
+            taqa_car_monthly_working_days AS (
+                SELECT 
+                    car_no_plate,
+                    month,
+                    date,
+                    COUNT(*) OVER (
+                        PARTITION BY car_no_plate, month
+                    ) as working_days_in_month
+                FROM taqa_car_monthly_days_raw
+            ),
+            -- TAQA: Calculate monthly rental per car per month
+            taqa_car_monthly_rental AS (
+                SELECT DISTINCT
+                    car_no_plate,
+                    month,
+                    working_days_in_month,
+                    CASE 
+                        WHEN working_days_in_month >= 28 THEN 43000.0
+                        ELSE GREATEST(0.0, 43000.0 - ((28 - working_days_in_month) * 1535.71))
+                    END::float8 as monthly_rental
+                FROM taqa_car_monthly_working_days
+            ),
+            -- TAQA: Allocate monthly rental to each working day
+            taqa_daily_rental_allocation AS (
+                SELECT 
+                    cmd.date,
+                    cmd.car_no_plate,
+                    cmr.monthly_rental / cmr.working_days_in_month as daily_rental_share
+                FROM taqa_car_monthly_working_days cmd
+                JOIN taqa_car_monthly_rental cmr 
+                    ON cmd.car_no_plate = cmr.car_no_plate 
+                    AND cmd.month = cmr.month
+            ),
+            -- TAQA: Aggregate car rental by date
             taqa_car_rentals AS (
                 SELECT 
                     date,
-                    SUM(
-                        CASE 
-                            WHEN working_days >= 28 THEN 43000.0
-                            ELSE GREATEST(0.0, 43000.0 - ((28 - working_days) * 1433.0))
-                        END
-                    )::float8 as daily_car_rental
-                FROM taqa_car_working_days
+                    SUM(daily_rental_share)::float8 as daily_car_rental
+                FROM taqa_daily_rental_allocation
                 GROUP BY date
             ),
-            -- Calculate car rental for Petromin
+            -- Petromin: Calculate car-days per date
             petromin_car_days AS (
                 SELECT 
                     date,
                     COUNT(DISTINCT car_no_plate)::bigint as daily_cars
                 FROM trip_data
                 WHERE company = 'Petromin'
-                    AND (parent_trip_id IS NULL OR parent_trip_id = 0)
                 GROUP BY date
             ),
             company_stats AS (
