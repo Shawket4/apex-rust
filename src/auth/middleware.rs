@@ -79,8 +79,6 @@ where
     forward_ready!(service);
 
     fn call(&self, req: ServiceRequest) -> Self::Future {
-        let required_perm = self.required_permission;
-        
         // Extract token from cookie or Authorization header
         let token = req
             .cookie("jwt")
@@ -118,15 +116,14 @@ where
             Ok(data) => {
                 let claims = data.claims;
                 
-                // Check permission if required
-                if let Some(required) = required_perm {
-                    if !claims.has_permission(required) {
-                        return Box::pin(async move {
-                            Err(actix_web::error::ErrorForbidden(
-                                format!("Insufficient permissions. Required permission level: {}", required)
-                            ))
-                        });
-                    }
+                // Only check if user is an admin (don't check permission level here)
+                // Handler will determine what data to show based on permission level
+                if !claims.is_admin() {
+                    return Box::pin(async move {
+                        Err(actix_web::error::ErrorForbidden(
+                            "Admin access required"
+                        ))
+                    });
                 }
                 
                 // Insert claims into request extensions for handlers to access

@@ -20,9 +20,16 @@ pub async fn get_trip_statistics(
     query: web::Query<QueryParams>,
     req: HttpRequest,
 ) -> Result<HttpResponse, actix_web::Error> {
+    // Get claims from request (guaranteed to exist since middleware validates admin)
     let claims = req.extensions().get::<Claims>().cloned();
+    
+    // Check if user has permission level >= 3 for financial access
+    // Permission 3+ = Full financial data
+    // Permission 1-2 = Limited data (no revenue/VAT/car rental)
     let has_financial_access = claims
-        .map(|c| c.is_admin())
+        .as_ref()
+        .and_then(|c| c.permission)
+        .map(|p| p >= 3)
         .unwrap_or(false);
 
     let use_msgpack = query.format.as_deref() == Some("msgpack");
@@ -114,6 +121,7 @@ pub async fn get_trip_statistics(
             
             (revenue, final_car_rent, final_vat, final_amount)
         } else {
+            // Users without financial access (permission < 3) get 0 for all financial data
             (0.0, None, None, None)
         };
 
