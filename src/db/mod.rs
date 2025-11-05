@@ -1,3 +1,7 @@
-pub mod queries;
+pub mod stats_queries;
 
-pub use queries::*;
+pub use stats_queries::*;
+
+pub mod expense_queries;
+
+pub use expense_queries::*;

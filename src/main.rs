@@ -101,6 +101,43 @@ async fn main() -> std::io::Result<()> {
                                 .to(get_trip_statistics)
                                 .wrap(JwtAuth { required_permission: Some(3) })
                         )
+                        // Fleet Expenses Routes
+                        .route(
+                            "/fleet-expenses",
+                            web::post()
+                                .to(create_expense_handler)
+                                .wrap(JwtAuth { required_permission: Some(3) })
+                        )
+                        .route(
+                            "/fleet-expenses",
+                            web::get()
+                                .to(list_expenses_handler)
+                                .wrap(JwtAuth { required_permission: Some(3) })
+                        )
+                        .route(
+                            "/fleet-expenses/statistics",
+                            web::get()
+                                .to(get_expense_statistics_handler)
+                                .wrap(JwtAuth { required_permission: Some(3) })
+                        )
+                        .route(
+                            "/fleet-expenses/{id}",
+                            web::get()
+                                .to(get_expense_handler)
+                                .wrap(JwtAuth { required_permission: Some(3) })
+                        )
+                        .route(
+                            "/fleet-expenses/{id}",
+                            web::put()
+                                .to(update_expense_handler)
+                                .wrap(JwtAuth { required_permission: Some(3) })
+                        )
+                        .route(
+                            "/fleet-expenses/{id}",
+                            web::delete()
+                                .to(delete_expense_handler)
+                                .wrap(JwtAuth { required_permission: Some(3) })
+                        )
                 )
         })
         .workers(CONFIG.workers)
@@ -144,6 +181,43 @@ async fn main() -> std::io::Result<()> {
                             "/trip-statistics",
                             web::get()
                                 .to(get_trip_statistics)
+                                .wrap(JwtAuth { required_permission: Some(3) })
+                        )
+                        // Fleet Expenses Routes
+                        .route(
+                            "/fleet-expenses",
+                            web::post()
+                                .to(create_expense_handler)
+                                .wrap(JwtAuth { required_permission: Some(3) })
+                        )
+                        .route(
+                            "/fleet-expenses",
+                            web::get()
+                                .to(list_expenses_handler)
+                                .wrap(JwtAuth { required_permission: Some(3) })
+                        )
+                        .route(
+                            "/fleet-expenses/statistics",
+                            web::get()
+                                .to(get_expense_statistics_handler)
+                                .wrap(JwtAuth { required_permission: Some(3) })
+                        )
+                        .route(
+                            "/fleet-expenses/{id}",
+                            web::get()
+                                .to(get_expense_handler)
+                                .wrap(JwtAuth { required_permission: Some(3) })
+                        )
+                        .route(
+                            "/fleet-expenses/{id}",
+                            web::put()
+                                .to(update_expense_handler)
+                                .wrap(JwtAuth { required_permission: Some(3) })
+                        )
+                        .route(
+                            "/fleet-expenses/{id}",
+                            web::delete()
+                                .to(delete_expense_handler)
                                 .wrap(JwtAuth { required_permission: Some(3) })
                         )
                 )
