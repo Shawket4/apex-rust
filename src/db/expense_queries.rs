@@ -28,7 +28,7 @@ pub async fn create_expense(
         )
         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
         RETURNING 
-            id, car_no_plate, expense_date, expense_type, amount, description,
+            id, car_no_plate, expense_date, expense_type, amount::float8 as amount, description,
             company, paid_by, payment_method, created_by, created_at, updated_at
     "#;
 
@@ -67,7 +67,7 @@ pub async fn get_expense_by_id(
 ) -> Result<Option<FleetExpense>> {
     let query = r#"
         SELECT 
-            id, car_no_plate, expense_date, expense_type, amount, description,
+            id, car_no_plate, expense_date, expense_type, amount::float8 as amount, description,
             company, paid_by, payment_method, created_by, created_at, updated_at
         FROM fleet_expenses
         WHERE id = $1 AND deleted_at IS NULL
@@ -102,7 +102,6 @@ pub async fn list_expenses(
     let page_size = filters.page_size.unwrap_or(50).clamp(1, 100);
     let offset = (page - 1) * page_size;
 
-    // FIXED: Create search_pattern at function scope to extend lifetime
     let search_pattern = filters.search.as_ref().map(|s| format!("%{}%", s));
 
     // Build WHERE clause dynamically
@@ -159,7 +158,7 @@ pub async fn list_expenses(
     let data_query = format!(
         r#"
         SELECT 
-            id, car_no_plate, expense_date, expense_type, amount, description,
+            id, car_no_plate, expense_date, expense_type, amount::float8 as amount, description,
             company, paid_by, payment_method, created_by, created_at, updated_at
         FROM fleet_expenses
         WHERE {}
@@ -190,7 +189,6 @@ pub async fn list_expenses(
     if let Some(ref payment_method) = filters.payment_method {
         count_query_builder = count_query_builder.bind(payment_method);
     }
-    // FIXED: Now search_pattern lives long enough
     if let Some(ref pattern) = search_pattern {
         count_query_builder = count_query_builder.bind(pattern);
     }
@@ -221,7 +219,6 @@ pub async fn list_expenses(
     if let Some(ref payment_method) = filters.payment_method {
         data_query_builder = data_query_builder.bind(payment_method);
     }
-    // FIXED: Now search_pattern lives long enough
     if let Some(ref pattern) = search_pattern {
         data_query_builder = data_query_builder.bind(pattern);
     }
@@ -318,7 +315,7 @@ pub async fn update_expense(
         SET {}
         WHERE id = ${} AND deleted_at IS NULL
         RETURNING 
-            id, car_no_plate, expense_date, expense_type, amount, description,
+            id, car_no_plate, expense_date, expense_type, amount::float8 as amount, description,
             company, paid_by, payment_method, created_by, created_at, updated_at
         "#,
         set_clauses.join(", "),

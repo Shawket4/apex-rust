@@ -33,7 +33,7 @@ pub struct CreateFleetExpense {
     pub description: Option<String>,
     pub company: Option<String>,
     pub paid_by: String,
-    pub payment_method: String,  // "Cash" or "IPN Transfer"
+    pub payment_method: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -48,10 +48,14 @@ pub struct UpdateFleetExpense {
     pub payment_method: Option<String>,
 }
 
+// ============================================================================
+// Filter Models
+// ============================================================================
+
 #[derive(Debug, Deserialize)]
 pub struct FleetExpenseFilters {
-    pub start_date: Option<String>,
-    pub end_date: Option<String>,
+    pub start_date: Option<NaiveDate>,
+    pub end_date: Option<NaiveDate>,
     pub car_no_plate: Option<String>,
     pub company: Option<String>,
     pub expense_type: Option<String>,
@@ -59,7 +63,7 @@ pub struct FleetExpenseFilters {
     pub search: Option<String>,
     pub page: Option<i64>,
     pub page_size: Option<i64>,
-    pub format: Option<String>,  // "json" or "msgpack"
+    pub format: Option<String>,
 }
 
 // ============================================================================
@@ -147,4 +151,22 @@ pub struct ExpenseByDate {
 pub struct ExpenseStatisticsResponse {
     pub message: String,
     pub data: ExpenseStatistics,
+}
+
+// ============================================================================
+// Batch Create Models
+// ============================================================================
+
+#[derive(Debug, Serialize)]
+pub struct BatchCreateResult {
+    pub success_count: usize,
+    pub failed_count: usize,
+    pub created_expenses: Vec<FleetExpense>,
+    pub errors: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct FleetExpenseBatchResponse {
+    pub message: String,
+    pub data: BatchCreateResult,
 }

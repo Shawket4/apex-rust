@@ -50,7 +50,7 @@ fn extract_user_id(req: &HttpRequest) -> Result<i32, actix_web::Error> {
 
 pub async fn create_expense_handler(
     pool: web::Data<PgPool>,
-    expense_data: web::Json<CreateFleetExpense>,
+    body: web::Bytes,
     query: web::Query<FormatQuery>,
     req: HttpRequest,
 ) -> Result<HttpResponse, actix_web::Error> {
@@ -65,7 +65,38 @@ pub async fn create_expense_handler(
     
     let user_id = extract_user_id(&req)?;
 
-    // Create expense
+    // Try to parse as array first
+    if let Ok(expenses_array) = serde_json::from_slice::<Vec<CreateFleetExpense>>(&body) {
+        // Handle array of expenses
+        let mut created_expenses = Vec::new();
+        let mut errors = Vec::new();
+
+        for (index, expense_data) in expenses_array.iter().enumerate() {
+            match create_expense(pool.get_ref(), expense_data, user_id).await {
+                Ok(expense) => created_expenses.push(expense),
+                Err(e) => errors.push(format!("Row {}: {}", index + 1, e.to_string())),
+            }
+        }
+
+        let response_data = FleetExpenseBatchResponse {
+            message: format!("{} expenses created, {} failed", created_expenses.len(), errors.len()),
+            data: BatchCreateResult {
+                success_count: created_expenses.len(),
+                failed_count: errors.len(),
+                created_expenses,
+                errors,
+            },
+        };
+
+        let use_msgpack = query.format.as_deref() == Some("msgpack");
+        return response(&response_data, use_msgpack)
+            .map_err(actix_web::error::ErrorInternalServerError);
+    }
+
+    // Otherwise parse as single expense
+    let expense_data: CreateFleetExpense = serde_json::from_slice(&body)
+        .map_err(|e| actix_web::error::ErrorBadRequest(format!("Invalid request body: {}", e)))?;
+
     let expense = create_expense(pool.get_ref(), &expense_data, user_id)
         .await
         .map_err(|e| actix_web::error::ErrorBadRequest(format!("Failed to create expense: {}", e)))?;
