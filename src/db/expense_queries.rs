@@ -71,21 +71,18 @@ pub async fn list_unified_expenses(
         union_parts.push(format!(r#"
             SELECT 
                 id,
-                'fuel_event' as source,
+                'fuel_event'::text as source,
                 car_no_plate,
-                CASE 
-                    WHEN date ~ '^\d{{4}}-\d{{2}}-\d{{2}}' THEN date::date
-                    ELSE CURRENT_DATE
-                END as expense_date,
-                'Fuel' as expense_type,
+                date::date as expense_date,
+                'Fuel'::text as expense_type,
                 COALESCE(price, 0)::float8 as amount,
-                CONCAT('Fuel: ', COALESCE(liters::text, '0'), 'L @ ', COALESCE(price_per_liter::text, '0'), '/L') as description,
+                CONCAT('Fuel: ', COALESCE(liters::text, '0'), 'L @ ', COALESCE(price_per_liter::text, '0'), '/L')::text as description,
                 transporter as company,
                 driver_name as paid_by,
-                COALESCE(method, 'Cash') as payment_method,
+                COALESCE(method, 'Cash')::text as payment_method,
                 NULL::integer as created_by,
-                COALESCE(created_at, CURRENT_TIMESTAMP) as created_at,
-                COALESCE(updated_at, CURRENT_TIMESTAMP) as updated_at,
+                created_at,
+                updated_at,
                 liters::float8 as liters,
                 price_per_liter::float8 as price_per_liter,
                 driver_name,
@@ -95,7 +92,7 @@ pub async fn list_unified_expenses(
                 NULL::bigint as driver_id,
                 NULL::bigint as employee_id
             FROM fuel_events
-            WHERE deleted_at IS NULL
+            WHERE deleted_at IS NULL AND created_at IS NOT NULL
             {}
             {}
         "#,
@@ -109,21 +106,18 @@ pub async fn list_unified_expenses(
         union_parts.push(format!(r#"
             SELECT 
                 id,
-                'loan' as source,
-                NULL as car_no_plate,
-                CASE 
-                    WHEN date ~ '^\d{{4}}-\d{{2}}-\d{{2}}' THEN date::date
-                    ELSE CURRENT_DATE
-                END as expense_date,
-                'Loan' as expense_type,
+                'loan'::text as source,
+                NULL::text as car_no_plate,
+                date::date as expense_date,
+                'Loan'::text as expense_type,
                 COALESCE(amount, 0)::float8 as amount,
                 description,
-                NULL as company,
-                NULL as paid_by,
-                COALESCE(method, 'Cash') as payment_method,
+                NULL::text as company,
+                NULL::text as paid_by,
+                COALESCE(method, 'Cash')::text as payment_method,
                 NULL::integer as created_by,
-                COALESCE(created_at, CURRENT_TIMESTAMP) as created_at,
-                COALESCE(updated_at, CURRENT_TIMESTAMP) as updated_at,
+                created_at,
+                updated_at,
                 NULL::float8 as liters,
                 NULL::float8 as price_per_liter,
                 NULL::text as driver_name,
@@ -133,7 +127,7 @@ pub async fn list_unified_expenses(
                 driver_id,
                 employee_id
             FROM loans
-            WHERE deleted_at IS NULL
+            WHERE deleted_at IS NULL AND created_at IS NOT NULL
             {}
         "#,
             build_loan_date_filter(&filters.start_date, &filters.end_date)
