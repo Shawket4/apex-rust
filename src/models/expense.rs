@@ -123,10 +123,20 @@ pub struct FleetExpenseFilters {
     pub page: Option<i64>,
     pub page_size: Option<i64>,
     pub format: Option<String>,
-    // New filter to control which sources to include
-    pub source: Option<String>, // "all", "fleet_expense", "fuel_event", "loan"
-    pub include_fuel: Option<bool>,
-    pub include_loans: Option<bool>,
+    pub source: Option<String>,
+    // Use String to handle "true"/"false" from query params
+    pub include_fuel: Option<String>,
+    pub include_loans: Option<String>,
+}
+
+impl FleetExpenseFilters {
+    pub fn should_include_fuel(&self) -> bool {
+        self.include_fuel.as_ref().map(|s| s != "false").unwrap_or(true)
+    }
+    
+    pub fn should_include_loans(&self) -> bool {
+        self.include_loans.as_ref().map(|s| s != "false").unwrap_or(true)
+    }
 }
 
 // ============================================================================

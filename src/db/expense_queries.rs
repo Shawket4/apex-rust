@@ -15,8 +15,8 @@ pub async fn list_unified_expenses(
     let page_size = filters.page_size.unwrap_or(50).clamp(1, 100);
     let offset = (page - 1) * page_size;
 
-    let include_fuel = filters.include_fuel.unwrap_or(true);
-    let include_loans = filters.include_loans.unwrap_or(true);
+    let include_fuel = filters.should_include_fuel();
+    let include_loans = filters.should_include_loans();
     
     let search_pattern = filters.search.as_ref().map(|s| format!("%{}%", s));
 
