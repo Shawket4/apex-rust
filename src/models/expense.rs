@@ -39,7 +39,7 @@ pub struct UnifiedExpense {
     pub created_at: NaiveDateTime,
     pub updated_at: NaiveDateTime,
     
-    // Fuel-specific fields (optional, only populated for fuel events)
+    // Fuel-specific fields
     #[serde(skip_serializing_if = "Option::is_none")]
     pub liters: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -51,7 +51,7 @@ pub struct UnifiedExpense {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub odometer_after: Option<i64>,
     
-    // Loan-specific fields (optional, only populated for loans)
+    // Loan-specific fields
     #[serde(skip_serializing_if = "Option::is_none")]
     pub is_paid: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -124,7 +124,6 @@ pub struct FleetExpenseFilters {
     pub page_size: Option<i64>,
     pub format: Option<String>,
     pub source: Option<String>,
-    // Use String to handle "true"/"false" from query params
     pub include_fuel: Option<String>,
     pub include_loans: Option<String>,
 }
@@ -187,7 +186,7 @@ pub struct PaginationInfo {
 }
 
 // ============================================================================
-// Statistics Models (Updated to include source breakdown)
+// Statistics Models (Updated with source breakdown by date)
 // ============================================================================
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -230,11 +229,19 @@ pub struct ExpenseByPaymentMethod {
     pub count: i64,
 }
 
+// UPDATED: Added source breakdown fields for daily chart
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ExpenseByDate {
     pub date: String,
     pub total_amount: f64,
     pub count: i64,
+    // Source breakdown for stacked bar charts
+    #[serde(default)]
+    pub fleet_expense: f64,
+    #[serde(default)]
+    pub fuel_event: f64,
+    #[serde(default)]
+    pub loan: f64,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

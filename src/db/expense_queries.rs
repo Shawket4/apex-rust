@@ -4,7 +4,99 @@ use chrono::NaiveDate;
 use crate::models::expense::*;
 
 // ============================================================================
-// Unified Expense Query - Combines all sources
+// Helper Functions
+// ============================================================================
+
+fn escape_sql_string(s: &str) -> String {
+    s.replace('\'', "''").replace('\\', "\\\\")
+}
+
+fn build_date_filter(start: &Option<NaiveDate>, end: &Option<NaiveDate>) -> String {
+    let mut parts = Vec::new();
+    if let Some(s) = start {
+        parts.push(format!("AND expense_date >= '{}'", s));
+    }
+    if let Some(e) = end {
+        parts.push(format!("AND expense_date <= '{}'", e));
+    }
+    parts.join(" ")
+}
+
+fn build_fuel_date_filter(start: &Option<NaiveDate>, end: &Option<NaiveDate>) -> String {
+    let mut parts = Vec::new();
+    if let Some(s) = start {
+        parts.push(format!("AND date >= '{}'", s));
+    }
+    if let Some(e) = end {
+        parts.push(format!("AND date <= '{}'", e));
+    }
+    parts.join(" ")
+}
+
+fn build_loan_date_filter(start: &Option<NaiveDate>, end: &Option<NaiveDate>) -> String {
+    let mut parts = Vec::new();
+    if let Some(s) = start {
+        parts.push(format!("AND date >= '{}'", s));
+    }
+    if let Some(e) = end {
+        parts.push(format!("AND date <= '{}'", e));
+    }
+    parts.join(" ")
+}
+
+fn build_search_filter_fleet(search: &Option<String>) -> String {
+    match search {
+        Some(s) if !s.trim().is_empty() => {
+            let escaped = escape_sql_string(s);
+            format!(r#"
+                AND (
+                    description ILIKE '%{}%'
+                    OR paid_by ILIKE '%{}%'
+                    OR car_no_plate ILIKE '%{}%'
+                    OR company ILIKE '%{}%'
+                    OR expense_type ILIKE '%{}%'
+                    OR payment_method ILIKE '%{}%'
+                )
+            "#, escaped, escaped, escaped, escaped, escaped, escaped)
+        }
+        _ => String::new()
+    }
+}
+
+fn build_search_filter_fuel(search: &Option<String>) -> String {
+    match search {
+        Some(s) if !s.trim().is_empty() => {
+            let escaped = escape_sql_string(s);
+            format!(r#"
+                AND (
+                    driver_name ILIKE '%{}%'
+                    OR car_no_plate ILIKE '%{}%'
+                    OR transporter ILIKE '%{}%'
+                    OR method ILIKE '%{}%'
+                )
+            "#, escaped, escaped, escaped, escaped)
+        }
+        _ => String::new()
+    }
+}
+
+fn build_search_filter_loan(search: &Option<String>) -> String {
+    match search {
+        Some(s) if !s.trim().is_empty() => {
+            let escaped = escape_sql_string(s);
+            format!(r#"
+                AND (
+                    description ILIKE '%{}%'
+                    OR method ILIKE '%{}%'
+                )
+            "#, escaped, escaped)
+        }
+        _ => String::new()
+    }
+}
+
+// ============================================================================
+// Unified Expense Query - Combines all sources with SEARCH
 // ============================================================================
 
 pub async fn list_unified_expenses(
@@ -18,56 +110,92 @@ pub async fn list_unified_expenses(
     let include_fuel = filters.should_include_fuel();
     let include_loans = filters.should_include_loans();
     
-    let search_pattern = filters.search.as_ref().map(|s| format!("%{}%", s));
-
-    // Build date filter strings
-    let date_filter = build_date_filter(&filters.start_date, &filters.end_date);
+    // Build all filters
+    let date_filter_fleet = build_date_filter(&filters.start_date, &filters.end_date);
+    let date_filter_fuel = build_fuel_date_filter(&filters.start_date, &filters.end_date);
+    let date_filter_loan = build_loan_date_filter(&filters.start_date, &filters.end_date);
+    
+    let search_filter_fleet = build_search_filter_fleet(&filters.search);
+    let search_filter_fuel = build_search_filter_fuel(&filters.search);
+    let search_filter_loan = build_search_filter_loan(&filters.search);
+    
+    let car_filter = filters.car_no_plate.as_ref()
+        .map(|c| format!("AND car_no_plate ILIKE '%{}%'", escape_sql_string(c)))
+        .unwrap_or_default();
+    
+    let company_filter = filters.company.as_ref()
+        .map(|c| {
+            if c == "General" {
+                "AND (company IS NULL OR company = '' OR company = 'General')".to_string()
+            } else {
+                format!("AND company ILIKE '%{}%'", escape_sql_string(c))
+            }
+        })
+        .unwrap_or_default();
+    
+    let expense_type_filter = filters.expense_type.as_ref()
+        .filter(|t| !t.is_empty() && *t != "Fuel" && *t != "Loan")
+        .map(|t| format!("AND expense_type = '{}'", escape_sql_string(t)))
+        .unwrap_or_default();
+    
+    let payment_method_filter = filters.payment_method.as_ref()
+        .map(|p| format!("AND payment_method ILIKE '%{}%'", escape_sql_string(p)))
+        .unwrap_or_default();
     
     // Build the UNION ALL query
     let mut union_parts = Vec::new();
     
+    // Determine what to include based on expense_type filter
+    let expense_type = filters.expense_type.as_deref().unwrap_or("");
+    let include_fleet = expense_type.is_empty() || (expense_type != "Fuel" && expense_type != "Loan");
+    let include_fuel_query = include_fuel && (expense_type.is_empty() || expense_type == "Fuel");
+    let include_loans_query = include_loans && (expense_type.is_empty() || expense_type == "Loan");
+    
     // Fleet expenses part
-    union_parts.push(format!(r#"
-        SELECT 
-            id,
-            'fleet_expense' as source,
-            car_no_plate,
-            expense_date,
-            expense_type,
-            amount::float8 as amount,
-            description,
-            company,
-            paid_by,
-            payment_method,
-            created_by,
-            created_at,
-            updated_at,
-            NULL::float8 as liters,
-            NULL::float8 as price_per_liter,
-            NULL::text as driver_name,
-            NULL::bigint as odometer_before,
-            NULL::bigint as odometer_after,
-            NULL::boolean as is_paid,
-            NULL::bigint as driver_id,
-            NULL::bigint as employee_id
-        FROM fleet_expenses
-        WHERE deleted_at IS NULL
-        {}
-        {}
-        {}
-        {}
-    "#,
-        date_filter.replace("expense_date", "expense_date"),
-        filters.car_no_plate.as_ref().map(|_| "AND car_no_plate = $1").unwrap_or(""),
-        filters.company.as_ref().map(|_| "AND company = $2").unwrap_or(""),
-        filters.expense_type.as_ref().map(|t| {
-            if t == "Fuel" || t == "Loan" { "AND 1=0".to_string() } // Exclude if filtering for fuel/loan
-            else { format!("AND expense_type = '{}'", t.replace("'", "''")) }
-        }).unwrap_or_default()
-    ));
+    if include_fleet {
+        union_parts.push(format!(r#"
+            SELECT 
+                id,
+                'fleet_expense' as source,
+                car_no_plate,
+                expense_date,
+                expense_type,
+                amount::float8 as amount,
+                description,
+                company,
+                paid_by,
+                payment_method,
+                created_by,
+                created_at,
+                updated_at,
+                NULL::float8 as liters,
+                NULL::float8 as price_per_liter,
+                NULL::text as driver_name,
+                NULL::bigint as odometer_before,
+                NULL::bigint as odometer_after,
+                NULL::boolean as is_paid,
+                NULL::bigint as driver_id,
+                NULL::bigint as employee_id
+            FROM fleet_expenses
+            WHERE deleted_at IS NULL
+            {}
+            {}
+            {}
+            {}
+            {}
+            {}
+        "#,
+            date_filter_fleet,
+            car_filter,
+            company_filter,
+            expense_type_filter,
+            payment_method_filter,
+            search_filter_fleet
+        ));
+    }
 
-    // Fuel events part (if included and not filtered out)
-    if include_fuel && filters.expense_type.as_ref().map(|t| t == "Fuel" || t.is_empty()).unwrap_or(true) {
+    // Fuel events part
+    if include_fuel_query {
         union_parts.push(format!(r#"
             SELECT 
                 id,
@@ -95,14 +223,16 @@ pub async fn list_unified_expenses(
             WHERE deleted_at IS NULL AND created_at IS NOT NULL
             {}
             {}
+            {}
         "#,
-            build_fuel_date_filter(&filters.start_date, &filters.end_date),
-            filters.car_no_plate.as_ref().map(|_| "AND car_no_plate = $1").unwrap_or("")
+            date_filter_fuel,
+            car_filter,
+            search_filter_fuel
         ));
     }
 
-    // Loans part (if included and not filtered out)
-    if include_loans && filters.expense_type.as_ref().map(|t| t == "Loan" || t.is_empty()).unwrap_or(true) {
+    // Loans part
+    if include_loans_query {
         union_parts.push(format!(r#"
             SELECT 
                 id,
@@ -129,14 +259,25 @@ pub async fn list_unified_expenses(
             FROM loans
             WHERE deleted_at IS NULL AND created_at IS NOT NULL
             {}
+            {}
         "#,
-            build_loan_date_filter(&filters.start_date, &filters.end_date)
+            date_filter_loan,
+            search_filter_loan
         ));
+    }
+
+    // Handle empty union
+    if union_parts.is_empty() {
+        return Ok((Vec::new(), 0, SourceCounts {
+            fleet_expenses: 0,
+            fuel_events: 0,
+            loans: 0,
+            total: 0,
+        }));
     }
 
     let union_query = union_parts.join(" UNION ALL ");
     
-    // Wrap in CTE for counting and pagination
     let full_query = format!(r#"
         WITH unified AS ({})
         SELECT * FROM unified
@@ -149,13 +290,11 @@ pub async fn list_unified_expenses(
         SELECT COUNT(*) as total FROM unified
     "#, union_query);
 
-    // Execute count query
     let total: i64 = sqlx::query(&count_query)
         .fetch_one(pool)
         .await?
         .get("total");
 
-    // Execute data query
     let rows = sqlx::query(&full_query)
         .fetch_all(pool)
         .await?;
@@ -196,7 +335,6 @@ pub async fn list_unified_expenses(
         })
         .collect();
 
-    // Get source counts
     let source_counts = get_source_counts(pool, filters).await?;
 
     Ok((expenses, total, source_counts))
@@ -206,30 +344,46 @@ async fn get_source_counts(pool: &PgPool, filters: &FleetExpenseFilters) -> Resu
     let date_filter_fleet = build_date_filter(&filters.start_date, &filters.end_date);
     let date_filter_fuel = build_fuel_date_filter(&filters.start_date, &filters.end_date);
     let date_filter_loan = build_loan_date_filter(&filters.start_date, &filters.end_date);
+    
+    let search_filter_fleet = build_search_filter_fleet(&filters.search);
+    let search_filter_fuel = build_search_filter_fuel(&filters.search);
+    let search_filter_loan = build_search_filter_loan(&filters.search);
+    
+    let car_filter = filters.car_no_plate.as_ref()
+        .map(|c| format!("AND car_no_plate ILIKE '%{}%'", escape_sql_string(c)))
+        .unwrap_or_default();
 
     let fleet_count: i64 = sqlx::query(&format!(
-        "SELECT COUNT(*) as cnt FROM fleet_expenses WHERE deleted_at IS NULL {}",
-        date_filter_fleet
+        "SELECT COUNT(*) as cnt FROM fleet_expenses WHERE deleted_at IS NULL {} {} {}",
+        date_filter_fleet, car_filter, search_filter_fleet
     ))
         .fetch_one(pool)
         .await?
         .get("cnt");
 
-    let fuel_count: i64 = sqlx::query(&format!(
-        "SELECT COUNT(*) as cnt FROM fuel_events WHERE deleted_at IS NULL {}",
-        date_filter_fuel
-    ))
-        .fetch_one(pool)
-        .await?
-        .get("cnt");
+    let fuel_count: i64 = if filters.should_include_fuel() {
+        sqlx::query(&format!(
+            "SELECT COUNT(*) as cnt FROM fuel_events WHERE deleted_at IS NULL {} {} {}",
+            date_filter_fuel, car_filter, search_filter_fuel
+        ))
+            .fetch_one(pool)
+            .await?
+            .get("cnt")
+    } else {
+        0
+    };
 
-    let loan_count: i64 = sqlx::query(&format!(
-        "SELECT COUNT(*) as cnt FROM loans WHERE deleted_at IS NULL {}",
-        date_filter_loan
-    ))
-        .fetch_one(pool)
-        .await?
-        .get("cnt");
+    let loan_count: i64 = if filters.should_include_loans() {
+        sqlx::query(&format!(
+            "SELECT COUNT(*) as cnt FROM loans WHERE deleted_at IS NULL {} {}",
+            date_filter_loan, search_filter_loan
+        ))
+            .fetch_one(pool)
+            .await?
+            .get("cnt")
+    } else {
+        0
+    };
 
     Ok(SourceCounts {
         fleet_expenses: fleet_count,
@@ -239,41 +393,8 @@ async fn get_source_counts(pool: &PgPool, filters: &FleetExpenseFilters) -> Resu
     })
 }
 
-fn build_date_filter(start: &Option<NaiveDate>, end: &Option<NaiveDate>) -> String {
-    let mut parts = Vec::new();
-    if let Some(s) = start {
-        parts.push(format!("AND expense_date >= '{}'", s));
-    }
-    if let Some(e) = end {
-        parts.push(format!("AND expense_date <= '{}'", e));
-    }
-    parts.join(" ")
-}
-
-fn build_fuel_date_filter(start: &Option<NaiveDate>, end: &Option<NaiveDate>) -> String {
-    let mut parts = Vec::new();
-    if let Some(s) = start {
-        parts.push(format!("AND date >= '{}'", s));
-    }
-    if let Some(e) = end {
-        parts.push(format!("AND date <= '{}'", e));
-    }
-    parts.join(" ")
-}
-
-fn build_loan_date_filter(start: &Option<NaiveDate>, end: &Option<NaiveDate>) -> String {
-    let mut parts = Vec::new();
-    if let Some(s) = start {
-        parts.push(format!("AND date >= '{}'", s));
-    }
-    if let Some(e) = end {
-        parts.push(format!("AND date <= '{}'", e));
-    }
-    parts.join(" ")
-}
-
 // ============================================================================
-// Unified Statistics
+// Unified Statistics with Source Breakdown by Date
 // ============================================================================
 
 pub async fn get_unified_expense_statistics(
@@ -284,24 +405,35 @@ pub async fn get_unified_expense_statistics(
     let date_filter_fuel = build_fuel_date_filter(&filters.start_date, &filters.end_date);
     let date_filter_loan = build_loan_date_filter(&filters.start_date, &filters.end_date);
 
-    // Build unified CTE for statistics
-    let unified_cte = format!(r#"
-        WITH unified AS (
-            SELECT amount::float8 as amount, expense_type, company, car_no_plate, 
-                   payment_method, expense_date::text as date_str, 'fleet_expense' as source
-            FROM fleet_expenses WHERE deleted_at IS NULL {}
-            UNION ALL
+    let include_fuel = filters.should_include_fuel();
+    let include_loans = filters.should_include_loans();
+
+    // Build unified CTE
+    let mut cte_parts = vec![format!(r#"
+        SELECT amount::float8 as amount, expense_type, company, car_no_plate, 
+               payment_method, expense_date::text as date_str, 'fleet_expense' as source
+        FROM fleet_expenses WHERE deleted_at IS NULL {}
+    "#, date_filter_fleet)];
+
+    if include_fuel {
+        cte_parts.push(format!(r#"
             SELECT COALESCE(price, 0)::float8 as amount, 'Fuel' as expense_type, 
                    transporter as company, car_no_plate, COALESCE(method, 'Cash') as payment_method,
-                   date as date_str, 'fuel_event' as source
+                   date::text as date_str, 'fuel_event' as source
             FROM fuel_events WHERE deleted_at IS NULL {}
-            UNION ALL
+        "#, date_filter_fuel));
+    }
+
+    if include_loans {
+        cte_parts.push(format!(r#"
             SELECT COALESCE(amount, 0)::float8 as amount, 'Loan' as expense_type,
                    NULL as company, NULL as car_no_plate, COALESCE(method, 'Cash') as payment_method,
-                   date as date_str, 'loan' as source
+                   date::text as date_str, 'loan' as source
             FROM loans WHERE deleted_at IS NULL {}
-        )
-    "#, date_filter_fleet, date_filter_fuel, date_filter_loan);
+        "#, date_filter_loan));
+    }
+
+    let unified_cte = format!("WITH unified AS ({})", cte_parts.join(" UNION ALL "));
 
     // Total amount and count
     let totals_query = format!("{} SELECT COALESCE(SUM(amount), 0)::float8 as total, COUNT(*)::bigint as count FROM unified", unified_cte);
@@ -361,8 +493,22 @@ pub async fn get_unified_expense_statistics(
         })
         .collect();
 
-    // By date
-    let by_date_query = format!("{} SELECT date_str as date, COALESCE(SUM(amount), 0)::float8 as total, COUNT(*)::bigint as count FROM unified WHERE date_str IS NOT NULL GROUP BY date_str ORDER BY date_str DESC", unified_cte);
+    // By date WITH SOURCE BREAKDOWN (for stacked chart)
+    let by_date_query = format!(r#"
+        {} 
+        SELECT 
+            date_str as date, 
+            COALESCE(SUM(amount), 0)::float8 as total, 
+            COUNT(*)::bigint as count,
+            COALESCE(SUM(CASE WHEN source = 'fleet_expense' THEN amount ELSE 0 END), 0)::float8 as fleet_expense,
+            COALESCE(SUM(CASE WHEN source = 'fuel_event' THEN amount ELSE 0 END), 0)::float8 as fuel_event,
+            COALESCE(SUM(CASE WHEN source = 'loan' THEN amount ELSE 0 END), 0)::float8 as loan
+        FROM unified 
+        WHERE date_str IS NOT NULL 
+        GROUP BY date_str 
+        ORDER BY date_str DESC
+    "#, unified_cte);
+    
     let by_date: Vec<ExpenseByDate> = sqlx::query(&by_date_query)
         .fetch_all(pool)
         .await?
@@ -371,6 +517,9 @@ pub async fn get_unified_expense_statistics(
             date: r.get("date"),
             total_amount: r.get("total"),
             count: r.get("count"),
+            fleet_expense: r.get("fleet_expense"),
+            fuel_event: r.get("fuel_event"),
+            loan: r.get("loan"),
         })
         .collect();
 
@@ -400,7 +549,7 @@ pub async fn get_unified_expense_statistics(
 }
 
 // ============================================================================
-// Original CRUD Operations (kept for fleet_expenses table only)
+// CRUD Operations (Fleet Expenses only)
 // ============================================================================
 
 pub async fn create_expense(
@@ -505,7 +654,9 @@ pub async fn update_expense(pool: &PgPool, id: i32, expense: &UpdateFleetExpense
     if expense.paid_by.is_some() { set_clauses.push(format!("paid_by = ${}", bind_count)); bind_count += 1; }
     if expense.payment_method.is_some() { set_clauses.push(format!("payment_method = ${}", bind_count)); bind_count += 1; }
 
-    if set_clauses.is_empty() {
+    set_clauses.push("updated_at = CURRENT_TIMESTAMP".to_string());
+
+    if set_clauses.len() == 1 {
         return get_expense_by_id(pool, id).await;
     }
 
@@ -529,15 +680,25 @@ pub async fn update_expense(pool: &PgPool, id: i32, expense: &UpdateFleetExpense
 
     let row = qb.fetch_optional(pool).await?;
     Ok(row.map(|r| FleetExpense {
-        id: r.get("id"), car_no_plate: r.get("car_no_plate"), expense_date: r.get("expense_date"),
-        expense_type: r.get("expense_type"), amount: r.get("amount"), description: r.get("description"),
-        company: r.get("company"), paid_by: r.get("paid_by"), payment_method: r.get("payment_method"),
-        created_by: r.get("created_by"), created_at: r.get("created_at"), updated_at: r.get("updated_at"),
+        id: r.get("id"),
+        car_no_plate: r.get("car_no_plate"),
+        expense_date: r.get("expense_date"),
+        expense_type: r.get("expense_type"),
+        amount: r.get("amount"),
+        description: r.get("description"),
+        company: r.get("company"),
+        paid_by: r.get("paid_by"),
+        payment_method: r.get("payment_method"),
+        created_by: r.get("created_by"),
+        created_at: r.get("created_at"),
+        updated_at: r.get("updated_at"),
     }))
 }
 
 pub async fn delete_expense(pool: &PgPool, id: i32) -> Result<bool> {
-    let result = sqlx::query("UPDATE fleet_expenses SET deleted_at = CURRENT_TIMESTAMP WHERE id = $1 AND deleted_at IS NULL")
+    let result = sqlx::query(
+        "UPDATE fleet_expenses SET deleted_at = CURRENT_TIMESTAMP WHERE id = $1 AND deleted_at IS NULL"
+    )
         .bind(id)
         .execute(pool)
         .await?;
