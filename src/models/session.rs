@@ -7,13 +7,13 @@ use chrono::{DateTime, Utc};
 
 #[derive(Debug, sqlx::FromRow)]
 pub struct SessionPermissionCheck {
-    pub id: i32,
-    pub driver_id: i32,
+    pub id: i32,          // driver_sessions.id = int
+    pub driver_id: i64,   // driver_sessions.driver_id = bigint
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct LocationPingLite {
-    pub id: i32,
+    pub id: i32,          // location_pings.id = int
     pub lat: f64,
     pub lng: f64,
     #[serde(rename = "time_stamp")]
@@ -24,7 +24,7 @@ pub struct LocationPingLite {
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct SessionLocationSummary {
-    pub session_id: i32,
+    pub session_id: i64,  // location_pings.session_id = bigint
     pub total_pings: i64,
     pub first_ping_time: Option<DateTime<Utc>>,
     pub last_ping_time: Option<DateTime<Utc>>,

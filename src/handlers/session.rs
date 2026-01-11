@@ -94,7 +94,7 @@ pub async fn get_session_location_pings(
     // Driver can only view their own sessions
     if claims.is_driver() {
         if let Some(driver_id) = claims.driver_id {
-            if session.driver_id != driver_id {
+            if session.driver_id != driver_id as i64 {
                 return Err(actix_web::error::ErrorForbidden(
                     "You don't have permission to view this session"
                 ));
