@@ -19,13 +19,24 @@ use crate::handlers::*;
 fn configure_routes(cfg: &mut web::ServiceConfig) {
     cfg.service(
         web::scope("/api/v1")
+            // Session Routes
+            .service(
+                web::scope("/sessions")
+                    .route(
+                        "/{id}/location-pings",
+                        web::get()
+                            .to(get_session_location_pings)
+                            .wrap(JwtAuth { required_permission: Some(1) })
+                    )
+            )
+            // Trip Statistics Routes
             .route(
                 "/trip-statistics",
                 web::get()
                     .to(get_trip_statistics)
                     .wrap(JwtAuth { required_permission: Some(3) })
             )
-            // Fleet Expenses Routes (now unified with fuel events + loans)
+            // Fleet Expenses Routes
             .route(
                 "/fleet-expenses",
                 web::post()
@@ -35,13 +46,13 @@ fn configure_routes(cfg: &mut web::ServiceConfig) {
             .route(
                 "/fleet-expenses",
                 web::get()
-                    .to(list_unified_expenses_handler)  // CHANGED: now unified
+                    .to(list_unified_expenses_handler)
                     .wrap(JwtAuth { required_permission: Some(4) })
             )
             .route(
                 "/fleet-expenses/statistics",
                 web::get()
-                    .to(get_unified_expense_statistics_handler)  // CHANGED: now unified
+                    .to(get_unified_expense_statistics_handler)
                     .wrap(JwtAuth { required_permission: Some(4) })
             )
             .route(
@@ -69,7 +80,7 @@ fn configure_routes(cfg: &mut web::ServiceConfig) {
 async fn main() -> std::io::Result<()> {
     env_logger::init();
     
-    info!("Starting Trip Statistics Rust Microservice");
+    info!("Starting Apex Transport Rust Microservice");
     info!("Connecting to database...");
     
     let pool = PgPoolOptions::new()
