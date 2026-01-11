@@ -415,11 +415,13 @@ pub async fn get_watanya_stats(
                 -- Calculate revenue per row based on fee tier
                 (t.tank_capacity * 
                     CASE fm.fee::int
-                        WHEN 1 THEN 82.5
-                        WHEN 2 THEN 104.5
-                        WHEN 3 THEN 126.5
-                        WHEN 4 THEN 148.5
-                        WHEN 5 THEN 170.5
+                         WHEN 1 THEN 95.0
+            WHEN 2 THEN 111.0
+            WHEN 3 THEN 118.0
+            WHEN 4 THEN 142.0
+            WHEN 5 THEN 167.0
+            WHEN 6 THEN 179.0
+            WHEN 7 THEN 191.0
                         ELSE 0.0
                     END / 1000.0)::float8 as trip_revenue
             FROM trips t
@@ -528,11 +530,13 @@ async fn get_watanya_route_details(
                 -- Calculate revenue per row
                 (t.tank_capacity * 
                     CASE fm.fee::int
-                        WHEN 1 THEN 82.5
-                        WHEN 2 THEN 104.5
-                        WHEN 3 THEN 126.5
-                        WHEN 4 THEN 148.5
-                        WHEN 5 THEN 170.5
+                         WHEN 1 THEN 95.0
+            WHEN 2 THEN 111.0
+            WHEN 3 THEN 118.0
+            WHEN 4 THEN 142.0
+            WHEN 5 THEN 167.0
+            WHEN 6 THEN 179.0
+            WHEN 7 THEN 191.0
                         ELSE 0.0
                     END / 1000.0)::float8 as trip_revenue
             FROM trips t
@@ -1090,11 +1094,13 @@ pub async fn get_stats_by_date(
                         WHEN t.company = 'Watanya' THEN
                             (t.tank_capacity * 
                                 CASE fm.fee::int
-                                    WHEN 1 THEN 82.5
-                                    WHEN 2 THEN 104.5
-                                    WHEN 3 THEN 126.5
-                                    WHEN 4 THEN 148.5
-                                    WHEN 5 THEN 170.5
+                                      WHEN 1 THEN 95.0
+            WHEN 2 THEN 111.0
+            WHEN 3 THEN 118.0
+            WHEN 4 THEN 142.0
+            WHEN 5 THEN 167.0
+            WHEN 6 THEN 179.0
+            WHEN 7 THEN 191.0
                                     ELSE 0.0
                                 END / 1000.0)::float8
                         WHEN t.company = 'TAQA' THEN
@@ -1273,11 +1279,13 @@ pub async fn get_stats_by_date(
                         WHEN t.company = 'Watanya' THEN
                             (t.tank_capacity * 
                                 CASE fm.fee::int
-                                    WHEN 1 THEN 82.5
-                                    WHEN 2 THEN 104.5
-                                    WHEN 3 THEN 126.5
-                                    WHEN 4 THEN 148.5
-                                    WHEN 5 THEN 170.5
+                                      WHEN 1 THEN 95.0
+            WHEN 2 THEN 111.0
+            WHEN 3 THEN 118.0
+            WHEN 4 THEN 142.0
+            WHEN 5 THEN 167.0
+            WHEN 6 THEN 179.0
+            WHEN 7 THEN 191.0
                                     ELSE 0.0
                                 END / 1000.0)::float8
                         WHEN t.company = 'TAQA' THEN
