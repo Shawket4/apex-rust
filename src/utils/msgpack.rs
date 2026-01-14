@@ -59,33 +59,33 @@ pub fn serialize_pings_fast(pings: &[LocationPingLite]) -> Vec<u8> {
     let mut buf = Vec::with_capacity(pings.len() * 50);
     
     // Write array header
-    write_array_len(&mut buf, pings.len() as u32).unwrap();
+    let _ = write_array_len(&mut buf, pings.len() as u32);
     
     for ping in pings {
         // Write as 5-element map
-        write_map_len(&mut buf, 5).unwrap();
+        let _ = write_map_len(&mut buf, 5);
         
         // id
-        write_str(&mut buf, "id").unwrap();
-        write_i32(&mut buf, ping.id).unwrap();
+        let _ = write_str(&mut buf, "id");
+        let _ = write_i32(&mut buf, ping.id);
         
         // lat
-        write_str(&mut buf, "lat").unwrap();
-        write_f64(&mut buf, ping.lat).unwrap();
+        let _ = write_str(&mut buf, "lat");
+        let _ = write_f64(&mut buf, ping.lat);
         
         // lng
-        write_str(&mut buf, "lng").unwrap();
-        write_f64(&mut buf, ping.lng).unwrap();
+        let _ = write_str(&mut buf, "lng");
+        let _ = write_f64(&mut buf, ping.lng);
         
         // time_stamp (as Unix timestamp for compactness)
-        write_str(&mut buf, "ts").unwrap();
-        write_i64(&mut buf, ping.time_stamp.timestamp()).unwrap();
+        let _ = write_str(&mut buf, "ts");
+        let _ = write_i64(&mut buf, ping.time_stamp.and_utc().timestamp());
         
         // speed (optional)
-        write_str(&mut buf, "spd").unwrap();
+        let _ = write_str(&mut buf, "spd");
         match ping.speed {
-            Some(s) => write_f64(&mut buf, s).unwrap(),
-            None => write_nil(&mut buf).unwrap(),
+            Some(s) => { let _ = write_f64(&mut buf, s); },
+            None => { let _ = write_nil(&mut buf); },
         }
     }
     

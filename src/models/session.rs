@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Utc, NaiveDateTime};
 
 // ============================================================================
 // Database Models
@@ -17,17 +17,26 @@ pub struct LocationPingLite {
     pub lat: f64,
     pub lng: f64,
     #[serde(rename = "time_stamp")]
-    pub time_stamp: DateTime<Utc>,
+    #[serde(serialize_with = "serialize_naive_datetime")]
+    pub time_stamp: NaiveDateTime,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub speed: Option<f64>,
+}
+
+// Serialize NaiveDateTime as ISO 8601 string
+fn serialize_naive_datetime<S>(dt: &NaiveDateTime, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    serializer.serialize_str(&dt.format("%Y-%m-%dT%H:%M:%S%.fZ").to_string())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct SessionLocationSummary {
     pub session_id: i64,  // location_pings.session_id = bigint
     pub total_pings: i64,
-    pub first_ping_time: Option<DateTime<Utc>>,
-    pub last_ping_time: Option<DateTime<Utc>>,
+    pub first_ping_time: Option<NaiveDateTime>,
+    pub last_ping_time: Option<NaiveDateTime>,
     pub avg_speed: Option<f64>,
     pub max_speed: Option<f64>,
     pub min_lat: Option<f64>,
@@ -51,11 +60,24 @@ pub struct BoundingBox {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionStats {
     pub total_pings: i64,
-    pub first_ping_time: Option<DateTime<Utc>>,
-    pub last_ping_time: Option<DateTime<Utc>>,
+    #[serde(serialize_with = "serialize_option_naive_datetime")]
+    pub first_ping_time: Option<NaiveDateTime>,
+    #[serde(serialize_with = "serialize_option_naive_datetime")]
+    pub last_ping_time: Option<NaiveDateTime>,
     pub avg_speed: Option<f64>,
     pub max_speed: Option<f64>,
     pub bounding_box: BoundingBox,
+}
+
+// Serialize Option<NaiveDateTime> as ISO 8601 string
+fn serialize_option_naive_datetime<S>(dt: &Option<NaiveDateTime>, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    match dt {
+        Some(dt) => serializer.serialize_str(&dt.format("%Y-%m-%dT%H:%M:%S%.fZ").to_string()),
+        None => serializer.serialize_none(),
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
