@@ -1,4 +1,4 @@
-// db.rs - Revised with fixes for issues 5, 6, 7, 8 and extended Watanya fees
+// db.rs - Complete with deleted_at fix and extended Watanya fees
 
 use sqlx::{PgPool, Row};
 use anyhow::Result;
@@ -84,6 +84,7 @@ pub async fn get_petrol_arrows_stats(
                 ON t.company = fm.company 
                 AND t.terminal = fm.terminal 
                 AND t.drop_off_point = fm.drop_off_point
+                AND fm.deleted_at IS NULL
             WHERE t.company = 'Petrol Arrows'
                 AND t.deleted_at IS NULL
                 AND t.date BETWEEN $1 AND $2
@@ -163,11 +164,11 @@ pub async fn get_taqa_stats(
                 ON t.company = fm.company 
                 AND t.terminal = fm.terminal 
                 AND t.drop_off_point = fm.drop_off_point
+                AND fm.deleted_at IS NULL
             WHERE t.company = 'TAQA'
                 AND t.deleted_at IS NULL
                 AND t.date BETWEEN $1 AND $2
         ),
-        -- Calculate working days per car per month per terminal
         car_monthly_working_days AS (
             SELECT 
                 terminal,
@@ -177,7 +178,6 @@ pub async fn get_taqa_stats(
             FROM trip_data
             GROUP BY terminal, car_no_plate, DATE_TRUNC('month', date::date)
         ),
-        -- Calculate monthly rental per car per month (FIX #8: guard against division by zero)
         car_monthly_rentals AS (
             SELECT 
                 terminal,
@@ -191,7 +191,6 @@ pub async fn get_taqa_stats(
                 END::float8 as monthly_rental
             FROM car_monthly_working_days
         ),
-        -- Sum rentals per car across all months
         car_total_rentals AS (
             SELECT 
                 terminal,
@@ -201,7 +200,6 @@ pub async fn get_taqa_stats(
             FROM car_monthly_rentals
             GROUP BY terminal, car_no_plate
         ),
-        -- Aggregate by terminal
         car_rentals AS (
             SELECT 
                 terminal,
@@ -210,7 +208,6 @@ pub async fn get_taqa_stats(
             FROM car_total_rentals
             GROUP BY terminal
         ),
-        -- Aggregate trip data
         aggregates AS (
             SELECT 
                 terminal,
@@ -309,11 +306,11 @@ pub async fn get_petromin_stats(
                 ON t.company = fm.company 
                 AND t.terminal = fm.terminal 
                 AND t.drop_off_point = fm.drop_off_point
+                AND fm.deleted_at IS NULL
             WHERE t.company = 'Petromin'
                 AND t.deleted_at IS NULL
                 AND t.date BETWEEN $1 AND $2
         ),
-        -- Calculate car-days (unique car-date combinations)
         car_days AS (
             SELECT 
                 terminal,
@@ -321,7 +318,6 @@ pub async fn get_petromin_stats(
             FROM trip_data
             GROUP BY terminal
         ),
-        -- Aggregate trip data
         aggregates AS (
             SELECT 
                 terminal,
@@ -396,7 +392,6 @@ pub async fn get_petromin_stats(
     Ok(details)
 }
 
-// FIX #5: Watanya now includes unmapped trips (with 0 revenue)
 pub async fn get_watanya_stats(
     pool: &PgPool,
     start_date: &str,
@@ -410,7 +405,6 @@ pub async fn get_watanya_stats(
                 t.tank_capacity,
                 COALESCE(fm.distance, 0.0) as distance,
                 COALESCE(fm.fee::float8, 0.0) as fee,
-                -- Extended Watanya fees (1-15)
                 (t.tank_capacity * 
                     CASE COALESCE(fm.fee::int, 0)
                         WHEN 1 THEN 95.0
@@ -435,10 +429,10 @@ pub async fn get_watanya_stats(
                 ON t.company = fm.company 
                 AND t.terminal = fm.terminal 
                 AND t.drop_off_point = fm.drop_off_point
+                AND fm.deleted_at IS NULL
             WHERE t.company = 'Watanya' 
                 AND t.deleted_at IS NULL
                 AND t.date BETWEEN $1 AND $2
-                -- REMOVED: AND fm.fee IS NOT NULL (FIX #5)
         ),
         aggregates AS (
             SELECT 
@@ -518,7 +512,6 @@ pub async fn get_route_details(
     }
 }
 
-// FIX #5 & #6: Watanya route details - includes unmapped, fixed GROUP BY
 async fn get_watanya_route_details(
     pool: &PgPool,
     start_date: &str,
@@ -534,7 +527,6 @@ async fn get_watanya_route_details(
                 t.tank_capacity,
                 COALESCE(fm.distance, 0.0) as distance,
                 COALESCE(fm.fee::float8, 0.0) as fee,
-                -- Extended Watanya fees
                 (t.tank_capacity * 
                     CASE COALESCE(fm.fee::int, 0)
                         WHEN 1 THEN 95.0
@@ -559,11 +551,11 @@ async fn get_watanya_route_details(
                 ON t.company = fm.company 
                 AND t.terminal = fm.terminal 
                 AND t.drop_off_point = fm.drop_off_point
+                AND fm.deleted_at IS NULL
             WHERE t.company = 'Watanya'
                 AND t.deleted_at IS NULL
                 AND t.date BETWEEN $1 AND $2
         ),
-        -- FIX #6: Simplified aggregation without problematic GROUP BY
         car_stats AS (
             SELECT 
                 COALESCE(fee, 0) as fee,
@@ -664,7 +656,6 @@ async fn get_watanya_route_details(
     Ok(result)
 }
 
-// FIX #6 & #8: TAQA route details - fixed GROUP BY, guarded division
 async fn get_taqa_route_details(
     pool: &PgPool,
     start_date: &str,
@@ -689,11 +680,11 @@ async fn get_taqa_route_details(
                 ON t.company = fm.company 
                 AND t.terminal = fm.terminal 
                 AND t.drop_off_point = fm.drop_off_point
+                AND fm.deleted_at IS NULL
             WHERE t.company = 'TAQA'
                 AND t.deleted_at IS NULL
                 AND t.date BETWEEN $1 AND $2
         ),
-        -- Calculate working days per car per month per terminal
         car_monthly_working_days AS (
             SELECT 
                 terminal,
@@ -703,7 +694,6 @@ async fn get_taqa_route_details(
             FROM trip_data
             GROUP BY terminal, car_no_plate, DATE_TRUNC('month', date::date)
         ),
-        -- Calculate monthly rental per car (FIX #8: guard against zero)
         car_monthly_rentals AS (
             SELECT 
                 terminal,
@@ -717,7 +707,6 @@ async fn get_taqa_route_details(
                 END::float8 as monthly_rental
             FROM car_monthly_working_days
         ),
-        -- Sum rentals per car across all months per terminal
         car_rental_totals AS (
             SELECT 
                 terminal,
@@ -727,7 +716,6 @@ async fn get_taqa_route_details(
             FROM car_monthly_rentals
             GROUP BY terminal, car_no_plate
         ),
-        -- FIX #6: Aggregate trip stats per car separately, then join rental
         car_trip_stats AS (
             SELECT 
                 terminal,
@@ -740,7 +728,6 @@ async fn get_taqa_route_details(
             FROM trip_data
             GROUP BY terminal, car_no_plate
         ),
-        -- Join trip stats with rental data
         car_stats AS (
             SELECT 
                 cts.terminal,
@@ -838,7 +825,6 @@ async fn get_taqa_route_details(
     Ok(result)
 }
 
-// FIX #6: Petromin route details - simplified GROUP BY
 async fn get_petromin_route_details(
     pool: &PgPool,
     start_date: &str,
@@ -860,11 +846,11 @@ async fn get_petromin_route_details(
                 ON t.company = fm.company 
                 AND t.terminal = fm.terminal 
                 AND t.drop_off_point = fm.drop_off_point
+                AND fm.deleted_at IS NULL
             WHERE t.company = 'Petromin'
                 AND t.deleted_at IS NULL
                 AND t.date BETWEEN $1 AND $2
         ),
-        -- Calculate working days per car per terminal
         car_working_days AS (
             SELECT 
                 terminal,
@@ -873,7 +859,6 @@ async fn get_petromin_route_details(
             FROM trip_data
             GROUP BY terminal, car_no_plate
         ),
-        -- FIX #6: Separate trip aggregation
         car_trip_stats AS (
             SELECT 
                 terminal,
@@ -886,7 +871,6 @@ async fn get_petromin_route_details(
             FROM trip_data
             GROUP BY terminal, car_no_plate
         ),
-        -- Join trip stats with working days
         car_stats AS (
             SELECT 
                 cts.terminal,
@@ -984,7 +968,6 @@ async fn get_petromin_route_details(
     Ok(result)
 }
 
-// FIX #6: Petrol Arrows route details
 async fn get_petrol_arrows_route_details(
     pool: &PgPool,
     start_date: &str,
@@ -1008,6 +991,7 @@ async fn get_petrol_arrows_route_details(
                 ON t.company = fm.company 
                 AND t.terminal = fm.terminal 
                 AND t.drop_off_point = fm.drop_off_point
+                AND fm.deleted_at IS NULL
             WHERE t.company = 'Petrol Arrows'
                 AND t.deleted_at IS NULL
                 AND t.date BETWEEN $1 AND $2
@@ -1113,7 +1097,6 @@ async fn get_petrol_arrows_route_details(
     Ok(result)
 }
 
-// FIX #7: Simplified stats by date - cleaner JOIN logic
 pub async fn get_stats_by_date(
     pool: &PgPool,
     start_date: &str,
@@ -1134,7 +1117,6 @@ pub async fn get_stats_by_date(
                 t.drop_off_point,
                 COALESCE(fm.distance, 0.0) as distance,
                 COALESCE(fm.fee::float8, 0.0) as fee,
-                -- Calculate revenue per row based on company (extended Watanya fees)
                 CASE 
                     WHEN t.company = 'Watanya' THEN
                         (t.tank_capacity * 
@@ -1172,6 +1154,7 @@ pub async fn get_stats_by_date(
                 ON t.company = fm.company 
                 AND t.terminal = fm.terminal 
                 AND t.drop_off_point = fm.drop_off_point
+                AND fm.deleted_at IS NULL
             WHERE t.deleted_at IS NULL
                 AND t.date BETWEEN $1 AND $2
     "#;
@@ -1184,7 +1167,6 @@ pub async fn get_stats_by_date(
 
     let rest_of_query = r#"
         ),
-        -- TAQA: Calculate working days per car per month
         taqa_car_monthly AS (
             SELECT 
                 car_no_plate,
@@ -1194,7 +1176,6 @@ pub async fn get_stats_by_date(
             WHERE company = 'TAQA'
             GROUP BY car_no_plate, DATE_TRUNC('month', date::date)
         ),
-        -- TAQA: Calculate monthly rental per car (FIX #8: guard zero)
         taqa_car_rental AS (
             SELECT 
                 car_no_plate,
@@ -1207,7 +1188,6 @@ pub async fn get_stats_by_date(
                 END::float8 as monthly_rental
             FROM taqa_car_monthly
         ),
-        -- TAQA: Allocate rental to each day (FIX #8: guard zero division)
         taqa_daily_allocation AS (
             SELECT 
                 td.date,
@@ -1220,7 +1200,6 @@ pub async fn get_stats_by_date(
             FROM (SELECT DISTINCT date, car_no_plate, DATE_TRUNC('month', date::date) as month FROM trip_data WHERE company = 'TAQA') td
             JOIN taqa_car_rental tcr ON td.car_no_plate = tcr.car_no_plate AND td.month = tcr.month
         ),
-        -- TAQA: Sum daily rental by date
         taqa_daily_rental AS (
             SELECT 
                 date,
@@ -1228,7 +1207,6 @@ pub async fn get_stats_by_date(
             FROM taqa_daily_allocation
             GROUP BY date
         ),
-        -- Petromin: Car count per date
         petromin_daily_cars AS (
             SELECT 
                 date,
@@ -1237,7 +1215,6 @@ pub async fn get_stats_by_date(
             WHERE company = 'Petromin'
             GROUP BY date
         ),
-        -- FIX #7: Aggregate company stats without problematic JOINs in GROUP BY
         company_base_stats AS (
             SELECT 
                 date,
@@ -1250,7 +1227,6 @@ pub async fn get_stats_by_date(
             FROM trip_data
             GROUP BY date, company
         ),
-        -- FIX #7: Add car rental separately via LEFT JOIN
         company_with_rental AS (
             SELECT 
                 cbs.date,
@@ -1268,7 +1244,6 @@ pub async fn get_stats_by_date(
             LEFT JOIN taqa_daily_rental tdr ON cbs.date = tdr.date AND cbs.company = 'TAQA'
             LEFT JOIN petromin_daily_cars pdc ON cbs.date = pdc.date AND cbs.company = 'Petromin'
         ),
-        -- Calculate VAT and totals
         company_final AS (
             SELECT 
                 date,
@@ -1290,7 +1265,6 @@ pub async fn get_stats_by_date(
                 END as total_revenue
             FROM company_with_rental
         ),
-        -- Aggregate by date
         date_totals AS (
             SELECT 
                 date,
