@@ -73,6 +73,7 @@ fn configure_routes(cfg: &mut web::ServiceConfig) {
                     .to(delete_expense_handler)
                     .wrap(JwtAuth { required_permission: Some(4) })
             )
+            .route("/fleet-expenses/export", web::get().to(export_expenses_handler).wrap(JwtAuth { required_permission: Some(4) }))
     );
 }
 

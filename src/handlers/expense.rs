@@ -242,3 +242,32 @@ pub async fn delete_expense_handler(
     response(&response_data, use_msgpack)
         .map_err(actix_web::error::ErrorInternalServerError)
 }
+// handlers/expense.rs - Fix the export handler
+pub async fn export_expenses_handler(
+    pool: web::Data<PgPool>,
+    query: web::Query<FleetExpenseFilters>,
+    req: HttpRequest,
+) -> Result<HttpResponse, actix_web::Error> {
+    let claims = req.extensions().get::<Claims>().cloned()
+        .ok_or_else(|| actix_web::error::ErrorUnauthorized("Authentication required"))?;
+    check_financial_access(&claims)?;
+
+    let use_msgpack = query.format.as_deref() == Some("msgpack");
+
+    // Get ALL expenses without pagination
+    let expenses = list_all_expenses_for_export(pool.get_ref(), &query)
+        .await
+        .map_err(actix_web::error::ErrorInternalServerError)?;
+
+    // ✅ Calculate length BEFORE moving the value
+    let total_records = expenses.len() as i64;
+
+    let response_data = UnifiedExpenseExportResponse {
+        message: "Expenses exported successfully".to_string(),
+        data: expenses,  // ✅ Value moved here
+        total_records,   // ✅ Use the pre-calculated value
+    };
+
+    response(&response_data, use_msgpack)
+        .map_err(actix_web::error::ErrorInternalServerError)
+}

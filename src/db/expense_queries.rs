@@ -704,3 +704,156 @@ pub async fn delete_expense(pool: &PgPool, id: i32) -> Result<bool> {
         .await?;
     Ok(result.rows_affected() > 0)
 }
+
+// db/expense.rs - Add new function for export (no pagination)
+pub async fn list_all_expenses_for_export(
+    pool: &PgPool,
+    filters: &FleetExpenseFilters,
+) -> Result<Vec<UnifiedExpense>> {
+    // Same query logic as list_unified_expenses but WITHOUT limit/offset
+    let include_fuel = filters.should_include_fuel();
+    let include_loans = filters.should_include_loans();
+    
+    let date_filter_fleet = build_date_filter(&filters.start_date, &filters.end_date);
+    let date_filter_fuel = build_fuel_date_filter(&filters.start_date, &filters.end_date);
+    let date_filter_loan = build_loan_date_filter(&filters.start_date, &filters.end_date);
+    
+    let search_filter_fleet = build_search_filter_fleet(&filters.search);
+    let search_filter_fuel = build_search_filter_fuel(&filters.search);
+    let search_filter_loan = build_search_filter_loan(&filters.search);
+    
+    let car_filter = filters.car_no_plate.as_ref()
+        .map(|c| format!("AND car_no_plate ILIKE '%{}%'", escape_sql_string(c)))
+        .unwrap_or_default();
+    
+    let company_filter = filters.company.as_ref()
+        .map(|c| {
+            if c == "General" {
+                "AND (company IS NULL OR company = '' OR company = 'General')".to_string()
+            } else {
+                format!("AND company ILIKE '%{}%'", escape_sql_string(c))
+            }
+        })
+        .unwrap_or_default();
+    
+    let expense_type_filter = filters.expense_type.as_ref()
+        .filter(|t| !t.is_empty() && *t != "Fuel" && *t != "Loan")
+        .map(|t| format!("AND expense_type = '{}'", escape_sql_string(t)))
+        .unwrap_or_default();
+    
+    let payment_method_filter = filters.payment_method.as_ref()
+        .map(|p| format!("AND payment_method ILIKE '%{}%'", escape_sql_string(p)))
+        .unwrap_or_default();
+    
+    let mut union_parts = Vec::new();
+    
+    let expense_type = filters.expense_type.as_deref().unwrap_or("");
+    let include_fleet = expense_type.is_empty() || (expense_type != "Fuel" && expense_type != "Loan");
+    let include_fuel_query = include_fuel && (expense_type.is_empty() || expense_type == "Fuel");
+    let include_loans_query = include_loans && (expense_type.is_empty() || expense_type == "Loan");
+    
+    if include_fleet {
+        union_parts.push(format!(r#"
+            SELECT 
+                id, 'fleet_expense' as source, car_no_plate, expense_date, expense_type,
+                amount::float8 as amount, description, company, paid_by, payment_method,
+                created_by, created_at, updated_at,
+                NULL::float8 as liters, NULL::float8 as price_per_liter,
+                NULL::text as driver_name, NULL::bigint as odometer_before,
+                NULL::bigint as odometer_after, NULL::boolean as is_paid,
+                NULL::bigint as driver_id, NULL::bigint as employee_id
+            FROM fleet_expenses
+            WHERE deleted_at IS NULL {} {} {} {} {} {}
+        "#,
+            date_filter_fleet, car_filter, company_filter,
+            expense_type_filter, payment_method_filter, search_filter_fleet
+        ));
+    }
+
+    if include_fuel_query {
+        union_parts.push(format!(r#"
+            SELECT 
+                id, 'fuel_event'::text as source, car_no_plate, date::date as expense_date,
+                'Fuel'::text as expense_type, COALESCE(price, 0)::float8 as amount,
+                CONCAT('Fuel: ', COALESCE(liters::text, '0'), 'L @ ', COALESCE(price_per_liter::text, '0'), '/L')::text as description,
+                transporter as company, driver_name as paid_by, COALESCE(method, 'Cash')::text as payment_method,
+                NULL::integer as created_by, created_at, updated_at,
+                liters::float8 as liters, price_per_liter::float8 as price_per_liter,
+                driver_name, odometer_before, odometer_after,
+                NULL::boolean as is_paid, NULL::bigint as driver_id, NULL::bigint as employee_id
+            FROM fuel_events
+            WHERE deleted_at IS NULL AND created_at IS NOT NULL {} {} {}
+        "#, date_filter_fuel, car_filter, search_filter_fuel));
+    }
+
+    if include_loans_query {
+        union_parts.push(format!(r#"
+            SELECT 
+                id, 'loan'::text as source, NULL::text as car_no_plate, date::date as expense_date,
+                'Loan'::text as expense_type, COALESCE(amount, 0)::float8 as amount,
+                description, NULL::text as company, NULL::text as paid_by,
+                COALESCE(method, 'Cash')::text as payment_method,
+                NULL::integer as created_by, created_at, updated_at,
+                NULL::float8 as liters, NULL::float8 as price_per_liter,
+                NULL::text as driver_name, NULL::bigint as odometer_before,
+                NULL::bigint as odometer_after, is_paid, driver_id, employee_id
+            FROM loans
+            WHERE deleted_at IS NULL AND created_at IS NOT NULL {} {}
+        "#, date_filter_loan, search_filter_loan));
+    }
+
+    if union_parts.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let union_query = union_parts.join(" UNION ALL ");
+    
+    // ✅ NO LIMIT OR OFFSET - returns ALL records
+    let full_query = format!(r#"
+        WITH unified AS ({})
+        SELECT * FROM unified
+        ORDER BY expense_date DESC, created_at DESC
+    "#, union_query);
+
+    let rows = sqlx::query(&full_query)
+        .fetch_all(pool)
+        .await?;
+
+    let expenses: Vec<UnifiedExpense> = rows
+        .into_iter()
+        .map(|r| {
+            let source_str: String = r.get("source");
+            let source = match source_str.as_str() {
+                "fuel_event" => ExpenseSource::FuelEvent,
+                "loan" => ExpenseSource::Loan,
+                _ => ExpenseSource::FleetExpense,
+            };
+            
+            UnifiedExpense {
+                id: r.get("id"),
+                source,
+                car_no_plate: r.get("car_no_plate"),
+                expense_date: r.get("expense_date"),
+                expense_type: r.get("expense_type"),
+                amount: r.get("amount"),
+                description: r.get("description"),
+                company: r.get("company"),
+                paid_by: r.get("paid_by"),
+                payment_method: r.get("payment_method"),
+                created_by: r.get("created_by"),
+                created_at: r.get("created_at"),
+                updated_at: r.get("updated_at"),
+                liters: r.get("liters"),
+                price_per_liter: r.get("price_per_liter"),
+                driver_name: r.get("driver_name"),
+                odometer_before: r.get("odometer_before"),
+                odometer_after: r.get("odometer_after"),
+                is_paid: r.get("is_paid"),
+                driver_id: r.get("driver_id"),
+                employee_id: r.get("employee_id"),
+            }
+        })
+        .collect();
+
+    Ok(expenses)
+}

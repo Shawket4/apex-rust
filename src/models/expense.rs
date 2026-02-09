@@ -274,3 +274,12 @@ pub struct FleetExpenseBatchResponse {
     pub message: String,
     pub data: BatchCreateResult,
 }
+
+
+// models/expense.rs - Add export response model
+#[derive(Debug, Serialize, Deserialize)]
+pub struct UnifiedExpenseExportResponse {
+    pub message: String,
+    pub data: Vec<UnifiedExpense>,
+    pub total_records: i64,
+}
