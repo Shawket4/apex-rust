@@ -17,14 +17,12 @@ jobs:
         env:
           SQLX_OFFLINE: true
         run: |
-          # Create a Dockerfile for building
           cat > Dockerfile.build << 'EOF'
           FROM ubuntu:22.04
-          
-          # Prevent interactive prompts
+
           ENV DEBIAN_FRONTEND=noninteractive
-          
-          # Install build dependencies
+
+          # libssl-dev is still required by sqlx and other crates at compile time
           RUN apt-get update && apt-get install -y \
               curl \
               build-essential \
@@ -32,59 +30,42 @@ jobs:
               libssl-dev \
               ca-certificates \
               && rm -rf /var/lib/apt/lists/*
-          
-          # Install Rust
+
           RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
           ENV PATH="/root/.cargo/bin:${PATH}"
-          
+
           WORKDIR /app
-          
-          # Copy the project files
+
           COPY . .
-          
-          # Build the project
+
           RUN cargo build --release --verbose
-          
-          # Strip the binary
+
           RUN strip target/release/apex-rust || true
-          
-          # List the result
+
           RUN ls -lh target/release/apex-rust
           EOF
-          
-          # Build the Docker image (this compiles the Rust code)
+
           docker build -t apex-rust-builder -f Dockerfile.build .
-          
-          # Extract the binary from the Docker image
+
           docker create --name temp-container apex-rust-builder
           docker cp temp-container:/app/target/release/apex-rust ./apex-rust
           docker rm temp-container
-          
-          # Verify binary was extracted
+
           ls -la apex-rust
           file apex-rust
-          
-          # Make executable
+
           chmod +x apex-rust
 
       - name: Prepare deployment package
         run: |
-          # Create a directory for all files to deploy
           mkdir -p deployment
 
-          # Copy the binary
           cp apex-rust deployment/
-
-          # Copy migrations if they exist
           cp -r migrations deployment/ || true
-
-          # Copy any config files you might need
           cp .env.example deployment/.env.example || true
 
-          # Create a tarball for easier transfer
           tar -czf deployment.tar.gz -C deployment .
-          
-          # Show what's in the deployment package
+
           echo "Deployment package contents:"
           tar -tzf deployment.tar.gz
 
@@ -98,74 +79,58 @@ jobs:
 
       - name: Deploy to VPS
         run: |
-          # Create a deployment script to run on the server
           cat > deploy.sh << 'EOF'
           #!/bin/bash
           set -e
 
-          # Configuration
           DEPLOY_DIR="/opt/apex-rust"
           SERVICE_NAME="apex-rust"
           BACKUP_DIR="/opt/apex-rust/backups"
 
           echo "Starting deployment..."
 
-          # Create directories if they don't exist
           sudo mkdir -p ${DEPLOY_DIR}
           sudo mkdir -p ${BACKUP_DIR}
           sudo mkdir -p ${DEPLOY_DIR}/logs
 
-          # Stop the service
           echo "Stopping service..."
           sudo systemctl stop ${SERVICE_NAME} || true
 
-          # Backup existing binary
           if [ -f ${DEPLOY_DIR}/apex-rust ]; then
             echo "Backing up existing binary..."
             TIMESTAMP=$(date +%Y%m%d_%H%M%S)
             sudo cp ${DEPLOY_DIR}/apex-rust ${BACKUP_DIR}/apex-rust.${TIMESTAMP}
-            # Keep only last 5 backups
             sudo ls -t ${BACKUP_DIR}/apex-rust.* | tail -n +6 | xargs -r sudo rm
           fi
 
-          # Extract new files
           echo "Extracting new files..."
           cd ${DEPLOY_DIR}
           sudo tar -xzf /tmp/deployment.tar.gz
 
-          # List what was extracted
           echo "Files in deployment directory:"
           ls -la ${DEPLOY_DIR}/
 
-          # Make sure binary is executable
           sudo chmod +x ${DEPLOY_DIR}/apex-rust
-
-          # Set ownership
           sudo chown -R root:root ${DEPLOY_DIR}
 
-          # Keep .env file if it exists (don't overwrite with .env.example)
           if [ ! -f ${DEPLOY_DIR}/.env ] && [ -f ${DEPLOY_DIR}/.env.example ]; then
             echo "Creating .env from .env.example..."
             sudo cp ${DEPLOY_DIR}/.env.example ${DEPLOY_DIR}/.env
             echo "⚠️  Please configure ${DEPLOY_DIR}/.env with your settings"
           fi
 
-          # Run migrations if they exist
           if [ -d ${DEPLOY_DIR}/migrations ]; then
             echo "Migrations directory found. Run manually if needed:"
             echo "cd ${DEPLOY_DIR} && sqlx migrate run"
           fi
 
-          # Restart service
           echo "Restarting service..."
           sudo systemctl daemon-reload
           sudo systemctl enable ${SERVICE_NAME}
           sudo systemctl restart ${SERVICE_NAME}
 
-          # Wait a moment for service to start
           sleep 3
 
-          # Check service status
           echo "Checking service status..."
           if sudo systemctl is-active --quiet ${SERVICE_NAME}; then
             echo "✅ Service is running"
@@ -182,11 +147,9 @@ jobs:
 
           chmod +x deploy.sh
 
-          # Copy the deployment package to the VPS
           echo "Uploading deployment package..."
           scp -i ~/.ssh/deploy_key -P ${{ secrets.SSH_PORT }} deployment.tar.gz ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}:/tmp/
 
-          # Copy and execute the deployment script
           echo "Deploying on VPS..."
           scp -i ~/.ssh/deploy_key -P ${{ secrets.SSH_PORT }} deploy.sh ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}:/tmp/
           ssh -i ~/.ssh/deploy_key -P ${{ secrets.SSH_PORT }} ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} "bash /tmp/deploy.sh"
@@ -195,20 +158,23 @@ jobs:
         run: |
           echo "Waiting for service to be ready..."
           sleep 5
-          
-          # Try health check via HTTPS
-          ssh -i ~/.ssh/deploy_key -P ${{ secrets.SSH_PORT }} ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} "curl -k -f https://localhost:3002/health || echo 'Health check endpoint not available'"
+
+          # Service is HTTP-only on loopback — no TLS, no -k flag needed
+          ssh -i ~/.ssh/deploy_key -P ${{ secrets.SSH_PORT }} ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} \
+            "curl -f http://127.0.0.1:3002/health || echo 'Health check endpoint not available'"
 
       - name: Verify deployment
         run: |
           echo "Verifying service status..."
-          ssh -i ~/.ssh/deploy_key -P ${{ secrets.SSH_PORT }} ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} "systemctl status apex-rust --no-pager" || true
+          ssh -i ~/.ssh/deploy_key -P ${{ secrets.SSH_PORT }} ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} \
+            "systemctl status apex-rust --no-pager" || true
 
       - name: Show recent logs
         if: always()
         run: |
           echo "Recent service logs:"
-          ssh -i ~/.ssh/deploy_key -P ${{ secrets.SSH_PORT }} ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} "sudo journalctl -u apex-rust -n 30 --no-pager" || true
+          ssh -i ~/.ssh/deploy_key -P ${{ secrets.SSH_PORT }} ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} \
+            "sudo journalctl -u apex-rust -n 30 --no-pager" || true
 
       - name: Cleanup
         if: always()
