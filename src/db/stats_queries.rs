@@ -156,7 +156,7 @@ pub async fn get_taqa_stats(
                 t.tank_capacity,
                 COALESCE(fm.distance, 0.0) as distance,
                 (CASE 
-                    WHEN t.terminal IN ('Alex', 'Suez') THEN COALESCE(fm.distance, 0.0) * 45.5
+                    WHEN t.terminal IN ('Alex', 'Suez') THEN COALESCE(fm.distance, 0.0) * 50.5
                     ELSE 0.0
                 END)::float8 as trip_revenue
             FROM trips t
@@ -233,7 +233,7 @@ pub async fn get_taqa_stats(
             CASE WHEN $3 THEN COALESCE(cr.total_car_rental, 0.0)::float8 ELSE NULL END as car_rental,
             CASE WHEN $3 THEN ((a.base_revenue + COALESCE(cr.total_car_rental, 0.0)) * 0.14)::float8 ELSE NULL END as vat,
             CASE 
-                WHEN a.terminal IN ('Alex', 'Suez') THEN 45.5
+                WHEN a.terminal IN ('Alex', 'Suez') THEN 50.5
                 ELSE 0.0
             END as fee
         FROM aggregates a
@@ -672,7 +672,7 @@ async fn get_taqa_route_details(
                 t.tank_capacity,
                 COALESCE(fm.distance, 0.0) as distance,
                 (CASE 
-                    WHEN t.terminal IN ('Alex', 'Suez') THEN COALESCE(fm.distance, 0.0) * 45.5
+                    WHEN t.terminal IN ('Alex', 'Suez') THEN COALESCE(fm.distance, 0.0) * 50.5
                     ELSE 0.0
                 END)::float8 as trip_revenue
             FROM trips t
@@ -812,7 +812,7 @@ async fn get_taqa_route_details(
             vat,
             car_rental,
             total_with_vat,
-            fee: Some(45.5),
+            fee: Some(50.5),
             route_type: "terminal".to_string(),
             terminal: Some(terminal),
             drop_off_point: None,
@@ -1140,7 +1140,7 @@ pub async fn get_stats_by_date(
                             END / 1000.0)::float8
                     WHEN t.company = 'TAQA' THEN
                         (CASE 
-                            WHEN t.terminal IN ('Alex', 'Suez') THEN COALESCE(fm.distance, 0.0) * 45.5
+                            WHEN t.terminal IN ('Alex', 'Suez') THEN COALESCE(fm.distance, 0.0) * 50.5
                             ELSE 0.0
                         END)::float8
                     WHEN t.company = 'Petromin' THEN
