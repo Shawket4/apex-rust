@@ -407,21 +407,21 @@ pub async fn get_watanya_stats(
                 COALESCE(fm.fee::float8, 0.0) as fee,
                 (t.tank_capacity * 
                     CASE COALESCE(fm.fee::int, 0)
-                        WHEN 1 THEN 95.0
-                        WHEN 2 THEN 111.0
-                        WHEN 3 THEN 118.0
-                        WHEN 4 THEN 142.0
-                        WHEN 5 THEN 167.0
-                        WHEN 6 THEN 179.0
-                        WHEN 7 THEN 191.0
-                        WHEN 8 THEN 214.0
-                        WHEN 9 THEN 238.0
-                        WHEN 10 THEN 262.0
-                        WHEN 11 THEN 286.0
-                        WHEN 12 THEN 310.0
-                        WHEN 13 THEN 334.0
-                        WHEN 14 THEN 358.0
-                        WHEN 15 THEN 382.0
+                        WHEN 1 THEN 104.5
+                        WHEN 2 THEN 122.1
+                        WHEN 3 THEN 129.8
+                        WHEN 4 THEN 156.2
+                        WHEN 5 THEN 183.7
+                        WHEN 6 THEN 196.9
+                        WHEN 7 THEN 210.1
+                        WHEN 8 THEN 235.4
+                        WHEN 9 THEN 261.8
+                        WHEN 10 THEN 288.2
+                        WHEN 11 THEN 314.6
+                        WHEN 12 THEN 341.0
+                        WHEN 13 THEN 367.4
+                        WHEN 14 THEN 393.8
+                        WHEN 15 THEN 420.2
                         ELSE 0.0
                     END / 1000.0)::float8 as trip_revenue
             FROM trips t
@@ -529,21 +529,21 @@ async fn get_watanya_route_details(
                 COALESCE(fm.fee::float8, 0.0) as fee,
                 (t.tank_capacity * 
                     CASE COALESCE(fm.fee::int, 0)
-                        WHEN 1 THEN 95.0
-                        WHEN 2 THEN 111.0
-                        WHEN 3 THEN 118.0
-                        WHEN 4 THEN 142.0
-                        WHEN 5 THEN 167.0
-                        WHEN 6 THEN 179.0
-                        WHEN 7 THEN 191.0
-                        WHEN 8 THEN 214.0
-                        WHEN 9 THEN 238.0
-                        WHEN 10 THEN 262.0
-                        WHEN 11 THEN 286.0
-                        WHEN 12 THEN 310.0
-                        WHEN 13 THEN 334.0
-                        WHEN 14 THEN 358.0
-                        WHEN 15 THEN 382.0
+                        WHEN 1 THEN 104.5
+                        WHEN 2 THEN 122.1
+                        WHEN 3 THEN 129.8
+                        WHEN 4 THEN 156.2
+                        WHEN 5 THEN 183.7
+                        WHEN 6 THEN 196.9
+                        WHEN 7 THEN 210.1
+                        WHEN 8 THEN 235.4
+                        WHEN 9 THEN 261.8
+                        WHEN 10 THEN 288.2
+                        WHEN 11 THEN 314.6
+                        WHEN 12 THEN 341.0
+                        WHEN 13 THEN 367.4
+                        WHEN 14 THEN 393.8
+                        WHEN 15 THEN 420.2
                         ELSE 0.0
                     END / 1000.0)::float8 as trip_revenue
             FROM trips t
@@ -1121,21 +1121,21 @@ pub async fn get_stats_by_date(
                     WHEN t.company = 'Watanya' THEN
                         (t.tank_capacity * 
                             CASE COALESCE(fm.fee::int, 0)
-                                WHEN 1 THEN 95.0
-                                WHEN 2 THEN 111.0
-                                WHEN 3 THEN 118.0
-                                WHEN 4 THEN 142.0
-                                WHEN 5 THEN 167.0
-                                WHEN 6 THEN 179.0
-                                WHEN 7 THEN 191.0
-                                WHEN 8 THEN 214.0
-                                WHEN 9 THEN 238.0
-                                WHEN 10 THEN 262.0
-                                WHEN 11 THEN 286.0
-                                WHEN 12 THEN 310.0
-                                WHEN 13 THEN 334.0
-                                WHEN 14 THEN 358.0
-                                WHEN 15 THEN 382.0
+                                WHEN 1 THEN 104.5
+                                WHEN 2 THEN 122.1
+                                WHEN 3 THEN 129.8
+                                WHEN 4 THEN 156.2
+                                WHEN 5 THEN 183.7
+                                WHEN 6 THEN 196.9
+                                WHEN 7 THEN 210.1
+                                WHEN 8 THEN 235.4
+                                WHEN 9 THEN 261.8
+                                WHEN 10 THEN 288.2
+                                WHEN 11 THEN 314.6
+                                WHEN 12 THEN 341.0
+                                WHEN 13 THEN 367.4
+                                WHEN 14 THEN 393.8
+                                WHEN 15 THEN 420.2
                                 ELSE 0.0
                             END / 1000.0)::float8
                     WHEN t.company = 'TAQA' THEN
