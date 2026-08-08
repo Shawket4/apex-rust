@@ -103,6 +103,7 @@ pub async fn poll_once(pool: &sqlx::PgPool, client: &WhatsAppClient) -> AppResul
 
     if !got_lock {
         debug!("poll skipped: another instance holds the ingest lock");
+        crate::ops::metrics::incr(&crate::ops::metrics::POLL_SKIPPED_LOCKED, 1);
         return Ok(PollOutcome {
             ran: false,
             ..Default::default()
@@ -240,6 +241,11 @@ pub async fn run(pool: sqlx::PgPool, client: WhatsAppClient) {
         match poll_once(&pool, &client).await {
             Ok(outcome) => {
                 consecutive_failures = 0;
+                crate::ops::metrics::incr(&crate::ops::metrics::POLL_CYCLES, 1);
+                crate::ops::metrics::incr(
+                    &crate::ops::metrics::MESSAGES_INGESTED,
+                    outcome.inserted as u64,
+                );
                 if outcome.inserted > 0 {
                     info!(
                         "ingest: {} new of {} fetched across {} page(s)",
@@ -254,6 +260,18 @@ pub async fn run(pool: sqlx::PgPool, client: WhatsAppClient) {
                             .await
                     {
                         error!("parse run failed (messages are stored and will retry): {e}");
+                        crate::ops::metrics::incr(&crate::ops::metrics::PARSE_ERRORS, 1);
+                    }
+
+                    // A bank changing its SMS format is the one thing worth
+                    // paging for, so check after every batch that produced work.
+                    if let Err(e) = crate::ops::alarm::check(
+                        &pool,
+                        crate::ops::alarm::DEFAULT_ALARM_THRESHOLD,
+                    )
+                    .await
+                    {
+                        warn!("alarm check failed: {e}");
                     }
                 } else if outcome.ran {
                     debug!("ingest: nothing new ({} fetched)", outcome.fetched);
@@ -262,6 +280,7 @@ pub async fn run(pool: sqlx::PgPool, client: WhatsAppClient) {
             }
             Err(e) => {
                 consecutive_failures = consecutive_failures.saturating_add(1);
+                crate::ops::metrics::incr(&crate::ops::metrics::POLL_ERRORS, 1);
                 error!("ingest poll failed (attempt {consecutive_failures}): {e}");
 
                 if let Err(log_err) = cursor::record_error(&pool, &e.to_string()).await {

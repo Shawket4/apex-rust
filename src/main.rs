@@ -3,6 +3,7 @@ mod api;
 mod auth;
 mod errors;
 mod ingest;
+mod ops;
 mod parser;
 mod models;
 mod handlers;
@@ -204,6 +205,7 @@ async fn main() -> std::io::Result<()> {
             .route("/health", web::get().to(health_check))
             .route("/healthz", web::get().to(api::health::healthz))
             .route("/readyz", web::get().to(api::health::readyz))
+            .route("/metrics", web::get().to(api::health::metrics))
             // Bank-SMS routes FIRST: their prefixes are more specific, and
             // actix matches the first scope whose prefix matches rather than
             // falling through, so the existing generic /api/v1 scope would
