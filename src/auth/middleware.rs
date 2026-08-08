@@ -137,6 +137,7 @@ where
                 })
             }
             Err(err) => Box::pin(async move {
+                crate::ops::metrics::incr(&crate::ops::metrics::AUTH_FAILURES, 1);
                 Err(actix_web::error::ErrorUnauthorized(
                     format!("Invalid token: {}", err)
                 ))

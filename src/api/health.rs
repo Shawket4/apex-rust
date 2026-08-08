@@ -49,3 +49,18 @@ pub async fn readyz(pool: web::Data<PgPool>, wa: web::Data<WhatsAppClient>) -> H
         HttpResponse::ServiceUnavailable().json(body)
     }
 }
+
+/// Prometheus metrics. Unauthenticated like the probes, and safe to expose
+/// because the service is bound to loopback behind nginx -- but it deliberately
+/// contains only counters, never message bodies or amounts.
+pub async fn metrics(pool: web::Data<PgPool>) -> HttpResponse {
+    // Process counters reset on restart, so the message-status totals are
+    // refreshed from the database on scrape.
+    if let Err(e) = crate::ops::alarm::refresh_status_counters(pool.get_ref()).await {
+        log::warn!("could not refresh status counters: {e}");
+    }
+
+    HttpResponse::Ok()
+        .content_type("text/plain; version=0.0.4")
+        .body(crate::ops::metrics::render())
+}
