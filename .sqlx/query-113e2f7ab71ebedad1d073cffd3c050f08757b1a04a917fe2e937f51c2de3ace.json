@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        UPDATE banksms.ingest_cursor\n        SET chat_jid           = $1,\n            last_wa_timestamp  = GREATEST(COALESCE(last_wa_timestamp, $2), $2),\n            last_wa_message_id = CASE\n                                     WHEN last_wa_timestamp IS NULL\n                                       OR $2 >= last_wa_timestamp THEN $3\n                                     ELSE last_wa_message_id\n                                 END,\n            last_poll_at       = now(),\n            last_error         = NULL,\n            consecutive_errors = 0,\n            updated_at         = now()\n        WHERE id = 1\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Timestamptz",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "113e2f7ab71ebedad1d073cffd3c050f08757b1a04a917fe2e937f51c2de3ace"
+}
