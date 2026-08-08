@@ -245,6 +245,16 @@ pub async fn run(pool: sqlx::PgPool, client: WhatsAppClient) {
                         "ingest: {} new of {} fetched across {} page(s)",
                         outcome.inserted, outcome.fetched, outcome.pages
                     );
+
+                    // Parse what was just stored. Deliberately after the ingest
+                    // transaction committed: a parser failure must never be able
+                    // to roll back or delay an ingest.
+                    if let Err(e) =
+                        crate::parser::worker::run(&pool, crate::parser::worker::Scope::Pending, 50_000)
+                            .await
+                    {
+                        error!("parse run failed (messages are stored and will retry): {e}");
+                    }
                 } else if outcome.ran {
                     debug!("ingest: nothing new ({} fetched)", outcome.fetched);
                 }

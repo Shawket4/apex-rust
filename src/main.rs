@@ -2,6 +2,7 @@ mod config;
 mod auth;
 mod errors;
 mod ingest;
+mod parser;
 mod models;
 mod handlers;
 mod db;

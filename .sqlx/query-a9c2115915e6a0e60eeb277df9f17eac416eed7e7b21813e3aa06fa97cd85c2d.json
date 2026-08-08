@@ -1,0 +1,20 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT skeleton_hash FROM banksms.noise_skeletons",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "skeleton_hash",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "a9c2115915e6a0e60eeb277df9f17eac416eed7e7b21813e3aa06fa97cd85c2d"
+}
