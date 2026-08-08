@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        UPDATE banksms.ingest_cursor\n        SET last_error          = $1,\n            last_error_at       = now(),\n            consecutive_errors  = consecutive_errors + 1,\n            updated_at          = now()\n        WHERE id = 1\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "642751a2920278f547f76111a095b3aeae62960d5055c4092f439e7bc9c47cc1"
+}

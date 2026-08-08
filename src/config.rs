@@ -7,16 +7,48 @@ pub struct Config {
     pub server_host: String,
     pub server_port: u16,
     pub workers: usize,
+
+    // --- bank-SMS ingestion -------------------------------------------------
+    /// Base URL of the WhatsApp Go API. Localhost-only, unauthenticated.
+    pub whatsapp_api_url: String,
+
+    /// Reserved. The WhatsApp API has no auth today; carrying the field means
+    /// adding one later is a config line rather than a refactor.
+    pub whatsapp_api_token: Option<String>,
+
+    /// The single chat whose messages we ingest. Never hardcode it: this is a
+    /// 1:1 DM that also carries ordinary human conversation.
+    pub target_chat_jid: String,
+
+    pub poll_interval_secs: u64,
+
+    /// How far back before the cursor each poll re-reads. WhatsApp delivers late
+    /// in bursts after the phone reconnects, and the unique constraint on
+    /// wa_message_id makes overlap free, so be generous.
+    pub overlap_window_secs: i64,
+
+    /// Ceiling for exponential backoff after WhatsApp API errors.
+    pub poll_backoff_max_secs: u64,
+
+    /// Set false to run the HTTP API without the background poller (useful for
+    /// tests, and for running a second instance that only serves reads).
+    pub ingest_enabled: bool,
 }
 
 pub static CONFIG: Lazy<Config> = Lazy::new(|| {
     dotenv::dotenv().ok();
-    
+
     Config {
         database_url: env::var("DATABASE_URL")
             .expect("DATABASE_URL must be set"),
+
+        // Previously this fell back to the literal string "secret". That silently
+        // turned a missing env var into a service that accepts forged admin
+        // tokens, which is strictly worse than refusing to boot. FalconGo, which
+        // issues these tokens, already hard-fails on the same condition.
         jwt_secret: env::var("JWT_SECRET")
-            .unwrap_or_else(|_| "secret".to_string()),
+            .expect("JWT_SECRET must be set — it must match FalconGo's signing secret"),
+
         server_host: env::var("SERVER_HOST")
             .unwrap_or_else(|_| "127.0.0.1".to_string()),
         server_port: env::var("SERVER_PORT")
@@ -27,5 +59,28 @@ pub static CONFIG: Lazy<Config> = Lazy::new(|| {
             .unwrap_or_else(|_| "4".to_string())
             .parse()
             .unwrap_or(4),
+
+        whatsapp_api_url: env::var("WHATSAPP_API_URL")
+            .unwrap_or_else(|_| "http://127.0.0.1:3000".to_string()),
+        whatsapp_api_token: env::var("WHATSAPP_API_TOKEN").ok().filter(|s| !s.is_empty()),
+
+        target_chat_jid: env::var("TARGET_CHAT_JID").unwrap_or_default(),
+
+        poll_interval_secs: env::var("POLL_INTERVAL_SECS")
+            .unwrap_or_else(|_| "60".to_string())
+            .parse()
+            .expect("POLL_INTERVAL_SECS must be a valid number"),
+        overlap_window_secs: env::var("OVERLAP_WINDOW_SECS")
+            .unwrap_or_else(|_| "300".to_string())
+            .parse()
+            .expect("OVERLAP_WINDOW_SECS must be a valid number"),
+        poll_backoff_max_secs: env::var("POLL_BACKOFF_MAX_SECS")
+            .unwrap_or_else(|_| "900".to_string())
+            .parse()
+            .expect("POLL_BACKOFF_MAX_SECS must be a valid number"),
+
+        ingest_enabled: env::var("INGEST_ENABLED")
+            .map(|v| v != "false" && v != "0")
+            .unwrap_or(true),
     }
 });

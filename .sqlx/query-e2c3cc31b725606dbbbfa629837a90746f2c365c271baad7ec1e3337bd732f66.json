@@ -1,0 +1,19 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        INSERT INTO banksms.raw_messages\n            (wa_message_id, chat_jid, sender, is_from_me, wa_timestamp, body)\n        SELECT * FROM UNNEST(\n            $1::text[], $2::text[], $3::text[], $4::bool[], $5::timestamptz[], $6::text[]\n        )\n        ON CONFLICT (wa_message_id) DO NOTHING\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "TextArray",
+        "TextArray",
+        "TextArray",
+        "BoolArray",
+        "TimestamptzArray",
+        "TextArray"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "e2c3cc31b725606dbbbfa629837a90746f2c365c271baad7ec1e3337bd732f66"
+}

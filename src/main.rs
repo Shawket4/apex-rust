@@ -1,5 +1,7 @@
 mod config;
 mod auth;
+mod errors;
+mod ingest;
 mod models;
 mod handlers;
 mod db;
@@ -139,6 +141,35 @@ async fn main() -> std::io::Result<()> {
     info!("Database connected successfully");
 
     run_banksms_migrations(&pool).await;
+
+    let wa_client = ingest::WhatsAppClient::from_config();
+
+    // One-shot backfill: `apex-rust backfill`. Walks chat history through the same
+    // insert path the poller uses, then exits without starting the HTTP server.
+    if std::env::args().nth(1).as_deref() == Some("backfill") {
+        match ingest::poller::backfill(&pool, &wa_client).await {
+            Ok(n) => {
+                info!("backfill inserted {n} new messages");
+                return Ok(());
+            }
+            Err(e) => {
+                log::error!("backfill failed: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
+
+    // The poller is an independent task: ingestion never blocks a request, and a
+    // slow request never delays a poll.
+    if CONFIG.ingest_enabled {
+        let poll_pool = pool.clone();
+        let poll_client = wa_client.clone();
+        tokio::spawn(async move {
+            ingest::poller::run(poll_pool, poll_client).await;
+        });
+    } else {
+        info!("ingest poller disabled by INGEST_ENABLED=false");
+    }
 
     // Bind to loopback only — nginx terminates TLS and proxies to us over HTTP.
     // The service is unreachable from outside the machine at the OS level.
