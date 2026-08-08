@@ -181,6 +181,8 @@ pub struct ListQuery {
     pub source: Option<String>,
     pub category: Option<String>,
     pub company: Option<String>,
+    pub car_no_plate: Option<String>,
+    pub payment_method: Option<String>,
     pub verified: Option<bool>,
     pub q: Option<String>,
     /// Opaque cursor: the id of the last row from the previous page.
@@ -227,6 +229,8 @@ async fn list(
     if q.source.is_some() { push(&mut sql, " AND t.source::text = $?", &mut n); }
     if q.category.is_some() { push(&mut sql, " AND t.category = $?", &mut n); }
     if q.company.is_some() { push(&mut sql, " AND t.company = $?", &mut n); }
+    if q.car_no_plate.is_some() { push(&mut sql, " AND t.car_no_plate = $?", &mut n); }
+    if q.payment_method.is_some() { push(&mut sql, " AND t.payment_method = $?", &mut n); }
     if q.verified.is_some() { push(&mut sql, " AND t.verified = $?", &mut n); }
     if q.q.is_some() {
         // All three `$?` become the SAME placeholder number, so the free-text
@@ -250,6 +254,8 @@ async fn list(
     if let Some(v) = &q.source { query = query.bind(v); }
     if let Some(v) = &q.category { query = query.bind(v); }
     if let Some(v) = &q.company { query = query.bind(v); }
+    if let Some(v) = &q.car_no_plate { query = query.bind(v); }
+    if let Some(v) = &q.payment_method { query = query.bind(v); }
     if let Some(v) = q.verified { query = query.bind(v); }
     if let Some(v) = &q.q { query = query.bind(v); }
     if let Some(v) = q.cursor { query = query.bind(v); }
@@ -747,12 +753,180 @@ async fn summary(
     Ok(HttpResponse::Ok().json(data))
 }
 
+#[derive(Debug, Deserialize)]
+pub struct StatisticsQuery {
+    pub from: Option<DateTime<Utc>>,
+    pub to: Option<DateTime<Utc>>,
+    pub category: Option<String>,
+    pub company: Option<String>,
+    pub car_no_plate: Option<String>,
+    pub payment_method: Option<String>,
+    pub source: Option<String>,
+    pub account: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct Breakdown {
+    pub key: String,
+    pub count: i64,
+    pub total_amount: Decimal,
+}
+
+/// The aggregate the expenses dashboard renders in one request.
+///
+/// Every figure comes from `banksms.transactions`. `public.fleet_expenses` is
+/// never read: its rows live here as `source = 'import'`.
+#[derive(Debug, Serialize)]
+pub struct Statistics {
+    pub total_amount: Decimal,
+    pub total_in: Decimal,
+    pub total_out: Decimal,
+    pub net: Decimal,
+    /// Derived per row, then summed. Never a stored column.
+    pub total_fees: Decimal,
+    pub expense_count: i64,
+    pub by_date: Vec<Breakdown>,
+    pub by_type: Vec<Breakdown>,
+    pub by_car: Vec<Breakdown>,
+    pub by_company: Vec<Breakdown>,
+    pub by_source: Vec<Breakdown>,
+    pub by_payment_method: Vec<Breakdown>,
+    pub by_account: Vec<Breakdown>,
+}
+
+/// One pass over the filtered rows, bucketed in Rust.
+///
+/// Deliberately not seven SQL aggregates: the fee is a derived value (see
+/// parser::derive_fee), so it has to be computed per row anyway, and doing the
+/// grouping here keeps every breakdown consistent with a single snapshot of the
+/// data rather than seven separately-timed queries.
+async fn statistics(
+    pool: web::Data<PgPool>,
+    q: web::Query<StatisticsQuery>,
+    req: HttpRequest,
+) -> AppResult<HttpResponse> {
+    require_read(&req)?;
+
+    let rows = sqlx::query(
+        r#"
+        SELECT
+            to_char(
+                date_trunc('day', COALESCE(t.parsed_occurred_at, t.created_at)
+                                  AT TIME ZONE 'Africa/Cairo'),
+                'YYYY-MM-DD'
+            )                                   AS day,
+            t.category, t.car_no_plate, t.company, t.payment_method,
+            t.source::text                      AS source,
+            t.parsed_account                    AS account,
+            t.parsed_direction::text            AS direction,
+            t.parsed_amount                     AS amount
+        FROM banksms.transactions t
+        WHERE t.deleted_at IS NULL
+          AND ($1::timestamptz IS NULL OR COALESCE(t.parsed_occurred_at, t.created_at) >= $1)
+          AND ($2::timestamptz IS NULL OR COALESCE(t.parsed_occurred_at, t.created_at) <= $2)
+          AND ($3::text IS NULL OR t.category       = $3)
+          AND ($4::text IS NULL OR t.company        = $4)
+          AND ($5::text IS NULL OR t.car_no_plate   = $5)
+          AND ($6::text IS NULL OR t.payment_method = $6)
+          AND ($7::text IS NULL OR t.source::text   = $7)
+          AND ($8::text IS NULL OR t.parsed_account = $8)
+        "#,
+    )
+    .bind(q.from)
+    .bind(q.to)
+    .bind(&q.category)
+    .bind(&q.company)
+    .bind(&q.car_no_plate)
+    .bind(&q.payment_method)
+    .bind(&q.source)
+    .bind(&q.account)
+    .fetch_all(pool.get_ref())
+    .await?;
+
+    use std::collections::HashMap;
+    let mut totals = (Decimal::ZERO, Decimal::ZERO, Decimal::ZERO); // in, out, fees
+    let mut buckets: HashMap<&'static str, HashMap<String, (i64, Decimal)>> = HashMap::new();
+
+    for r in &rows {
+        let amount: Decimal = r.get::<Option<Decimal>, _>("amount").unwrap_or(Decimal::ZERO);
+        let direction: Option<String> = r.get("direction");
+
+        let (_principal, fee) = derive_fee(amount);
+        totals.2 += fee;
+        match direction.as_deref() {
+            Some("in") => totals.0 += amount,
+            _ => totals.1 += amount,
+        }
+
+        // "(none)" rather than dropping the row: an expense with no company is
+        // still money, and silently omitting it would make the breakdowns fail
+        // to sum to the total.
+        let dims: [(&'static str, Option<String>); 7] = [
+            ("date", r.get::<Option<String>, _>("day")),
+            ("type", r.get::<Option<String>, _>("category")),
+            ("car", r.get::<Option<String>, _>("car_no_plate")),
+            ("company", r.get::<Option<String>, _>("company")),
+            ("source", r.get::<Option<String>, _>("source")),
+            ("payment_method", r.get::<Option<String>, _>("payment_method")),
+            ("account", r.get::<Option<String>, _>("account")),
+        ];
+
+        for (dim, value) in dims {
+            let key = value.filter(|v| !v.is_empty()).unwrap_or_else(|| "(none)".to_string());
+            let entry = buckets.entry(dim).or_default().entry(key).or_insert((0, Decimal::ZERO));
+            entry.0 += 1;
+            entry.1 += amount;
+        }
+    }
+
+    // Dates ascending (they are a time series); everything else by value
+    // descending, because the dashboard shows "top N".
+    let take = |dim: &str, chronological: bool| -> Vec<Breakdown> {
+        let mut v: Vec<Breakdown> = buckets
+            .get(dim)
+            .map(|m| {
+                m.iter()
+                    .map(|(key, (count, total))| Breakdown {
+                        key: key.clone(),
+                        count: *count,
+                        total_amount: *total,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        if chronological {
+            v.sort_by(|a, b| a.key.cmp(&b.key));
+        } else {
+            v.sort_by(|a, b| b.total_amount.cmp(&a.total_amount));
+        }
+        v
+    };
+
+    Ok(HttpResponse::Ok().json(Statistics {
+        total_amount: totals.0 + totals.1,
+        total_in: totals.0,
+        total_out: totals.1,
+        net: totals.0 - totals.1,
+        total_fees: totals.2,
+        expense_count: rows.len() as i64,
+        by_date: take("date", true),
+        by_type: take("type", false),
+        by_car: take("car", false),
+        by_company: take("company", false),
+        by_source: take("source", false),
+        by_payment_method: take("payment_method", false),
+        by_account: take("account", false),
+    }))
+}
+
 pub fn configure(cfg: &mut web::ServiceConfig) {
     let guard = || JwtAuth { required_permission: None };
     cfg.service(
         web::scope("/api/v1/transactions")
             .route("", web::get().to(list).wrap(guard()))
             .route("", web::post().to(create).wrap(guard()))
+            // Registered before /{id} so "statistics" is not captured as an id.
+            .route("/statistics", web::get().to(statistics).wrap(guard()))
             .route("/{id}", web::get().to(get_one).wrap(guard()))
             .route("/{id}", web::patch().to(patch).wrap(guard()))
             .route("/{id}", web::put().to(patch).wrap(guard()))
