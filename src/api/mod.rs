@@ -1,0 +1,131 @@
+//! REST API for bank-SMS transactions.
+//!
+//! Mounted under `/api/v1` alongside the existing apex-rust routes, except the
+//! health probes which sit at the root by convention.
+//!
+//! Two rules apply everywhere:
+//!   * Handlers take `AuthContext`, never raw `Claims`.
+//!   * Reads return EFFECTIVE values -- `COALESCE(override, parsed_*)` -- plus a
+//!     `parsed` sub-object holding the original, so the UI can show "the SMS said
+//!     X, you changed it to Y".
+
+pub mod admin;
+pub mod health;
+pub mod notes_tags;
+pub mod raw;
+pub mod transactions;
+
+use actix_web::{web, HttpRequest, HttpMessage};
+
+use crate::auth::AuthContext;
+use crate::errors::{AppError, AppResult};
+
+/// Pull the resolved authorization context off the request.
+///
+/// Absent means the token was valid but not an admin user (a driver token), which
+/// is a 403 rather than a 401 -- the caller authenticated fine, they just have no
+/// business here.
+pub fn auth(req: &HttpRequest) -> AppResult<AuthContext> {
+    req.extensions()
+        .get::<AuthContext>()
+        .cloned()
+        .ok_or(AppError::Forbidden)
+}
+
+pub fn require_read(req: &HttpRequest) -> AppResult<AuthContext> {
+    let ctx = auth(req)?;
+    if !ctx.can_read() {
+        return Err(AppError::Forbidden);
+    }
+    Ok(ctx)
+}
+
+pub fn require_write(req: &HttpRequest) -> AppResult<AuthContext> {
+    let ctx = auth(req)?;
+    if !ctx.can_write() {
+        return Err(AppError::Forbidden);
+    }
+    Ok(ctx)
+}
+
+pub fn require_admin(req: &HttpRequest) -> AppResult<AuthContext> {
+    let ctx = auth(req)?;
+    if !ctx.can_admin() {
+        return Err(AppError::Forbidden);
+    }
+    Ok(ctx)
+}
+
+/// Parse the `If-Match` header into a version number.
+///
+/// Mandatory on PUT/PATCH: without it two concurrent editors silently overwrite
+/// each other. A missing header is 428, distinct from a malformed one (400), so
+/// a client can tell "you forgot it" from "yours is wrong".
+pub fn if_match_version(req: &HttpRequest) -> AppResult<i32> {
+    let raw = req
+        .headers()
+        .get("If-Match")
+        .ok_or(AppError::PreconditionRequired)?
+        .to_str()
+        .map_err(|_| AppError::BadRequest("If-Match is not valid ASCII".into()))?;
+
+    // Accept both `3` and the quoted ETag form `"3"`.
+    raw.trim()
+        .trim_matches('"')
+        .parse::<i32>()
+        .map_err(|_| AppError::BadRequest(format!("If-Match must be a version number, got {raw:?}")))
+}
+
+/// Cap on page size, so a client cannot ask for the whole ledger in one request.
+pub const MAX_LIMIT: i64 = 200;
+pub const DEFAULT_LIMIT: i64 = 50;
+
+pub fn clamp_limit(requested: Option<i64>) -> i64 {
+    requested.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT)
+}
+
+pub fn configure(cfg: &mut web::ServiceConfig) {
+    transactions::configure(cfg);
+    notes_tags::configure(cfg);
+    raw::configure(cfg);
+    admin::configure(cfg);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use actix_web::test::TestRequest;
+
+    #[test]
+    fn if_match_accepts_bare_and_quoted_versions() {
+        let req = TestRequest::default().insert_header(("If-Match", "3")).to_http_request();
+        assert_eq!(if_match_version(&req).unwrap(), 3);
+
+        let req = TestRequest::default().insert_header(("If-Match", "\"7\"")).to_http_request();
+        assert_eq!(if_match_version(&req).unwrap(), 7);
+    }
+
+    #[test]
+    fn missing_if_match_is_precondition_required_not_bad_request() {
+        let req = TestRequest::default().to_http_request();
+        assert!(matches!(
+            if_match_version(&req),
+            Err(AppError::PreconditionRequired)
+        ));
+    }
+
+    #[test]
+    fn malformed_if_match_is_bad_request() {
+        let req = TestRequest::default().insert_header(("If-Match", "abc")).to_http_request();
+        assert!(matches!(if_match_version(&req), Err(AppError::BadRequest(_))));
+    }
+
+    #[test]
+    fn limit_is_clamped_to_a_sane_range() {
+        assert_eq!(clamp_limit(None), DEFAULT_LIMIT);
+        assert_eq!(clamp_limit(Some(10_000)), MAX_LIMIT);
+        assert_eq!(clamp_limit(Some(0)), 1);
+        assert_eq!(clamp_limit(Some(-5)), 1);
+        assert_eq!(clamp_limit(Some(25)), 25);
+    }
+}

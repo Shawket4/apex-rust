@@ -1,4 +1,5 @@
 mod config;
+mod api;
 mod auth;
 mod errors;
 mod ingest;
@@ -178,6 +179,8 @@ async fn main() -> std::io::Result<()> {
 
     info!("Starting HTTP server on http://{}", server_addr);
 
+    let wa_for_app = wa_client.clone();
+
     HttpServer::new(move || {
         // CORS is largely irrelevant here since all requests arrive via nginx,
         // but kept permissive for local development convenience.
@@ -197,7 +200,15 @@ async fn main() -> std::io::Result<()> {
             .wrap(cors)
             .wrap(middleware::Logger::default())
             .wrap(middleware::Compress::default())
+            .app_data(web::Data::new(wa_for_app.clone()))
             .route("/health", web::get().to(health_check))
+            .route("/healthz", web::get().to(api::health::healthz))
+            .route("/readyz", web::get().to(api::health::readyz))
+            // Bank-SMS routes FIRST: their prefixes are more specific, and
+            // actix matches the first scope whose prefix matches rather than
+            // falling through, so the existing generic /api/v1 scope would
+            // otherwise shadow every one of them.
+            .configure(api::configure)
             .configure(configure_routes)
     })
     .workers(CONFIG.workers)
