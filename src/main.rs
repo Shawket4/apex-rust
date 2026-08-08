@@ -75,6 +75,54 @@ fn configure_routes(cfg: &mut web::ServiceConfig) {
     );
 }
 
+/// Apply the `banksms` migrations at boot, keeping their bookkeeping isolated
+/// from apex-petroapp's.
+///
+/// The problem: apex-petroapp owns `public._sqlx_migrations` in *this same
+/// database* (its versions 1..3). If this service used the default table too,
+/// each migrator would see the other's rows as unknown versions and fail with
+/// `VersionMissing`.
+///
+/// sqlx 0.8 has no `set_migration_table` — the name `_sqlx_migrations` is
+/// hardcoded and created *unqualified*, so it lands in the first existing schema
+/// on `search_path`. So: create the schema, then run the migrator over a single
+/// dedicated connection whose `search_path` starts with `banksms`. The bookkeeping
+/// table becomes `banksms._sqlx_migrations` and petroapp's is left untouched.
+///
+/// Scoping this to one connection rather than the pool matters: a pool-wide
+/// `search_path` change would silently reorder name resolution for every existing
+/// query in this service, so any future `public` table sharing a name with a
+/// `banksms` table would be shadowed. Every statement in the migrations is
+/// schema-qualified, so nothing else depends on this setting.
+async fn run_banksms_migrations(pool: &sqlx::PgPool) {
+    use sqlx::Executor;
+
+    // Must exist before `search_path` can place the bookkeeping table in it:
+    // Postgres silently ignores non-existent schemas in search_path, which would
+    // put `_sqlx_migrations` back in `public`. Migration 1 repeats this
+    // idempotently, which is fine.
+    sqlx::query("CREATE SCHEMA IF NOT EXISTS banksms")
+        .execute(pool)
+        .await
+        .expect("Failed to create banksms schema");
+
+    let mut conn = pool
+        .acquire()
+        .await
+        .expect("Failed to acquire migration connection");
+
+    conn.execute("SET search_path TO banksms, public")
+        .await
+        .expect("Failed to set search_path for migrations");
+
+    sqlx::migrate!("./migrations")
+        .run(&mut *conn)
+        .await
+        .expect("Failed to apply banksms migrations");
+
+    info!("Migrations applied (banksms._sqlx_migrations)");
+}
+
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     env_logger::init();
@@ -89,6 +137,8 @@ async fn main() -> std::io::Result<()> {
         .expect("Failed to connect to database");
 
     info!("Database connected successfully");
+
+    run_banksms_migrations(&pool).await;
 
     // Bind to loopback only — nginx terminates TLS and proxies to us over HTTP.
     // The service is unreachable from outside the machine at the OS level.
