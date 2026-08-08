@@ -78,3 +78,6 @@ strip = true
 
 [profile.dev]
 opt-level = 0
+
+[dev-dependencies]
+base64 = "0.23.1"
