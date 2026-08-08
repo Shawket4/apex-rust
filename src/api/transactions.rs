@@ -170,7 +170,9 @@ fn row_to_view(r: &sqlx::postgres::PgRow) -> TransactionView {
 
 #[derive(Debug, Deserialize)]
 pub struct ListQuery {
+    #[serde(default, deserialize_with = "crate::api::flexible_date::start")]
     pub from: Option<DateTime<Utc>>,
+    #[serde(default, deserialize_with = "crate::api::flexible_date::end")]
     pub to: Option<DateTime<Utc>>,
     pub account: Option<String>,
     pub direction: Option<String>,
@@ -660,7 +662,9 @@ async fn accounts(pool: web::Data<PgPool>, req: HttpRequest) -> AppResult<HttpRe
 
 #[derive(Debug, Deserialize)]
 pub struct SummaryQuery {
+    #[serde(default, deserialize_with = "crate::api::flexible_date::start")]
     pub from: Option<DateTime<Utc>>,
+    #[serde(default, deserialize_with = "crate::api::flexible_date::end")]
     pub to: Option<DateTime<Utc>>,
     /// day | account | counterparty | category | company
     pub group_by: Option<String>,
@@ -755,7 +759,9 @@ async fn summary(
 
 #[derive(Debug, Deserialize)]
 pub struct StatisticsQuery {
+    #[serde(default, deserialize_with = "crate::api::flexible_date::start")]
     pub from: Option<DateTime<Utc>>,
+    #[serde(default, deserialize_with = "crate::api::flexible_date::end")]
     pub to: Option<DateTime<Utc>>,
     pub category: Option<String>,
     pub company: Option<String>,

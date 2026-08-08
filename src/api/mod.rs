@@ -76,6 +76,100 @@ pub fn if_match_version(req: &HttpRequest) -> AppResult<i32> {
         .map_err(|_| AppError::BadRequest(format!("If-Match must be a version number, got {raw:?}")))
 }
 
+/// Deserialize a date-or-datetime query parameter.
+///
+/// The expenses view puts its filters in the URL so a view can be shared, which
+/// means people hand-edit them. `?from=2025-11-01` is the natural thing to type,
+/// but a plain `DateTime<Utc>` field rejects it and the caller gets a 400 and an
+/// empty page with no clue why.
+///
+/// Accepts:
+///   * full RFC 3339 (`2025-11-01T00:00:00Z`) — what the date picker sends
+///   * bare `YYYY-MM-DD`, anchored in **Africa/Cairo**, not UTC. Anchoring in
+///     UTC would pull the previous evening's Cairo transactions into the range.
+///
+/// `end_of_day` decides which edge a bare date snaps to, so `to=2025-11-01`
+/// includes that whole day rather than stopping at midnight.
+pub mod flexible_date {
+    use chrono::{DateTime, NaiveDate, NaiveTime, TimeZone, Utc};
+    use chrono_tz::Africa::Cairo;
+    use serde::{Deserialize, Deserializer};
+
+    fn parse(raw: &str, end_of_day: bool) -> Option<DateTime<Utc>> {
+        let raw = raw.trim();
+        if raw.is_empty() {
+            return None;
+        }
+
+        if let Ok(dt) = DateTime::parse_from_rfc3339(raw) {
+            return Some(dt.with_timezone(&Utc));
+        }
+
+        let date = NaiveDate::parse_from_str(raw, "%Y-%m-%d").ok()?;
+        let time = if end_of_day {
+            NaiveTime::from_hms_milli_opt(23, 59, 59, 999)?
+        } else {
+            NaiveTime::from_hms_opt(0, 0, 0)?
+        };
+
+        Cairo
+            .from_local_datetime(&date.and_time(time))
+            .earliest()
+            .map(|dt| dt.with_timezone(&Utc))
+    }
+
+    pub fn start<'de, D>(deserializer: D) -> Result<Option<DateTime<Utc>>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = Option::<String>::deserialize(deserializer)?;
+        Ok(raw.and_then(|s| parse(&s, false)))
+    }
+
+    pub fn end<'de, D>(deserializer: D) -> Result<Option<DateTime<Utc>>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = Option::<String>::deserialize(deserializer)?;
+        Ok(raw.and_then(|s| parse(&s, true)))
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn accepts_full_rfc3339() {
+            let dt = parse("2025-11-01T08:30:00Z", false).unwrap();
+            assert_eq!(dt.to_rfc3339(), "2025-11-01T08:30:00+00:00");
+        }
+
+        #[test]
+        fn bare_date_anchors_to_cairo_not_utc() {
+            // Cairo is UTC+2 on 1 Nov 2025, so local midnight is 22:00 UTC the
+            // day before. Anchoring in UTC would sweep in the previous evening.
+            let dt = parse("2025-11-01", false).unwrap();
+            assert_eq!(dt.to_rfc3339(), "2025-10-31T22:00:00+00:00");
+        }
+
+        #[test]
+        fn bare_end_date_covers_the_whole_day() {
+            let start = parse("2025-11-01", false).unwrap();
+            let end = parse("2025-11-01", true).unwrap();
+            assert!(end > start);
+            assert!((end - start).num_hours() >= 23);
+        }
+
+        #[test]
+        fn garbage_and_empty_become_none_rather_than_an_error() {
+            // A filter that cannot be understood should widen the view, not fail
+            // the whole request.
+            assert!(parse("not-a-date", false).is_none());
+            assert!(parse("", false).is_none());
+        }
+    }
+}
+
 /// Cap on page size, so a client cannot ask for the whole ledger in one request.
 pub const MAX_LIMIT: i64 = 200;
 pub const DEFAULT_LIMIT: i64 = 50;
