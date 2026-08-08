@@ -1,0 +1,861 @@
+//! Transaction endpoints.
+
+use actix_web::{web, HttpRequest, HttpResponse};
+use chrono::{DateTime, Duration, Utc};
+use rust_decimal::Decimal;
+use serde::{Deserialize, Serialize};
+use sqlx::{PgPool, Row};
+
+use crate::api::{clamp_limit, if_match_version, require_read, require_write};
+use crate::auth::JwtAuth;
+use crate::errors::{AppError, AppResult};
+use crate::parser::derive_fee;
+
+/// Fields a user may override. Anything outside this list is rejected, so a
+/// typo cannot silently create a phantom override that never surfaces.
+const OVERRIDABLE: &[&str] = &[
+    "direction",
+    "amount",
+    "currency",
+    "account",
+    "counterparty",
+    "reference",
+    "occurred_at",
+];
+
+#[derive(Debug, Serialize)]
+pub struct ParsedView {
+    pub direction: Option<String>,
+    pub amount: Option<Decimal>,
+    pub currency: Option<String>,
+    pub account: Option<String>,
+    pub counterparty: Option<String>,
+    pub reference: Option<String>,
+    pub balance_after: Option<Decimal>,
+    pub occurred_at: Option<DateTime<Utc>>,
+    pub template: Option<String>,
+    pub parser_version: Option<i32>,
+}
+
+/// A transaction as the API returns it: effective values at the top level, with
+/// the parser's original readings nested under `parsed`.
+#[derive(Debug, Serialize)]
+pub struct TransactionView {
+    pub id: i64,
+    pub version: i32,
+    pub source: String,
+    pub raw_message_id: Option<i64>,
+
+    pub direction: Option<String>,
+    pub amount: Option<Decimal>,
+    pub currency: Option<String>,
+    pub account: Option<String>,
+    pub counterparty: Option<String>,
+    pub reference: Option<String>,
+    pub occurred_at: Option<DateTime<Utc>>,
+
+    pub confidence: i16,
+    pub parse_method: Option<String>,
+    pub category: Option<String>,
+    pub verified: bool,
+
+    pub description: Option<String>,
+    pub payment_method: Option<String>,
+    pub company: Option<String>,
+    pub car_no_plate: Option<String>,
+    pub paid_by: Option<String>,
+
+    /// Derived, never stored -- see parser::derive_fee.
+    pub principal: Option<Decimal>,
+    pub fee: Option<Decimal>,
+
+    pub has_overrides: bool,
+    pub parsed: ParsedView,
+
+    pub created_by: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// The effective-value projection, shared by list and detail reads.
+///
+/// `COALESCE(override, parsed_*)` is applied in SQL rather than in Rust so that
+/// filtering and sorting operate on the same values the client sees. Filtering on
+/// the parsed value while displaying the override would be a subtle and very
+/// confusing bug.
+const SELECT_EFFECTIVE: &str = r#"
+    SELECT t.id, t.version, t.source::text AS source, t.raw_message_id,
+           COALESCE(o.direction, t.parsed_direction::text)            AS eff_direction,
+           COALESCE(o.amount::numeric, t.parsed_amount)               AS eff_amount,
+           COALESCE(o.currency, t.parsed_currency)                    AS eff_currency,
+           COALESCE(o.account, t.parsed_account)                      AS eff_account,
+           COALESCE(o.counterparty, t.parsed_counterparty)            AS eff_counterparty,
+           COALESCE(o.reference, t.parsed_reference)                  AS eff_reference,
+           COALESCE(o.occurred_at::timestamptz, t.parsed_occurred_at) AS eff_occurred_at,
+           t.parsed_direction::text AS parsed_direction, t.parsed_amount, t.parsed_currency,
+           t.parsed_account, t.parsed_counterparty, t.parsed_reference,
+           t.parsed_balance_after, t.parsed_occurred_at, t.parsed_template, t.parser_version,
+           t.confidence, t.parse_method::text AS parse_method,
+           t.category, t.verified,
+           t.description, t.payment_method, t.company, t.car_no_plate, t.paid_by,
+           t.created_by, t.created_at, t.updated_at,
+           (o.transaction_id IS NOT NULL) AS has_overrides
+    FROM banksms.transactions t
+    LEFT JOIN LATERAL (
+        SELECT ov.transaction_id,
+               MAX(CASE WHEN ov.field = 'direction'    THEN ov.value END) AS direction,
+               MAX(CASE WHEN ov.field = 'amount'       THEN ov.value END) AS amount,
+               MAX(CASE WHEN ov.field = 'currency'     THEN ov.value END) AS currency,
+               MAX(CASE WHEN ov.field = 'account'      THEN ov.value END) AS account,
+               MAX(CASE WHEN ov.field = 'counterparty' THEN ov.value END) AS counterparty,
+               MAX(CASE WHEN ov.field = 'reference'    THEN ov.value END) AS reference,
+               MAX(CASE WHEN ov.field = 'occurred_at'  THEN ov.value END) AS occurred_at
+        FROM banksms.transaction_overrides ov
+        WHERE ov.transaction_id = t.id AND ov.superseded_at IS NULL AND NOT ov.is_cleared
+        GROUP BY ov.transaction_id
+    ) o ON TRUE
+"#;
+
+fn row_to_view(r: &sqlx::postgres::PgRow) -> TransactionView {
+    let amount: Option<Decimal> = r.get("eff_amount");
+    let (principal, fee) = match amount {
+        Some(a) => {
+            let (p, f) = derive_fee(a);
+            (Some(p), Some(f))
+        }
+        None => (None, None),
+    };
+
+    TransactionView {
+        id: r.get("id"),
+        version: r.get("version"),
+        source: r.get("source"),
+        raw_message_id: r.get("raw_message_id"),
+        direction: r.get("eff_direction"),
+        amount,
+        currency: r.get("eff_currency"),
+        account: r.get("eff_account"),
+        counterparty: r.get("eff_counterparty"),
+        reference: r.get("eff_reference"),
+        occurred_at: r.get("eff_occurred_at"),
+        confidence: r.get("confidence"),
+        parse_method: r.get("parse_method"),
+        category: r.get("category"),
+        verified: r.get("verified"),
+        description: r.get("description"),
+        payment_method: r.get("payment_method"),
+        company: r.get("company"),
+        car_no_plate: r.get("car_no_plate"),
+        paid_by: r.get("paid_by"),
+        principal,
+        fee,
+        has_overrides: r.try_get("has_overrides").unwrap_or(false),
+        parsed: ParsedView {
+            direction: r.get("parsed_direction"),
+            amount: r.get("parsed_amount"),
+            currency: r.get("parsed_currency"),
+            account: r.get("parsed_account"),
+            counterparty: r.get("parsed_counterparty"),
+            reference: r.get("parsed_reference"),
+            balance_after: r.get("parsed_balance_after"),
+            occurred_at: r.get("parsed_occurred_at"),
+            template: r.get("parsed_template"),
+            parser_version: r.get("parser_version"),
+        },
+        created_by: r.get("created_by"),
+        created_at: r.get("created_at"),
+        updated_at: r.get("updated_at"),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ListQuery {
+    pub from: Option<DateTime<Utc>>,
+    pub to: Option<DateTime<Utc>>,
+    pub account: Option<String>,
+    pub direction: Option<String>,
+    pub min_amount: Option<Decimal>,
+    pub max_amount: Option<Decimal>,
+    pub counterparty: Option<String>,
+    pub template: Option<String>,
+    pub source: Option<String>,
+    pub category: Option<String>,
+    pub company: Option<String>,
+    pub verified: Option<bool>,
+    pub q: Option<String>,
+    /// Opaque cursor: the id of the last row from the previous page.
+    pub cursor: Option<i64>,
+    pub limit: Option<i64>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct Page<T> {
+    pub data: Vec<T>,
+    /// Absent when there are no further pages.
+    pub next_cursor: Option<i64>,
+}
+
+/// Cursor pagination, not offset: the ledger is append-heavy, and with offset
+/// paging a row inserted mid-scan silently shifts every subsequent page.
+async fn list(
+    pool: web::Data<PgPool>,
+    q: web::Query<ListQuery>,
+    req: HttpRequest,
+) -> AppResult<HttpResponse> {
+    require_read(&req)?;
+    let limit = clamp_limit(q.limit);
+
+    let mut sql = String::from(SELECT_EFFECTIVE);
+    sql.push_str(" WHERE t.deleted_at IS NULL");
+
+    // Bind positions are tracked manually because the filter set is dynamic.
+    // Values are always bound, never interpolated.
+    let mut n = 0;
+    let mut push = |sql: &mut String, clause: &str, n: &mut i32| {
+        *n += 1;
+        sql.push_str(&clause.replace("$?", &format!("${n}")));
+    };
+
+    if q.from.is_some() { push(&mut sql, " AND COALESCE(t.parsed_occurred_at, t.created_at) >= $?", &mut n); }
+    if q.to.is_some() { push(&mut sql, " AND COALESCE(t.parsed_occurred_at, t.created_at) <= $?", &mut n); }
+    if q.account.is_some() { push(&mut sql, " AND t.parsed_account = $?", &mut n); }
+    if q.direction.is_some() { push(&mut sql, " AND t.parsed_direction::text = $?", &mut n); }
+    if q.min_amount.is_some() { push(&mut sql, " AND t.parsed_amount >= $?", &mut n); }
+    if q.max_amount.is_some() { push(&mut sql, " AND t.parsed_amount <= $?", &mut n); }
+    if q.counterparty.is_some() { push(&mut sql, " AND t.parsed_counterparty ILIKE '%' || $? || '%'", &mut n); }
+    if q.template.is_some() { push(&mut sql, " AND t.parsed_template = $?", &mut n); }
+    if q.source.is_some() { push(&mut sql, " AND t.source::text = $?", &mut n); }
+    if q.category.is_some() { push(&mut sql, " AND t.category = $?", &mut n); }
+    if q.company.is_some() { push(&mut sql, " AND t.company = $?", &mut n); }
+    if q.verified.is_some() { push(&mut sql, " AND t.verified = $?", &mut n); }
+    if q.q.is_some() {
+        // All three `$?` become the SAME placeholder number, so the free-text
+        // term is bound once and reused across the three columns.
+        push(&mut sql, " AND (t.parsed_counterparty ILIKE '%' || $? || '%' OR t.description ILIKE '%' || $? || '%' OR t.parsed_reference ILIKE '%' || $? || '%')", &mut n);
+    }
+    if q.cursor.is_some() { push(&mut sql, " AND t.id < $?", &mut n); }
+
+    n += 1;
+    sql.push_str(&format!(" ORDER BY t.id DESC LIMIT ${n}"));
+
+    let mut query = sqlx::query(&sql);
+    if let Some(v) = q.from { query = query.bind(v); }
+    if let Some(v) = q.to { query = query.bind(v); }
+    if let Some(v) = &q.account { query = query.bind(v); }
+    if let Some(v) = &q.direction { query = query.bind(v); }
+    if let Some(v) = q.min_amount { query = query.bind(v); }
+    if let Some(v) = q.max_amount { query = query.bind(v); }
+    if let Some(v) = &q.counterparty { query = query.bind(v); }
+    if let Some(v) = &q.template { query = query.bind(v); }
+    if let Some(v) = &q.source { query = query.bind(v); }
+    if let Some(v) = &q.category { query = query.bind(v); }
+    if let Some(v) = &q.company { query = query.bind(v); }
+    if let Some(v) = q.verified { query = query.bind(v); }
+    if let Some(v) = &q.q { query = query.bind(v); }
+    if let Some(v) = q.cursor { query = query.bind(v); }
+    query = query.bind(limit);
+
+    let rows = query.fetch_all(pool.get_ref()).await?;
+    let data: Vec<TransactionView> = rows.iter().map(row_to_view).collect();
+
+    let next_cursor = if data.len() as i64 == limit {
+        data.last().map(|t| t.id)
+    } else {
+        None
+    };
+
+    Ok(HttpResponse::Ok().json(Page { data, next_cursor }))
+}
+
+async fn get_one(
+    pool: web::Data<PgPool>,
+    path: web::Path<i64>,
+    req: HttpRequest,
+) -> AppResult<HttpResponse> {
+    require_read(&req)?;
+    let id = path.into_inner();
+
+    let sql = format!("{SELECT_EFFECTIVE} WHERE t.id = $1 AND t.deleted_at IS NULL");
+    let row = sqlx::query(&sql)
+        .bind(id)
+        .fetch_optional(pool.get_ref())
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("transaction {id}")))?;
+
+    Ok(HttpResponse::Ok().json(row_to_view(&row)))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CreateTransaction {
+    pub direction: String,
+    pub amount: Decimal,
+    pub currency: String,
+    pub occurred_at: DateTime<Utc>,
+    pub account: Option<String>,
+    pub counterparty: Option<String>,
+    pub reference: Option<String>,
+    pub category: Option<String>,
+    pub description: Option<String>,
+    pub payment_method: Option<String>,
+    pub company: Option<String>,
+    pub car_no_plate: Option<String>,
+    pub paid_by: Option<String>,
+}
+
+/// Validate human input. The parser guarantees shape; humans do not.
+fn validate(c: &CreateTransaction) -> AppResult<()> {
+    if c.amount <= Decimal::ZERO {
+        return Err(AppError::BadRequest("amount must be greater than zero".into()));
+    }
+    if !matches!(c.direction.as_str(), "in" | "out") {
+        return Err(AppError::BadRequest("direction must be 'in' or 'out'".into()));
+    }
+    // ISO 4217 is three uppercase letters. Not a currency-table lookup, but it
+    // rejects the realistic mistakes ("EGP " , "egp", "pounds").
+    if c.currency.len() != 3 || !c.currency.chars().all(|ch| ch.is_ascii_uppercase()) {
+        return Err(AppError::BadRequest(
+            "currency must be a 3-letter uppercase ISO-4217 code".into(),
+        ));
+    }
+    if c.occurred_at > Utc::now() + Duration::hours(24) {
+        return Err(AppError::BadRequest(
+            "occurred_at cannot be more than 24 hours in the future".into(),
+        ));
+    }
+    for (name, value) in [
+        ("counterparty", &c.counterparty),
+        ("reference", &c.reference),
+        ("category", &c.category),
+        ("description", &c.description),
+        ("company", &c.company),
+        ("car_no_plate", &c.car_no_plate),
+        ("paid_by", &c.paid_by),
+    ] {
+        if let Some(v) = value {
+            if v.chars().count() > 500 {
+                return Err(AppError::BadRequest(format!("{name} is too long")));
+            }
+            if v.chars().any(|ch| ch.is_control()) {
+                return Err(AppError::BadRequest(format!(
+                    "{name} must not contain control characters"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Manual create.
+///
+/// The row's values go into the `parsed_*` columns with parse_method='manual'
+/// and parser_version=0. That is safe because every reparse path is additionally
+/// scoped to `source = 'whatsapp'`, so a manual row is never rebuilt -- which is
+/// exactly the guarantee the acceptance test checks.
+async fn create(
+    pool: web::Data<PgPool>,
+    body: web::Json<CreateTransaction>,
+    req: HttpRequest,
+) -> AppResult<HttpResponse> {
+    let ctx = require_write(&req)?;
+    let c = body.into_inner();
+    validate(&c)?;
+
+    let id: i64 = sqlx::query_scalar(
+        r#"
+        INSERT INTO banksms.transactions (
+            source, parsed_direction, parsed_amount, parsed_currency, parsed_occurred_at,
+            parsed_account, parsed_counterparty, parsed_reference,
+            parse_method, parser_version, confidence,
+            category, description, payment_method, company, car_no_plate, paid_by,
+            verified, created_by
+        ) VALUES (
+            'manual', $1::text::banksms.direction, $2, $3, $4,
+            $5, $6, $7,
+            'manual', 0, 100,
+            $8, $9, $10, $11, $12, $13,
+            true, $14
+        )
+        RETURNING id
+        "#,
+    )
+    .bind(&c.direction)
+    .bind(c.amount)
+    .bind(&c.currency)
+    .bind(c.occurred_at)
+    .bind(&c.account)
+    .bind(&c.counterparty)
+    .bind(&c.reference)
+    .bind(&c.category)
+    .bind(&c.description)
+    .bind(&c.payment_method)
+    .bind(&c.company)
+    .bind(&c.car_no_plate)
+    .bind(&c.paid_by)
+    .bind(ctx.actor())
+    .fetch_one(pool.get_ref())
+    .await?;
+
+    let sql = format!("{SELECT_EFFECTIVE} WHERE t.id = $1");
+    let row = sqlx::query(&sql).bind(id).fetch_one(pool.get_ref()).await?;
+    Ok(HttpResponse::Created().json(row_to_view(&row)))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PatchTransaction {
+    // Overridable parser-owned fields.
+    pub direction: Option<String>,
+    pub amount: Option<Decimal>,
+    pub currency: Option<String>,
+    pub account: Option<String>,
+    pub counterparty: Option<String>,
+    pub reference: Option<String>,
+    pub occurred_at: Option<DateTime<Utc>>,
+    // Directly user-owned columns.
+    pub category: Option<String>,
+    pub verified: Option<bool>,
+    pub description: Option<String>,
+    pub payment_method: Option<String>,
+    pub company: Option<String>,
+    pub car_no_plate: Option<String>,
+    pub paid_by: Option<String>,
+}
+
+/// Partial update with optimistic concurrency.
+///
+/// Corrections to parser-owned fields become rows in `transaction_overrides`
+/// rather than in-place edits, so the original SMS reading is never lost and
+/// `/history` has something real to show.
+async fn patch(
+    pool: web::Data<PgPool>,
+    path: web::Path<i64>,
+    body: web::Json<PatchTransaction>,
+    req: HttpRequest,
+) -> AppResult<HttpResponse> {
+    let ctx = require_write(&req)?;
+    let id = path.into_inner();
+    let expected = if_match_version(&req)?;
+    let p = body.into_inner();
+
+    let mut tx = pool.begin().await?;
+
+    // Lock the row so the version check and the write cannot interleave.
+    let current: Option<(i32, Option<DateTime<Utc>>)> = sqlx::query_as(
+        "SELECT version, deleted_at FROM banksms.transactions WHERE id = $1 FOR UPDATE",
+    )
+    .bind(id)
+    .fetch_optional(&mut *tx)
+    .await?;
+
+    let (actual, deleted_at) =
+        current.ok_or_else(|| AppError::NotFound(format!("transaction {id}")))?;
+    if deleted_at.is_some() {
+        return Err(AppError::NotFound(format!("transaction {id}")));
+    }
+    if actual != expected {
+        return Err(AppError::VersionConflict { expected, actual });
+    }
+
+    let overrides: Vec<(&str, Option<String>)> = vec![
+        ("direction", p.direction.clone()),
+        ("amount", p.amount.map(|v| v.to_string())),
+        ("currency", p.currency.clone()),
+        ("account", p.account.clone()),
+        ("counterparty", p.counterparty.clone()),
+        ("reference", p.reference.clone()),
+        ("occurred_at", p.occurred_at.map(|v| v.to_rfc3339())),
+    ];
+
+    for (field, value) in overrides.into_iter().filter(|(_, v)| v.is_some()) {
+        debug_assert!(OVERRIDABLE.contains(&field));
+        let value = value.unwrap();
+
+        if field == "direction" && !matches!(value.as_str(), "in" | "out") {
+            return Err(AppError::BadRequest("direction must be 'in' or 'out'".into()));
+        }
+
+        // Supersede rather than replace: the previous value is the audit trail.
+        sqlx::query(
+            "UPDATE banksms.transaction_overrides SET superseded_at = now() \
+             WHERE transaction_id = $1 AND field = $2 AND superseded_at IS NULL",
+        )
+        .bind(id)
+        .bind(field)
+        .execute(&mut *tx)
+        .await?;
+
+        sqlx::query(
+            "INSERT INTO banksms.transaction_overrides (transaction_id, field, value, actor) \
+             VALUES ($1, $2, $3, $4)",
+        )
+        .bind(id)
+        .bind(field)
+        .bind(&value)
+        .bind(ctx.actor())
+        .execute(&mut *tx)
+        .await?;
+    }
+
+    // User-owned columns are updated in place -- they were never the parser's.
+    sqlx::query(
+        r#"
+        UPDATE banksms.transactions
+        SET category       = COALESCE($2, category),
+            verified       = COALESCE($3, verified),
+            description    = COALESCE($4, description),
+            payment_method = COALESCE($5, payment_method),
+            company        = COALESCE($6, company),
+            car_no_plate   = COALESCE($7, car_no_plate),
+            paid_by        = COALESCE($8, paid_by),
+            version        = version + 1,
+            updated_at     = now()
+        WHERE id = $1
+        "#,
+    )
+    .bind(id)
+    .bind(&p.category)
+    .bind(p.verified)
+    .bind(&p.description)
+    .bind(&p.payment_method)
+    .bind(&p.company)
+    .bind(&p.car_no_plate)
+    .bind(&p.paid_by)
+    .execute(&mut *tx)
+    .await?;
+
+    tx.commit().await?;
+
+    let sql = format!("{SELECT_EFFECTIVE} WHERE t.id = $1");
+    let row = sqlx::query(&sql).bind(id).fetch_one(pool.get_ref()).await?;
+    Ok(HttpResponse::Ok().json(row_to_view(&row)))
+}
+
+/// Soft delete. Parsed rows are never hard-deleted: the raw message still exists,
+/// so a hard delete would simply be re-materialised by the next reparse.
+async fn soft_delete(
+    pool: web::Data<PgPool>,
+    path: web::Path<i64>,
+    req: HttpRequest,
+) -> AppResult<HttpResponse> {
+    require_write(&req)?;
+    let id = path.into_inner();
+    let expected = if_match_version(&req)?;
+
+    let result = sqlx::query(
+        "UPDATE banksms.transactions SET deleted_at = now(), version = version + 1, \
+         updated_at = now() WHERE id = $1 AND version = $2 AND deleted_at IS NULL",
+    )
+    .bind(id)
+    .bind(expected)
+    .execute(pool.get_ref())
+    .await?;
+
+    if result.rows_affected() == 0 {
+        let actual: Option<i32> =
+            sqlx::query_scalar("SELECT version FROM banksms.transactions WHERE id = $1")
+                .bind(id)
+                .fetch_optional(pool.get_ref())
+                .await?;
+        return match actual {
+            Some(actual) => Err(AppError::VersionConflict { expected, actual }),
+            None => Err(AppError::NotFound(format!("transaction {id}"))),
+        };
+    }
+
+    Ok(HttpResponse::NoContent().finish())
+}
+
+#[derive(Debug, Serialize)]
+pub struct HistoryEntry {
+    pub field: String,
+    pub value: Option<String>,
+    pub is_cleared: bool,
+    pub actor: Option<String>,
+    pub set_at: DateTime<Utc>,
+    pub superseded_at: Option<DateTime<Utc>>,
+    pub is_current: bool,
+}
+
+async fn history(
+    pool: web::Data<PgPool>,
+    path: web::Path<i64>,
+    req: HttpRequest,
+) -> AppResult<HttpResponse> {
+    require_read(&req)?;
+    let id = path.into_inner();
+
+    let rows = sqlx::query(
+        "SELECT field, value, is_cleared, actor, set_at, superseded_at \
+         FROM banksms.transaction_overrides WHERE transaction_id = $1 ORDER BY set_at DESC",
+    )
+    .bind(id)
+    .fetch_all(pool.get_ref())
+    .await?;
+
+    let entries: Vec<HistoryEntry> = rows
+        .iter()
+        .map(|r| {
+            let superseded_at: Option<DateTime<Utc>> = r.get("superseded_at");
+            HistoryEntry {
+                field: r.get("field"),
+                value: r.get("value"),
+                is_cleared: r.get("is_cleared"),
+                actor: r.get("actor"),
+                set_at: r.get("set_at"),
+                superseded_at,
+                is_current: superseded_at.is_none(),
+            }
+        })
+        .collect();
+
+    Ok(HttpResponse::Ok().json(entries))
+}
+
+#[derive(Debug, Serialize)]
+pub struct AccountRollup {
+    pub account: Option<String>,
+    pub transactions: i64,
+    pub total_in: Decimal,
+    pub total_out: Decimal,
+    pub last_seen: Option<DateTime<Utc>>,
+}
+
+async fn accounts(pool: web::Data<PgPool>, req: HttpRequest) -> AppResult<HttpResponse> {
+    require_read(&req)?;
+
+    let rows = sqlx::query(
+        r#"
+        SELECT parsed_account AS account,
+               count(*) AS transactions,
+               COALESCE(SUM(parsed_amount) FILTER (WHERE parsed_direction = 'in'), 0)  AS total_in,
+               COALESCE(SUM(parsed_amount) FILTER (WHERE parsed_direction = 'out'), 0) AS total_out,
+               MAX(parsed_occurred_at) AS last_seen
+        FROM banksms.transactions
+        WHERE deleted_at IS NULL
+        GROUP BY parsed_account
+        ORDER BY count(*) DESC
+        "#,
+    )
+    .fetch_all(pool.get_ref())
+    .await?;
+
+    let data: Vec<AccountRollup> = rows
+        .iter()
+        .map(|r| AccountRollup {
+            account: r.get("account"),
+            transactions: r.get("transactions"),
+            total_in: r.get("total_in"),
+            total_out: r.get("total_out"),
+            last_seen: r.get("last_seen"),
+        })
+        .collect();
+
+    Ok(HttpResponse::Ok().json(data))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SummaryQuery {
+    pub from: Option<DateTime<Utc>>,
+    pub to: Option<DateTime<Utc>>,
+    /// day | account | counterparty | category | company
+    pub group_by: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SummaryBucket {
+    pub key: Option<String>,
+    pub transactions: i64,
+    pub total_in: Decimal,
+    pub total_out: Decimal,
+    pub net: Decimal,
+    /// Sum of derived fees across the bucket. Derived per row, never stored.
+    pub fees: Decimal,
+}
+
+async fn summary(
+    pool: web::Data<PgPool>,
+    q: web::Query<SummaryQuery>,
+    req: HttpRequest,
+) -> AppResult<HttpResponse> {
+    require_read(&req)?;
+
+    // Whitelisted, never interpolated from raw input.
+    let group_expr = match q.group_by.as_deref() {
+        None | Some("day") => "to_char(date_trunc('day', parsed_occurred_at AT TIME ZONE 'Africa/Cairo'), 'YYYY-MM-DD')",
+        Some("account") => "parsed_account",
+        Some("counterparty") => "parsed_counterparty",
+        Some("category") => "category",
+        Some("company") => "company",
+        Some(other) => {
+            return Err(AppError::BadRequest(format!(
+                "group_by must be one of day, account, counterparty, category, company (got {other:?})"
+            )))
+        }
+    };
+
+    let sql = format!(
+        r#"
+        SELECT {group_expr} AS key,
+               id, parsed_direction::text AS direction, parsed_amount AS amount
+        FROM banksms.transactions
+        WHERE deleted_at IS NULL
+          AND ($1::timestamptz IS NULL OR parsed_occurred_at >= $1)
+          AND ($2::timestamptz IS NULL OR parsed_occurred_at <= $2)
+        "#
+    );
+
+    let rows = sqlx::query(&sql)
+        .bind(q.from)
+        .bind(q.to)
+        .fetch_all(pool.get_ref())
+        .await?;
+
+    // Fees are derived per row, so the aggregation happens here rather than in
+    // SQL -- summing a derived value in the database would mean storing it.
+    use std::collections::BTreeMap;
+    let mut buckets: BTreeMap<Option<String>, SummaryBucket> = BTreeMap::new();
+
+    for r in &rows {
+        let key: Option<String> = r.try_get("key").unwrap_or(None);
+        let direction: Option<String> = r.get("direction");
+        let amount: Option<Decimal> = r.get("amount");
+
+        let b = buckets.entry(key.clone()).or_insert_with(|| SummaryBucket {
+            key,
+            transactions: 0,
+            total_in: Decimal::ZERO,
+            total_out: Decimal::ZERO,
+            net: Decimal::ZERO,
+            fees: Decimal::ZERO,
+        });
+
+        b.transactions += 1;
+        if let Some(a) = amount {
+            let (_principal, fee) = derive_fee(a);
+            b.fees += fee;
+            match direction.as_deref() {
+                Some("in") => b.total_in += a,
+                _ => b.total_out += a,
+            }
+        }
+    }
+
+    let mut data: Vec<SummaryBucket> = buckets.into_values().collect();
+    for b in &mut data {
+        b.net = b.total_in - b.total_out;
+    }
+
+    Ok(HttpResponse::Ok().json(data))
+}
+
+pub fn configure(cfg: &mut web::ServiceConfig) {
+    let guard = || JwtAuth { required_permission: None };
+    cfg.service(
+        web::scope("/api/v1/transactions")
+            .route("", web::get().to(list).wrap(guard()))
+            .route("", web::post().to(create).wrap(guard()))
+            .route("/{id}", web::get().to(get_one).wrap(guard()))
+            .route("/{id}", web::patch().to(patch).wrap(guard()))
+            .route("/{id}", web::put().to(patch).wrap(guard()))
+            .route("/{id}", web::delete().to(soft_delete).wrap(guard()))
+            .route("/{id}/history", web::get().to(history).wrap(guard()))
+            // Nested note and tag routes live here rather than in their own
+            // module's configure(): actix matches the FIRST scope whose prefix
+            // matches and 404s inside it, so a second scope on the same prefix
+            // would be unreachable.
+            .route("/{id}/notes", web::get().to(crate::api::notes_tags::list_notes).wrap(guard()))
+            .route("/{id}/notes", web::post().to(crate::api::notes_tags::create_note).wrap(guard()))
+            .route("/{id}/tags", web::post().to(crate::api::notes_tags::attach_tag).wrap(guard()))
+            .route("/{id}/tags/{tag_id}", web::delete().to(crate::api::notes_tags::detach_tag).wrap(guard())),
+    )
+    .route("/api/v1/accounts", web::get().to(accounts).wrap(guard()))
+    .route("/api/v1/summary", web::get().to(summary).wrap(guard()));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rust_decimal_macros::dec;
+
+    fn valid() -> CreateTransaction {
+        CreateTransaction {
+            direction: "out".into(),
+            amount: dec!(100.00),
+            currency: "EGP".into(),
+            occurred_at: Utc::now(),
+            account: None,
+            counterparty: Some("Test".into()),
+            reference: None,
+            category: None,
+            description: None,
+            payment_method: None,
+            company: None,
+            car_no_plate: None,
+            paid_by: None,
+        }
+    }
+
+    #[test]
+    fn accepts_a_well_formed_manual_transaction() {
+        assert!(validate(&valid()).is_ok());
+    }
+
+    #[test]
+    fn rejects_non_positive_amounts() {
+        let mut c = valid();
+        c.amount = dec!(0);
+        assert!(validate(&c).is_err());
+        c.amount = dec!(-5);
+        assert!(validate(&c).is_err());
+    }
+
+    #[test]
+    fn rejects_bad_direction() {
+        let mut c = valid();
+        c.direction = "sideways".into();
+        assert!(validate(&c).is_err());
+    }
+
+    #[test]
+    fn rejects_non_iso_currency() {
+        for bad in ["egp", "EGPP", "EG", "£", "pounds"] {
+            let mut c = valid();
+            c.currency = bad.into();
+            assert!(validate(&c).is_err(), "{bad} should be rejected");
+        }
+    }
+
+    #[test]
+    fn rejects_dates_far_in_the_future() {
+        let mut c = valid();
+        c.occurred_at = Utc::now() + Duration::days(2);
+        assert!(validate(&c).is_err());
+
+        // Just inside the 24h allowance: clock skew and timezone confusion are
+        // normal, so this must be accepted.
+        c.occurred_at = Utc::now() + Duration::hours(12);
+        assert!(validate(&c).is_ok());
+    }
+
+    #[test]
+    fn rejects_control_characters_and_overlong_text() {
+        let mut c = valid();
+        c.counterparty = Some("bad\u{0}name".into());
+        assert!(validate(&c).is_err());
+
+        let mut c = valid();
+        c.description = Some("x".repeat(501));
+        assert!(validate(&c).is_err());
+    }
+
+    #[test]
+    fn every_patchable_parser_field_is_in_the_override_allowlist() {
+        // Guards against adding a field to PatchTransaction and forgetting the
+        // allow-list, which would create an override that never reads back.
+        for field in [
+            "direction", "amount", "currency", "account", "counterparty", "reference",
+            "occurred_at",
+        ] {
+            assert!(OVERRIDABLE.contains(&field), "{field} missing from allow-list");
+        }
+    }
+}
