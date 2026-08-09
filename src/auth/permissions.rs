@@ -55,13 +55,20 @@ impl AuthContext {
     }
 
     /// Read the transaction ledger.
+    ///
+    /// ADMIN, not MANAGER. The whole fleet-expenses module is level 4 only: it
+    /// exposes every bank message, counterparty and account balance the company
+    /// receives, which is a strictly wider disclosure than the financial figures
+    /// a manager sees elsewhere. Read and write are the same level deliberately
+    /// -- there is no useful "can look but not touch" tier here, and splitting
+    /// them would imply a distinction the module does not actually enforce.
     pub fn can_read(&self) -> bool {
-        self.has_at_least(level::MANAGER)
+        self.has_at_least(level::ADMIN)
     }
 
     /// Create/edit/delete transactions, notes and tags.
     pub fn can_write(&self) -> bool {
-        self.has_at_least(level::MANAGER)
+        self.has_at_least(level::ADMIN)
     }
 
     /// Manage the template registry, trigger reparses, view ingest internals.
@@ -115,15 +122,31 @@ mod tests {
         assert!(!ctx.can_admin());
     }
 
+    /// The module is level 4 only. If this ever relaxes, it should be a
+    /// deliberate decision with this test changed to match, not a drift.
+    #[test]
+    fn every_capability_requires_admin() {
+        for level in 0..=3 {
+            let ctx = AuthContext::from_claims(&claims("admin_user", Some(9), Some(level)))
+                .expect("admin_user with a real id resolves");
+            assert!(!ctx.can_read(), "permission {level} must not read");
+            assert!(!ctx.can_write(), "permission {level} must not write");
+            assert!(!ctx.can_admin(), "permission {level} must not administer");
+        }
+        let admin = AuthContext::from_claims(&claims("admin_user", Some(9), Some(4))).unwrap();
+        assert!(admin.can_read() && admin.can_write() && admin.can_admin());
+    }
+
     #[test]
     fn permission_ladder() {
         let viewer = AuthContext::from_claims(&claims("admin_user", Some(1), Some(1))).unwrap();
         assert!(!viewer.can_read());
         assert!(!viewer.can_admin());
 
+        // A manager is deliberately locked out: this module is ADMIN-only.
         let manager = AuthContext::from_claims(&claims("admin_user", Some(2), Some(3))).unwrap();
-        assert!(manager.can_read());
-        assert!(manager.can_write());
+        assert!(!manager.can_read());
+        assert!(!manager.can_write());
         assert!(!manager.can_admin());
 
         let admin = AuthContext::from_claims(&claims("admin_user", Some(3), Some(4))).unwrap();
