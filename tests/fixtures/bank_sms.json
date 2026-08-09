@@ -236,5 +236,12 @@
     "is_from_me": false,
     "body": "Your ABK-Egypt account *7647 was credited with EGP 10.0 on 8/6/26 17:14 with IPN transfer from SHADY IBRAHIM ZAKHER IBRAHIM (ID 26775883).For queries call 19322",
     "expect_template": "abk"
+  },
+  {
+    "wa_message_id": "INSTANT-TRANSFER-0001",
+    "wa_timestamp": "2026-08-09T13:25:00Z",
+    "is_from_me": false,
+    "body": "يرجى العلم انه تم تنفيذ تحويل لحظي بمبلغ 1000.00 جم من حسابك المنتهي بـ ********5447 برقم مرجعي 2395c230 بتاريخ 09-08-2026 16:25 للمزيد، برجاء الاتصال بـ 19666",
+    "expect_template": "instant_transfer"
   }
 ]

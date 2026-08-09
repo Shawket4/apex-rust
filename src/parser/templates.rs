@@ -174,13 +174,28 @@ fn apply(t: &CompiledTemplate, normalized: &str) -> Option<TemplateMatch> {
         template_name: t.name.clone(),
         direction,
         amount: get("amount").and_then(|s| parse_money(&s)),
-        currency: get("currency"),
+        currency: get("currency").map(|c| normalize_currency(&c)),
         account: get("account"),
         counterparty: get("counterparty").filter(|s| !s.is_empty()),
         reference: get("reference"),
         balance_after: get("balance").and_then(|s| parse_money(&s)),
         occurred_at,
     })
+}
+
+/// Map whatever the bank wrote to an ISO-4217 code.
+///
+/// Banks here write the currency three ways: `EGP`, and the Arabic
+/// abbreviations `جم` and `ج.م` (جنيه مصري). Storing the abbreviation would
+/// make `currency` unfilterable -- the same money would sit under two codes and
+/// any total grouped by currency would split in half. Anything unrecognised is
+/// passed through uppercased rather than discarded, so a genuinely new currency
+/// shows up as itself instead of silently becoming EGP.
+pub fn normalize_currency(raw: &str) -> String {
+    match raw.trim() {
+        "جم" | "ج.م" | "جنيه" => "EGP".to_string(),
+        other => other.to_uppercase(),
+    }
 }
 
 /// Parse an amount. Thousands separators are stripped; the value is Decimal, so

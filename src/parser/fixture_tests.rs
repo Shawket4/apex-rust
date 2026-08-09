@@ -10,8 +10,14 @@ use std::collections::{HashMap, HashSet};
 use super::*;
 use crate::parser::templates::CompiledTemplate;
 
-const SEED_SQL: &str =
-    include_str!("../../migrations/20260808120100_seed_parse_templates.up.sql");
+/// Templates are seeded across MULTIPLE migrations: the original four, plus any
+/// added later. An applied migration's checksum is immutable, so a new template
+/// arrives in a new file rather than by editing the seed -- which means this
+/// test has to read every file that seeds one, not just the first.
+const SEED_SQL: &str = concat!(
+    include_str!("../../migrations/20260808120100_seed_parse_templates.up.sql"),
+    include_str!("../../migrations/20260809180000_instant_transfer_template.up.sql"),
+);
 const BANK_SMS: &str = include_str!("../../tests/fixtures/bank_sms.json");
 const CHATTER: &str = include_str!("../../tests/fixtures/chatter.json");
 
@@ -69,8 +75,8 @@ fn seeded_templates() -> Vec<CompiledTemplate> {
 
     assert_eq!(
         out.len(),
-        4,
-        "expected 4 seeded templates, parsed {} from the migration",
+        5,
+        "expected 5 seeded templates, parsed {} from the migrations",
         out.len()
     );
     out
@@ -139,7 +145,7 @@ fn every_seeded_template_matches_real_traffic() {
 fn all_bank_sms_parse_via_tier_one() {
     let templates = seeded_templates();
     let fixtures: Vec<Fixture> = serde_json::from_str(BANK_SMS).unwrap();
-    assert_eq!(fixtures.len(), 34, "fixture set changed size");
+    assert_eq!(fixtures.len(), 35, "fixture set changed size");
 
     let mut failures = Vec::new();
 
