@@ -70,6 +70,9 @@ pub struct TransactionView {
     pub fee: Option<Decimal>,
 
     pub has_overrides: bool,
+    /// False for fuel events and loans: they are read here but owned by the
+    /// PetroApp sync and FalconGo respectively, so the UI must not offer edits.
+    pub editable: bool,
     pub parsed: ParsedView,
 
     pub created_by: Option<String>,
@@ -150,6 +153,7 @@ fn row_to_view(r: &sqlx::postgres::PgRow) -> TransactionView {
         principal,
         fee,
         has_overrides: r.try_get("has_overrides").unwrap_or(false),
+        editable: r.try_get("editable").unwrap_or(true),
         parsed: ParsedView {
             direction: r.get("parsed_direction"),
             amount: r.get("parsed_amount"),
@@ -187,16 +191,53 @@ pub struct ListQuery {
     pub payment_method: Option<String>,
     pub verified: Option<bool>,
     pub q: Option<String>,
-    /// Opaque cursor: the id of the last row from the previous page.
-    pub cursor: Option<i64>,
+    /// Opaque cursor: "<occurred_at_millis>:<id>" from the previous page.
+    /// A composite is required because the list unions three sources whose ids
+    /// come from independent sequences.
+    pub cursor: Option<String>,
     pub limit: Option<i64>,
+
+    /// Include read-only fuel events / driver loans, matching the legacy costs
+    /// view. Default true; pass "false" to get the bank-SMS ledger alone.
+    pub include_fuel: Option<String>,
+    pub include_loans: Option<String>,
+}
+
+fn flag(v: &Option<String>) -> bool {
+    v.as_deref().map_or(true, |s| s != "false" && s != "0")
+}
+
+impl ListQuery {
+    fn to_unified(&self) -> crate::api::unified::UnifiedFilters {
+        crate::api::unified::UnifiedFilters {
+            from: self.from,
+            to: self.to,
+            category: self.category.clone(),
+            company: self.company.clone(),
+            car_no_plate: self.car_no_plate.clone(),
+            payment_method: self.payment_method.clone(),
+            source: self.source.clone(),
+            account: self.account.clone(),
+            direction: self.direction.clone(),
+            template: self.template.clone(),
+            counterparty: self.counterparty.clone(),
+            min_amount: self.min_amount,
+            max_amount: self.max_amount,
+            verified: self.verified,
+            q: self.q.clone(),
+            include_fuel: flag(&self.include_fuel),
+            include_loans: flag(&self.include_loans),
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
 pub struct Page<T> {
     pub data: Vec<T>,
-    /// Absent when there are no further pages.
-    pub next_cursor: Option<i64>,
+    /// Absent when there are no further pages. Opaque composite token —
+    /// "<occurred_at_millis>:<id>" — because the list unions three sources whose
+    /// ids come from independent sequences.
+    pub next_cursor: Option<String>,
 }
 
 /// Cursor pagination, not offset: the ledger is append-heavy, and with offset
@@ -208,71 +249,78 @@ async fn list(
 ) -> AppResult<HttpResponse> {
     require_read(&req)?;
     let limit = clamp_limit(q.limit);
+    let filters = q.to_unified();
 
-    let mut sql = String::from(SELECT_EFFECTIVE);
-    sql.push_str(" WHERE t.deleted_at IS NULL");
-
-    // Bind positions are tracked manually because the filter set is dynamic.
-    // Values are always bound, never interpolated.
-    let mut n = 0;
-    let mut push = |sql: &mut String, clause: &str, n: &mut i32| {
-        *n += 1;
-        sql.push_str(&clause.replace("$?", &format!("${n}")));
+    // No branch can satisfy these filters -- an empty page, not an error.
+    let Some(union) = crate::api::unified::build_union(&filters) else {
+        return Ok(HttpResponse::Ok().json(Page::<TransactionView> {
+            data: vec![],
+            next_cursor: None,
+        }));
     };
 
-    if q.from.is_some() { push(&mut sql, " AND COALESCE(t.parsed_occurred_at, t.created_at) >= $?", &mut n); }
-    if q.to.is_some() { push(&mut sql, " AND COALESCE(t.parsed_occurred_at, t.created_at) <= $?", &mut n); }
-    if q.account.is_some() { push(&mut sql, " AND t.parsed_account = $?", &mut n); }
-    if q.direction.is_some() { push(&mut sql, " AND t.parsed_direction::text = $?", &mut n); }
-    if q.min_amount.is_some() { push(&mut sql, " AND t.parsed_amount >= $?", &mut n); }
-    if q.max_amount.is_some() { push(&mut sql, " AND t.parsed_amount <= $?", &mut n); }
-    if q.counterparty.is_some() { push(&mut sql, " AND t.parsed_counterparty ILIKE '%' || $? || '%'", &mut n); }
-    if q.template.is_some() { push(&mut sql, " AND t.parsed_template = $?", &mut n); }
-    if q.source.is_some() { push(&mut sql, " AND t.source::text = $?", &mut n); }
-    if q.category.is_some() { push(&mut sql, " AND t.category = $?", &mut n); }
-    if q.company.is_some() { push(&mut sql, " AND t.company = $?", &mut n); }
-    if q.car_no_plate.is_some() { push(&mut sql, " AND t.car_no_plate = $?", &mut n); }
-    if q.payment_method.is_some() { push(&mut sql, " AND t.payment_method = $?", &mut n); }
-    if q.verified.is_some() { push(&mut sql, " AND t.verified = $?", &mut n); }
-    if q.q.is_some() {
-        // All three `$?` become the SAME placeholder number, so the free-text
-        // term is bound once and reused across the three columns.
-        push(&mut sql, " AND (t.parsed_counterparty ILIKE '%' || $? || '%' OR t.description ILIKE '%' || $? || '%' OR t.parsed_reference ILIKE '%' || $? || '%')", &mut n);
-    }
-    if q.cursor.is_some() { push(&mut sql, " AND t.id < $?", &mut n); }
+    // Composite cursor. Ordering by occurred_at alone is not stable (many rows
+    // share a day, and the synthesised fuel/loan rows all land at local
+    // midnight), so id is the tiebreaker and both travel in the cursor.
+    let (cursor_ts, cursor_id) = parse_cursor(q.cursor.as_deref());
 
-    n += 1;
-    sql.push_str(&format!(" ORDER BY t.id DESC LIMIT ${n}"));
+    let sql = format!(
+        "SELECT * FROM ({union}) u
+         WHERE ($16::timestamptz IS NULL
+                OR (u.eff_occurred_at, u.id) < ($16::timestamptz, $17::bigint))
+         ORDER BY u.eff_occurred_at DESC NULLS LAST, u.id DESC
+         LIMIT $18"
+    );
 
-    let mut query = sqlx::query(&sql);
-    if let Some(v) = q.from { query = query.bind(v); }
-    if let Some(v) = q.to { query = query.bind(v); }
-    if let Some(v) = &q.account { query = query.bind(v); }
-    if let Some(v) = &q.direction { query = query.bind(v); }
-    if let Some(v) = q.min_amount { query = query.bind(v); }
-    if let Some(v) = q.max_amount { query = query.bind(v); }
-    if let Some(v) = &q.counterparty { query = query.bind(v); }
-    if let Some(v) = &q.template { query = query.bind(v); }
-    if let Some(v) = &q.source { query = query.bind(v); }
-    if let Some(v) = &q.category { query = query.bind(v); }
-    if let Some(v) = &q.company { query = query.bind(v); }
-    if let Some(v) = &q.car_no_plate { query = query.bind(v); }
-    if let Some(v) = &q.payment_method { query = query.bind(v); }
-    if let Some(v) = q.verified { query = query.bind(v); }
-    if let Some(v) = &q.q { query = query.bind(v); }
-    if let Some(v) = q.cursor { query = query.bind(v); }
-    query = query.bind(limit);
+    let rows = sqlx::query(&sql)
+        .bind(filters.from)              // $1
+        .bind(filters.to)                // $2
+        .bind(&filters.category)         // $3
+        .bind(&filters.company)          // $4
+        .bind(&filters.car_no_plate)     // $5
+        .bind(&filters.payment_method)   // $6
+        .bind(&filters.source)           // $7
+        .bind(&filters.account)          // $8
+        .bind(&filters.direction)        // $9
+        .bind(&filters.template)         // $10
+        .bind(filters.min_amount)        // $11
+        .bind(filters.max_amount)        // $12
+        .bind(filters.verified)          // $13
+        .bind(&filters.counterparty)     // $14
+        .bind(&filters.q)                // $15
+        .bind(cursor_ts)                 // $16
+        .bind(cursor_id)                 // $17
+        .bind(limit)                     // $18
+        .fetch_all(pool.get_ref())
+        .await?;
 
-    let rows = query.fetch_all(pool.get_ref()).await?;
     let data: Vec<TransactionView> = rows.iter().map(row_to_view).collect();
 
     let next_cursor = if data.len() as i64 == limit {
-        data.last().map(|t| t.id)
+        data.last().and_then(|t| {
+            t.occurred_at.map(|ts| format!("{}:{}", ts.timestamp_millis(), t.id))
+        })
     } else {
         None
     };
 
     Ok(HttpResponse::Ok().json(Page { data, next_cursor }))
+}
+
+/// Decode "<millis>:<id>". A malformed cursor starts from the beginning rather
+/// than erroring -- it is an opaque token the client should not be building by
+/// hand, and failing the whole request over it helps nobody.
+fn parse_cursor(raw: Option<&str>) -> (Option<DateTime<Utc>>, Option<i64>) {
+    let Some(raw) = raw.filter(|s| !s.is_empty()) else {
+        return (None, None);
+    };
+    let Some((ts, id)) = raw.split_once(':') else {
+        return (None, None);
+    };
+    match (ts.parse::<i64>(), id.parse::<i64>()) {
+        (Ok(ms), Ok(id)) => (DateTime::from_timestamp_millis(ms), Some(id)),
+        _ => (None, None),
+    }
 }
 
 async fn get_one(
@@ -769,6 +817,26 @@ pub struct StatisticsQuery {
     pub payment_method: Option<String>,
     pub source: Option<String>,
     pub account: Option<String>,
+    pub include_fuel: Option<String>,
+    pub include_loans: Option<String>,
+}
+
+impl StatisticsQuery {
+    fn to_unified(&self) -> crate::api::unified::UnifiedFilters {
+        crate::api::unified::UnifiedFilters {
+            from: self.from,
+            to: self.to,
+            category: self.category.clone(),
+            company: self.company.clone(),
+            car_no_plate: self.car_no_plate.clone(),
+            payment_method: self.payment_method.clone(),
+            source: self.source.clone(),
+            account: self.account.clone(),
+            include_fuel: flag(&self.include_fuel),
+            include_loans: flag(&self.include_loans),
+            ..Default::default()
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -800,6 +868,18 @@ pub struct Statistics {
     pub by_account: Vec<Breakdown>,
 }
 
+impl Statistics {
+    fn empty() -> Self {
+        Self {
+            total_amount: Decimal::ZERO, total_in: Decimal::ZERO,
+            total_out: Decimal::ZERO, net: Decimal::ZERO,
+            total_fees: Decimal::ZERO, expense_count: 0,
+            by_date: vec![], by_type: vec![], by_car: vec![], by_company: vec![],
+            by_source: vec![], by_payment_method: vec![], by_account: vec![],
+        }
+    }
+}
+
 /// One pass over the filtered rows, bucketed in Rust.
 ///
 /// Deliberately not seven SQL aggregates: the fee is a derived value (see
@@ -813,41 +893,41 @@ async fn statistics(
 ) -> AppResult<HttpResponse> {
     require_read(&req)?;
 
-    let rows = sqlx::query(
-        r#"
-        SELECT
-            to_char(
-                date_trunc('day', COALESCE(t.parsed_occurred_at, t.created_at)
-                                  AT TIME ZONE 'Africa/Cairo'),
-                'YYYY-MM-DD'
-            )                                   AS day,
-            t.category, t.car_no_plate, t.company, t.payment_method,
-            t.source::text                      AS source,
-            t.parsed_account                    AS account,
-            t.parsed_direction::text            AS direction,
-            t.parsed_amount                     AS amount
-        FROM banksms.transactions t
-        WHERE t.deleted_at IS NULL
-          AND ($1::timestamptz IS NULL OR COALESCE(t.parsed_occurred_at, t.created_at) >= $1)
-          AND ($2::timestamptz IS NULL OR COALESCE(t.parsed_occurred_at, t.created_at) <= $2)
-          AND ($3::text IS NULL OR t.category       = $3)
-          AND ($4::text IS NULL OR t.company        = $4)
-          AND ($5::text IS NULL OR t.car_no_plate   = $5)
-          AND ($6::text IS NULL OR t.payment_method = $6)
-          AND ($7::text IS NULL OR t.source::text   = $7)
-          AND ($8::text IS NULL OR t.parsed_account = $8)
-        "#,
-    )
-    .bind(q.from)
-    .bind(q.to)
-    .bind(&q.category)
-    .bind(&q.company)
-    .bind(&q.car_no_plate)
-    .bind(&q.payment_method)
-    .bind(&q.source)
-    .bind(&q.account)
-    .fetch_all(pool.get_ref())
-    .await?;
+    let filters = q.to_unified();
+    let Some(union) = crate::api::unified::build_union(&filters) else {
+        return Ok(HttpResponse::Ok().json(Statistics::empty()));
+    };
+
+    // Same union as the list, so the totals can never disagree with the rows
+    // they claim to summarise.
+    let sql = format!(
+        "SELECT
+            to_char(date_trunc('day', u.eff_occurred_at AT TIME ZONE 'Africa/Cairo'),
+                    'YYYY-MM-DD')  AS day,
+            u.category, u.car_no_plate, u.company, u.payment_method,
+            u.source, u.eff_account AS account,
+            u.eff_direction AS direction, u.eff_amount AS amount
+         FROM ({union}) u"
+    );
+
+    let rows = sqlx::query(&sql)
+        .bind(filters.from)
+        .bind(filters.to)
+        .bind(&filters.category)
+        .bind(&filters.company)
+        .bind(&filters.car_no_plate)
+        .bind(&filters.payment_method)
+        .bind(&filters.source)
+        .bind(&filters.account)
+        .bind(&filters.direction)
+        .bind(&filters.template)
+        .bind(filters.min_amount)
+        .bind(filters.max_amount)
+        .bind(filters.verified)
+        .bind(&filters.counterparty)
+        .bind(&filters.q)
+        .fetch_all(pool.get_ref())
+        .await?;
 
     use std::collections::HashMap;
     let mut totals = (Decimal::ZERO, Decimal::ZERO, Decimal::ZERO); // in, out, fees

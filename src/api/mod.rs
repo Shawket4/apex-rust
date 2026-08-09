@@ -14,6 +14,7 @@ pub mod health;
 pub mod notes_tags;
 pub mod raw;
 pub mod transactions;
+pub mod unified;
 
 use actix_web::{web, HttpRequest, HttpMessage};
 
