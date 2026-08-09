@@ -45,6 +45,12 @@ pub struct Config {
     /// https://apextransport.ddns.net/fleet-expenses/224/edit
     pub dashboard_base_url: String,
 
+    /// Shared secret the WhatsApp service sends with each webhook push.
+    /// EMPTY DISABLES THE ENDPOINT: it is unauthenticated by necessity (the
+    /// sender has no JWT), so without a secret it refuses every request rather
+    /// than accepting anonymous writes.
+    pub whatsapp_webhook_secret: Option<String>,
+
     /// Set false to run the HTTP API without the background poller (useful for
     /// tests, and for running a second instance that only serves reads).
     pub ingest_enabled: bool,
@@ -93,6 +99,10 @@ pub static CONFIG: Lazy<Config> = Lazy::new(|| {
             .unwrap_or_else(|_| "900".to_string())
             .parse()
             .expect("POLL_BACKOFF_MAX_SECS must be a valid number"),
+
+        whatsapp_webhook_secret: env::var("WHATSAPP_WEBHOOK_SECRET")
+            .ok()
+            .filter(|s| !s.is_empty()),
 
         ntfy_url: env::var("NTFY_URL")
             .unwrap_or_else(|_| "https://ntfy.sh".to_string()),

@@ -81,6 +81,27 @@ async fn insert_batch(
     Ok(inserted as usize)
 }
 
+/// Store messages and parse them. The single entry point used by BOTH the
+/// poller and the webhook receiver, so there is exactly one way a message enters
+/// the system and one place for that behaviour to be wrong.
+pub async fn ingest_messages(pool: &sqlx::PgPool, messages: &[WaMessage]) -> AppResult<usize> {
+    if messages.is_empty() {
+        return Ok(0);
+    }
+
+    let mut tx = pool.begin().await?;
+    let inserted = insert_batch(&mut tx, messages).await?;
+    tx.commit().await?;
+
+    // Parse only when something new landed. A duplicate push must not trigger a
+    // parse sweep.
+    if inserted > 0 {
+        drain_pending(pool).await;
+    }
+
+    Ok(inserted)
+}
+
 /// One poll cycle: fetch everything at or after the cursor (minus the overlap
 /// window), store it, advance the cursor.
 ///

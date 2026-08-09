@@ -76,6 +76,7 @@ pub struct TransactionView {
     pub editable: bool,
     pub driver_id: Option<i64>,
     pub employee_id: Option<i64>,
+    pub car_id: Option<i64>,
     pub parsed: ParsedView,
 
     pub created_by: Option<String>,
@@ -159,6 +160,7 @@ fn row_to_view(r: &sqlx::postgres::PgRow) -> TransactionView {
         editable: r.try_get("editable").unwrap_or(true),
         driver_id: r.try_get("driver_id").unwrap_or(None),
         employee_id: r.try_get("employee_id").unwrap_or(None),
+        car_id: r.try_get("car_id").unwrap_or(None),
         parsed: ParsedView {
             direction: r.get("parsed_direction"),
             amount: r.get("parsed_amount"),
@@ -352,6 +354,8 @@ pub struct CreateTransaction {
     /// `required_party` is not `none` -- validated, not assumed.
     pub driver_id: Option<i64>,
     pub employee_id: Option<i64>,
+    /// Vehicle by id. The plate is derived from it, never typed.
+    pub car_id: Option<i64>,
     pub direction: String,
     pub amount: Decimal,
     pub currency: String,
@@ -436,13 +440,13 @@ async fn create(
             parsed_account, parsed_counterparty, parsed_reference,
             parse_method, parser_version, confidence,
             category, description, payment_method, company, car_no_plate, paid_by,
-            verified, created_by, driver_id, employee_id
+            verified, created_by, driver_id, employee_id, car_id
         ) VALUES (
             'manual', $1::text::banksms.direction, $2, $3, $4,
             $5, $6, $7,
             'manual', 0, 100,
             $8, $9, $10, $11, $12, $13,
-            true, $14, $15, $16
+            true, $14, $15, $16, $17
         )
         RETURNING id
         "#,
@@ -463,6 +467,7 @@ async fn create(
     .bind(ctx.actor())
     .bind(c.driver_id)
     .bind(c.employee_id)
+    .bind(c.car_id)
     .fetch_one(&mut *tx)
     .await?;
 
@@ -490,6 +495,8 @@ pub struct PatchTransaction {
     pub driver_id: Option<Option<i64>>,
     #[serde(default, deserialize_with = "crate::api::double_option")]
     pub employee_id: Option<Option<i64>>,
+    #[serde(default, deserialize_with = "crate::api::double_option")]
+    pub car_id: Option<Option<i64>>,
     // Overridable parser-owned fields.
     pub direction: Option<String>,
     pub amount: Option<Decimal>,
@@ -596,6 +603,10 @@ async fn patch(
             paid_by        = COALESCE($8, paid_by),
             driver_id      = CASE WHEN $10 THEN $9  ELSE driver_id   END,
             employee_id    = CASE WHEN $12 THEN $11 ELSE employee_id END,
+            car_id         = CASE WHEN $14 THEN $13 ELSE car_id      END,
+            car_no_plate   = CASE WHEN $14 THEN
+                                 (SELECT car_no_plate FROM public.cars WHERE id = $13)
+                             ELSE car_no_plate END,
             version        = version + 1,
             updated_at     = now()
         WHERE id = $1
@@ -613,6 +624,8 @@ async fn patch(
     .bind(p.driver_id.is_some())
     .bind(p.employee_id.flatten())
     .bind(p.employee_id.is_some())
+    .bind(p.car_id.flatten())
+    .bind(p.car_id.is_some())
     .execute(&mut *tx)
     .await?;
 
@@ -1115,8 +1128,6 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
             // module's configure(): actix matches the FIRST scope whose prefix
             // matches and 404s inside it, so a second scope on the same prefix
             // would be unreachable.
-            .route("/{id}/notes", web::get().to(crate::api::notes_tags::list_notes).wrap(guard()))
-            .route("/{id}/notes", web::post().to(crate::api::notes_tags::create_note).wrap(guard()))
             .route("/{id}/tags", web::post().to(crate::api::notes_tags::attach_tag).wrap(guard()))
             .route("/{id}/tags/{tag_id}", web::delete().to(crate::api::notes_tags::detach_tag).wrap(guard())),
     )
@@ -1131,6 +1142,9 @@ mod tests {
 
     fn valid() -> CreateTransaction {
         CreateTransaction {
+            driver_id: None,
+            employee_id: None,
+            car_id: None,
             direction: "out".into(),
             amount: dec!(100.00),
             currency: "EGP".into(),

@@ -111,7 +111,7 @@ pub const UNIFIED_COLUMNS: &str = "
     parsed_occurred_at, parsed_template, parser_version,
     confidence, parse_method, category, verified,
     description, payment_method, company, car_no_plate, paid_by,
-    created_by, created_at, updated_at, driver_id, employee_id, has_overrides
+    created_by, created_at, updated_at, driver_id, employee_id, car_id, has_overrides
 ";
 
 /// The banksms branch: effective values with overrides applied.
@@ -137,7 +137,7 @@ pub const TRANSACTIONS_BRANCH: &str = r#"
         t.category, t.verified,
         t.description, t.payment_method, t.company, t.car_no_plate, t.paid_by,
         t.created_by, t.created_at, t.updated_at,
-        t.driver_id, t.employee_id,
+        t.driver_id, t.employee_id, t.car_id,
         (o.transaction_id IS NOT NULL) AS has_overrides
     FROM banksms.transactions t
     LEFT JOIN LATERAL (
@@ -205,7 +205,7 @@ pub const FUEL_BRANCH: &str = r#"
         f.transporter AS company, f.car_no_plate, f.driver_name AS paid_by,
         NULL::text AS created_by, f.created_at AT TIME ZONE 'UTC' AS created_at,
         f.updated_at AT TIME ZONE 'UTC' AS updated_at,
-        NULL::bigint AS driver_id, NULL::bigint AS employee_id,
+        NULL::bigint AS driver_id, NULL::bigint AS employee_id, NULL::bigint AS car_id,
         FALSE AS has_overrides
     FROM public.fuel_events f
     WHERE f.deleted_at IS NULL AND f.created_at IS NOT NULL AND f.date IS NOT NULL
@@ -254,7 +254,7 @@ pub const LOAN_BRANCH: &str = r#"
         COALESCE(l.method, '')::text AS paid_by,
         NULL::text AS created_by, l.created_at AT TIME ZONE 'UTC' AS created_at,
         l.updated_at AT TIME ZONE 'UTC' AS updated_at,
-        l.driver_id, l.employee_id,
+        l.driver_id, l.employee_id, NULL::bigint AS car_id,
         FALSE AS has_overrides
     FROM public.loans l
     WHERE l.deleted_at IS NULL AND l.created_at IS NOT NULL AND l.date IS NOT NULL

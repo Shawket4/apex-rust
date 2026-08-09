@@ -197,6 +197,7 @@ pub fn clamp_limit(requested: Option<i64>) -> i64 {
 pub fn configure(cfg: &mut web::ServiceConfig) {
     transactions::configure(cfg);
     parties::configure(cfg);
+    crate::ingest::webhook::configure(cfg);
     notes_tags::configure(cfg);
     raw::configure(cfg);
     admin::configure(cfg);

@@ -113,6 +113,7 @@ async fn review_queue(
 
     let sql = format!(
         "{SELECT_RAW} WHERE r.parse_status IN ('partial', 'unmatched') \
+           AND r.reviewed_at IS NULL \
          ORDER BY COALESCE(s.cnt, 0) DESC, r.wa_timestamp DESC LIMIT $1"
     );
 
@@ -173,7 +174,7 @@ async fn reclassify(
 
     match kind.as_str() {
         "transaction" => {
-            worker::reclassify_as_transaction(pool.get_ref(), id).await?;
+            worker::reclassify_as_transaction(pool.get_ref(), id, &ctx.actor()).await?;
             // Re-run immediately so the caller sees the result rather than
             // waiting for the next poll cycle.
             worker::run(pool.get_ref(), worker::Scope::Pending, 1000).await?;
