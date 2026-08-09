@@ -5,9 +5,11 @@
 //! us a message, because the raw body is already durable before this runs.
 
 use log::{info, warn};
+use sqlx::Row;
 use std::collections::HashSet;
 
 use crate::errors::AppResult;
+use crate::ops::notify::{self, NewTransaction};
 use crate::parser::{self, templates, ParseOutcome, ParseStatus};
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -63,6 +65,7 @@ pub async fn run(pool: &sqlx::PgPool, scope: Scope, max_rows: i64) -> AppResult<
     let batch_size: i64 = 500;
     let mut after_id: i64 = 0;
     let mut run = ParseRun::default();
+    let mut created: Vec<NewTransaction> = Vec::new();
 
     loop {
         let sql = format!(
@@ -83,7 +86,7 @@ pub async fn run(pool: &sqlx::PgPool, scope: Scope, max_rows: i64) -> AppResult<
         after_id = rows.last().map(|(id, _)| *id).unwrap_or(after_id);
         let batch_len = rows.len();
 
-        process_batch(pool, rows, &compiled, &noise, &mut run).await?;
+        process_batch(pool, rows, &compiled, &noise, &mut run, &mut created).await?;
 
         if batch_len < batch_size as usize || run.examined as i64 >= max_rows {
             break;
@@ -98,6 +101,13 @@ pub async fn run(pool: &sqlx::PgPool, scope: Scope, max_rows: i64) -> AppResult<
         );
     }
 
+    // Published after every batch has committed, so a notification can never
+    // point at a transaction that was rolled back.
+    notify::notify_new_transactions(created);
+    if run.partial + run.unmatched > 0 {
+        notify::notify_needs_review(run.partial + run.unmatched);
+    }
+
     Ok(run)
 }
 
@@ -107,6 +117,7 @@ async fn process_batch(
     compiled: &[templates::CompiledTemplate],
     noise: &HashSet<String>,
     run: &mut ParseRun,
+    created: &mut Vec<NewTransaction>,
 ) -> AppResult<()> {
     for (raw_id, body) in rows {
         run.examined += 1;
@@ -149,9 +160,20 @@ async fn process_batch(
         .await?;
 
         if outcome.yields_transaction() {
-            let created = upsert_transaction(&mut tx, raw_id, &outcome).await?;
-            if created {
+            if let Some(txn_id) = upsert_transaction(&mut tx, raw_id, &outcome).await? {
                 run.transactions_created += 1;
+                // Collected here, published after the loop: a notification must
+                // never be sent for a row whose transaction then rolls back.
+                created.push(NewTransaction {
+                    id: txn_id,
+                    amount: outcome.amount,
+                    currency: outcome.currency.clone(),
+                    direction: outcome.direction.map(|d| d.as_str().to_string()),
+                    counterparty: outcome.counterparty.clone(),
+                    account: outcome.account.clone(),
+                    reference: outcome.reference.clone(),
+                    template: outcome.template.clone(),
+                });
             }
         }
 
@@ -171,7 +193,7 @@ async fn upsert_transaction(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     raw_id: i64,
     o: &ParseOutcome,
-) -> AppResult<bool> {
+) -> AppResult<Option<i64>> {
     let result = sqlx::query(
         r#"
         INSERT INTO banksms.transactions (
@@ -205,6 +227,7 @@ async fn upsert_transaction(
             version              = banksms.transactions.version + 1,
             updated_at           = now()
         WHERE banksms.transactions.source = 'whatsapp'
+        RETURNING id, (xmax = 0) AS inserted
         "#,
     )
     .bind(raw_id)
@@ -220,10 +243,17 @@ async fn upsert_transaction(
     .bind(o.parser_version)
     .bind(o.confidence)
     .bind(o.method.map(|m| m.as_str()))
-    .execute(&mut **tx)
+    .fetch_optional(&mut **tx)
     .await?;
 
-    Ok(result.rows_affected() > 0)
+    // `xmax = 0` distinguishes a genuine INSERT from the DO UPDATE branch of the
+    // upsert. Only a real insert counts as "created" -- otherwise every reparse
+    // would re-announce transactions the operator has already seen and possibly
+    // already annotated.
+    Ok(result.and_then(|row| {
+        let inserted: bool = row.try_get("inserted").unwrap_or(false);
+        inserted.then(|| row.get::<i64, _>("id"))
+    }))
 }
 
 /// Mark a message's skeleton as noise and re-ignore every message sharing it.

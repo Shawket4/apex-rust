@@ -3,3 +3,4 @@
 
 pub mod alarm;
 pub mod metrics;
+pub mod notify;
