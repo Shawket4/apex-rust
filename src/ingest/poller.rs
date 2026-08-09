@@ -22,6 +22,7 @@ use crate::config::CONFIG;
 use crate::errors::{AppError, AppResult};
 use crate::ingest::cursor::{self, Cursor};
 use crate::ingest::whatsapp_client::{WaMessage, WhatsAppClient, MAX_PAGE_LIMIT};
+use crate::parser::worker;
 
 /// Advisory-lock key for the poll cycle. Arbitrary but must stay stable: changing
 /// it would let an old and a new build poll concurrently during a deploy.
@@ -235,6 +236,12 @@ pub async fn run(pool: sqlx::PgPool, client: WhatsAppClient) {
         CONFIG.target_chat_jid, CONFIG.poll_interval_secs, CONFIG.overlap_window_secs
     );
 
+    // Drain anything already sitting at `pending` before the first poll. Without
+    // this, messages ingested by `backfill` (or by a build that had no parse
+    // step) would stay unparsed forever -- the poller only ever parsed what it
+    // had just fetched itself.
+    drain_pending(&pool).await;
+
     let mut consecutive_failures: u32 = 0;
 
     loop {
@@ -292,6 +299,23 @@ pub async fn run(pool: sqlx::PgPool, client: WhatsAppClient) {
                 tokio::time::sleep(delay).await;
             }
         }
+    }
+}
+
+/// Parse every `pending` message, logging rather than propagating failures.
+///
+/// Parsing is best-effort by design: a bad template or a panic-adjacent edge
+/// case should degrade to "these rows stay pending and get retried next cycle",
+/// never to "ingestion stops".
+async fn drain_pending(pool: &sqlx::PgPool) {
+    match worker::run(pool, worker::Scope::Pending, 100_000).await {
+        Ok(run) if run.examined > 0 => info!(
+            "parse: examined {}, parsed {}, partial {}, unmatched {}, ignored {}, {} transaction(s) created",
+            run.examined, run.parsed, run.partial, run.unmatched, run.ignored,
+            run.transactions_created
+        ),
+        Ok(_) => {}
+        Err(e) => error!("parse run failed: {e}"),
     }
 }
 
@@ -368,6 +392,12 @@ pub async fn backfill(pool: &sqlx::PgPool, client: &WhatsAppClient) -> AppResult
     }
 
     info!("backfill complete: {total_inserted} new of {total_fetched} fetched");
+
+    // Parse in the same run. Otherwise a fresh backfill leaves every message at
+    // `pending` and the operator sees no transactions until the poller happens
+    // to fetch something new.
+    drain_pending(pool).await;
+
     Ok(total_inserted)
 }
 

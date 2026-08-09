@@ -130,6 +130,14 @@ async fn run_banksms_migrations(pool: &sqlx::PgPool) {
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
+    // Load .env BEFORE initialising the logger.
+    //
+    // Config is a lazy static, so .env used to be read on first CONFIG access --
+    // which happens after env_logger::init(). RUST_LOG lives in .env, so the
+    // logger initialised with an empty filter and the process printed NOTHING:
+    // `apex-rust backfill` looked like it had silently done nothing when it was
+    // in fact working. Loading here makes the logger see the configured level.
+    dotenv::dotenv().ok();
     env_logger::init();
 
     info!("Starting Apex Transport Rust Microservice");
