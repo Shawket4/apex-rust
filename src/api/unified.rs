@@ -58,7 +58,6 @@ pub struct UnifiedFilters {
     pub counterparty: Option<String>,
     pub min_amount: Option<Decimal>,
     pub max_amount: Option<Decimal>,
-    pub verified: Option<bool>,
     pub q: Option<String>,
     pub include_fuel: bool,
     pub include_loans: bool,
@@ -67,7 +66,7 @@ pub struct UnifiedFilters {
 impl UnifiedFilters {
     /// Whether the fuel branch can contribute anything under these filters.
     ///
-    /// Fuel events have no account, direction, template, verified flag or
+    /// Fuel events have no account, direction, template or
     /// override history, so any filter on those excludes them entirely —
     /// including them anyway would return rows that do not match what was asked.
     pub fn wants_fuel(&self) -> bool {
@@ -75,7 +74,6 @@ impl UnifiedFilters {
             && self.account.is_none()
             && self.direction.is_none()
             && self.template.is_none()
-            && self.verified.is_none()
             && self.source.as_deref().map_or(true, |s| s == "fuel_event")
             && self.category.as_deref().map_or(true, |c| c == "Fuel")
     }
@@ -85,7 +83,6 @@ impl UnifiedFilters {
             && self.account.is_none()
             && self.direction.is_none()
             && self.template.is_none()
-            && self.verified.is_none()
             && self.car_no_plate.is_none() // loans are not vehicle-scoped
             && self.company.is_none() // nor company-scoped
             && self.source.as_deref().map_or(true, |s| s == "loan")
@@ -109,7 +106,7 @@ pub const UNIFIED_COLUMNS: &str = "
     parsed_direction, parsed_amount, parsed_currency, parsed_account,
     parsed_counterparty, parsed_reference, parsed_balance_after,
     parsed_occurred_at, parsed_template, parser_version,
-    confidence, parse_method, category, verified,
+    confidence, parse_method, category,
     description, payment_method, company, car_no_plate, paid_by,
     created_by, created_at, updated_at, driver_id, employee_id, car_id, has_overrides
 ";
@@ -134,7 +131,7 @@ pub const TRANSACTIONS_BRANCH: &str = r#"
         t.parsed_account, t.parsed_counterparty, t.parsed_reference,
         t.parsed_balance_after, t.parsed_occurred_at, t.parsed_template, t.parser_version,
         t.confidence, t.parse_method::text AS parse_method,
-        t.category, t.verified,
+        t.category,
         t.description, t.payment_method, t.company, t.car_no_plate, t.paid_by,
         t.created_by, t.created_at, t.updated_at,
         t.driver_id, t.employee_id, t.car_id,
@@ -166,13 +163,12 @@ pub const TRANSACTIONS_BRANCH: &str = r#"
       AND ($10::text   IS NULL OR t.parsed_template = $10)
       AND ($11::numeric IS NULL OR t.parsed_amount >= $11)
       AND ($12::numeric IS NULL OR t.parsed_amount <= $12)
-      AND ($13::bool   IS NULL OR t.verified = $13)
-      AND ($14::text   IS NULL OR t.parsed_counterparty ILIKE '%' || $14 || '%')
-      AND ($15::text   IS NULL OR (
-              t.parsed_counterparty ILIKE '%' || $15 || '%'
-           OR t.description         ILIKE '%' || $15 || '%'
-           OR t.parsed_reference    ILIKE '%' || $15 || '%'
-           OR t.paid_by             ILIKE '%' || $15 || '%'))
+      AND ($13::text   IS NULL OR t.parsed_counterparty ILIKE '%' || $13 || '%')
+      AND ($14::text   IS NULL OR (
+              t.parsed_counterparty ILIKE '%' || $14 || '%'
+           OR t.description         ILIKE '%' || $14 || '%'
+           OR t.parsed_reference    ILIKE '%' || $14 || '%'
+           OR t.paid_by             ILIKE '%' || $14 || '%'))
 "#;
 
 /// Fuel events, read-only.
@@ -198,7 +194,7 @@ pub const FUEL_BRANCH: &str = r#"
         NULL::numeric AS parsed_balance_after, NULL::timestamptz AS parsed_occurred_at,
         NULL::text AS parsed_template, NULL::integer AS parser_version,
         100::smallint AS confidence, 'manual'::text AS parse_method,
-        'Fuel'::text AS category, TRUE AS verified,
+        'Fuel'::text AS category,
         CONCAT('Fuel: ', COALESCE(f.liters::text, '0'), 'L @ ',
                COALESCE(f.price_per_liter::text, '0'), '/L')::text AS description,
         COALESCE(f.method, 'Cash')::text AS payment_method,
@@ -216,11 +212,11 @@ pub const FUEL_BRANCH: &str = r#"
       AND ($6::text    IS NULL OR COALESCE(f.method, 'Cash') = $6)
       AND ($11::numeric IS NULL OR COALESCE(f.price, 0) >= $11)
       AND ($12::numeric IS NULL OR COALESCE(f.price, 0) <= $12)
-      AND ($14::text   IS NULL OR f.driver_name ILIKE '%' || $14 || '%')
-      AND ($15::text   IS NULL OR (
-              f.driver_name  ILIKE '%' || $15 || '%'
-           OR f.car_no_plate ILIKE '%' || $15 || '%'
-           OR f.transporter  ILIKE '%' || $15 || '%'))
+      AND ($13::text   IS NULL OR f.driver_name ILIKE '%' || $13 || '%')
+      AND ($14::text   IS NULL OR (
+              f.driver_name  ILIKE '%' || $14 || '%'
+           OR f.car_no_plate ILIKE '%' || $14 || '%'
+           OR f.transporter  ILIKE '%' || $14 || '%'))
 "#;
 
 /// Driver loans, read-only.
@@ -247,7 +243,7 @@ pub const LOAN_BRANCH: &str = r#"
         NULL::numeric AS parsed_balance_after, NULL::timestamptz AS parsed_occurred_at,
         NULL::text AS parsed_template, NULL::integer AS parser_version,
         100::smallint AS confidence, 'manual'::text AS parse_method,
-        'Loan'::text AS category, TRUE AS verified,
+        'Loan'::text AS category,
         l.description,
         COALESCE(l.method, 'Cash')::text AS payment_method,
         NULL::text AS company, NULL::text AS car_no_plate,
@@ -263,9 +259,9 @@ pub const LOAN_BRANCH: &str = r#"
       AND ($6::text    IS NULL OR COALESCE(l.method, 'Cash') = $6)
       AND ($11::numeric IS NULL OR COALESCE(l.amount, 0) >= $11)
       AND ($12::numeric IS NULL OR COALESCE(l.amount, 0) <= $12)
-      AND ($15::text   IS NULL OR (
-              l.description ILIKE '%' || $15 || '%'
-           OR l.method      ILIKE '%' || $15 || '%'))
+      AND ($14::text   IS NULL OR (
+              l.description ILIKE '%' || $14 || '%'
+           OR l.method      ILIKE '%' || $14 || '%'))
 "#;
 
 /// Assemble the branches the filters allow into one UNION ALL.
@@ -331,7 +327,6 @@ mod tests {
         // not silently include every fuel row.
         for f in [
             UnifiedFilters { account: Some("6001-01".into()), ..base() },
-            UnifiedFilters { verified: Some(true), ..base() },
             UnifiedFilters { template: Some("abk".into()), ..base() },
             UnifiedFilters { direction: Some("in".into()), ..base() },
         ] {

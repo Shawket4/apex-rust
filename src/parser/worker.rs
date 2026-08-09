@@ -188,7 +188,7 @@ async fn process_batch(
 /// The re-parse rule lives here: `parsed_*` columns are rebuilt ONLY where
 /// `source = 'whatsapp'`. Manual and imported rows keep their values even if a
 /// raw message is later linked to them, and user-owned columns (category,
-/// verified) plus overrides, notes and tags are never touched.
+/// category) plus overrides and tags are never touched.
 async fn upsert_transaction(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     raw_id: i64,

@@ -58,7 +58,6 @@ pub struct TransactionView {
     pub confidence: i16,
     pub parse_method: Option<String>,
     pub category: Option<String>,
-    pub verified: bool,
 
     pub description: Option<String>,
     pub payment_method: Option<String>,
@@ -103,7 +102,7 @@ const SELECT_EFFECTIVE: &str = r#"
            t.parsed_account, t.parsed_counterparty, t.parsed_reference,
            t.parsed_balance_after, t.parsed_occurred_at, t.parsed_template, t.parser_version,
            t.confidence, t.parse_method::text AS parse_method,
-           t.category, t.verified,
+           t.category,
            t.description, t.payment_method, t.company, t.car_no_plate, t.paid_by,
            t.created_by, t.created_at, t.updated_at,
            (o.transaction_id IS NOT NULL) AS has_overrides
@@ -148,7 +147,6 @@ fn row_to_view(r: &sqlx::postgres::PgRow) -> TransactionView {
         confidence: r.get("confidence"),
         parse_method: r.get("parse_method"),
         category: r.get("category"),
-        verified: r.get("verified"),
         description: r.get("description"),
         payment_method: r.get("payment_method"),
         company: r.get("company"),
@@ -196,7 +194,6 @@ pub struct ListQuery {
     pub company: Option<String>,
     pub car_no_plate: Option<String>,
     pub payment_method: Option<String>,
-    pub verified: Option<bool>,
     pub q: Option<String>,
     /// Opaque cursor: "<occurred_at_millis>:<id>" from the previous page.
     /// A composite is required because the list unions three sources whose ids
@@ -230,7 +227,6 @@ impl ListQuery {
             counterparty: self.counterparty.clone(),
             min_amount: self.min_amount,
             max_amount: self.max_amount,
-            verified: self.verified,
             q: self.q.clone(),
             include_fuel: flag(&self.include_fuel),
             include_loans: flag(&self.include_loans),
@@ -292,7 +288,6 @@ async fn list(
         .bind(&filters.template)         // $10
         .bind(filters.min_amount)        // $11
         .bind(filters.max_amount)        // $12
-        .bind(filters.verified)          // $13
         .bind(&filters.counterparty)     // $14
         .bind(&filters.q)                // $15
         .bind(cursor_ts)                 // $16
@@ -440,13 +435,13 @@ async fn create(
             parsed_account, parsed_counterparty, parsed_reference,
             parse_method, parser_version, confidence,
             category, description, payment_method, company, car_no_plate, paid_by,
-            verified, created_by, driver_id, employee_id, car_id
+            created_by, driver_id, employee_id, car_id
         ) VALUES (
             'manual', $1::text::banksms.direction, $2, $3, $4,
             $5, $6, $7,
             'manual', 0, 100,
             $8, $9, $10, $11, $12, $13,
-            true, $14, $15, $16, $17
+            $14, $15, $16, $17
         )
         RETURNING id
         "#,
@@ -471,10 +466,9 @@ async fn create(
     .fetch_one(&mut *tx)
     .await?;
 
-    // Manual rows are created already verified -- a human typed them. That makes
-    // validating the category rule here essential rather than optional: without
-    // it a posting category could be created verified but with no party, which
-    // silently produces no loan and no error.
+    // Validate the category rule on create as well as on patch: a posting
+    // category saved with no party would otherwise produce no loan and no
+    // error, which reads as the feature silently not working.
     let created = load_postable(&mut tx, id).await?;
     if let Some(rule) = postings::load_rule(&mut tx, created.category.as_deref()).await? {
         postings::validate(&rule, &created)?;
@@ -507,7 +501,6 @@ pub struct PatchTransaction {
     pub occurred_at: Option<DateTime<Utc>>,
     // Directly user-owned columns.
     pub category: Option<String>,
-    pub verified: Option<bool>,
     pub description: Option<String>,
     pub payment_method: Option<String>,
     pub company: Option<String>,
@@ -595,18 +588,21 @@ async fn patch(
         r#"
         UPDATE banksms.transactions
         SET category       = COALESCE($2, category),
-            verified       = COALESCE($3, verified),
-            description    = COALESCE($4, description),
-            payment_method = COALESCE($5, payment_method),
-            company        = COALESCE($6, company),
-            car_no_plate   = COALESCE($7, car_no_plate),
-            paid_by        = COALESCE($8, paid_by),
-            driver_id      = CASE WHEN $10 THEN $9  ELSE driver_id   END,
-            employee_id    = CASE WHEN $12 THEN $11 ELSE employee_id END,
-            car_id         = CASE WHEN $14 THEN $13 ELSE car_id      END,
-            car_no_plate   = CASE WHEN $14 THEN
-                                 (SELECT car_no_plate FROM public.cars WHERE id = $13)
-                             ELSE car_no_plate END,
+            description    = COALESCE($3, description),
+            payment_method = COALESCE($4, payment_method),
+            company        = COALESCE($5, company),
+            paid_by        = COALESCE($6, paid_by),
+            driver_id      = CASE WHEN $8  THEN $7  ELSE driver_id   END,
+            employee_id    = CASE WHEN $10 THEN $9  ELSE employee_id END,
+            car_id         = CASE WHEN $12 THEN $11 ELSE car_id      END,
+            -- One assignment only: Postgres rejects a column appearing twice in
+            -- a SET. Picking a vehicle updates the denormalised plate from the
+            -- chosen row; otherwise an explicitly supplied plate wins.
+            car_no_plate   = CASE
+                                 WHEN $12 THEN (SELECT c.car_no_plate
+                                                FROM public.cars c WHERE c.id = $11)
+                                 ELSE COALESCE($13, car_no_plate)
+                             END,
             version        = version + 1,
             updated_at     = now()
         WHERE id = $1
@@ -614,11 +610,9 @@ async fn patch(
     )
     .bind(id)
     .bind(&p.category)
-    .bind(p.verified)
     .bind(&p.description)
     .bind(&p.payment_method)
     .bind(&p.company)
-    .bind(&p.car_no_plate)
     .bind(&p.paid_by)
     .bind(p.driver_id.flatten())
     .bind(p.driver_id.is_some())
@@ -626,13 +620,14 @@ async fn patch(
     .bind(p.employee_id.is_some())
     .bind(p.car_id.flatten())
     .bind(p.car_id.is_some())
+    .bind(&p.car_no_plate)
     .execute(&mut *tx)
     .await?;
 
     // Re-read inside the same transaction, then bring the posted state in line
     // with it. Reading back rather than trusting the patch means the decision is
     // made on what is actually stored, including fields this request did not
-    // touch (an advance verified today may have had its driver set last week).
+    // touch (an advance categorised today may have had its driver set last week).
     let after = load_postable(&mut tx, id).await?;
     if let Some(rule) = postings::load_rule(&mut tx, after.category.as_deref()).await? {
         postings::validate(&rule, &after)?;
@@ -656,7 +651,7 @@ async fn load_postable(
                 COALESCE(o.amount::numeric, t.parsed_amount)               AS amount,
                 COALESCE(o.occurred_at::timestamptz, t.parsed_occurred_at, t.created_at)
                                                                             AS occurred_at,
-                t.description, t.category, t.driver_id, t.employee_id, t.verified
+                t.description, t.category, t.driver_id, t.employee_id
          FROM banksms.transactions t
          LEFT JOIN LATERAL (
              SELECT MAX(CASE WHEN ov.field = 'amount'      THEN ov.value END) AS amount,
@@ -678,7 +673,6 @@ async fn load_postable(
         category: r.get("category"),
         driver_id: r.get("driver_id"),
         employee_id: r.get("employee_id"),
-        verified: r.get("verified"),
     })
 }
 
@@ -1029,7 +1023,6 @@ async fn statistics(
         .bind(&filters.template)
         .bind(filters.min_amount)
         .bind(filters.max_amount)
-        .bind(filters.verified)
         .bind(&filters.counterparty)
         .bind(&filters.q)
         .fetch_all(pool.get_ref())
