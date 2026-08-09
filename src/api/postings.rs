@@ -93,6 +93,9 @@ pub struct CategoryRule {
     pub key: String,
     pub posting_target: PostingTarget,
     pub required_party: PartyRequirement,
+    /// Which loan kind this category produces: advance, loan or salary. All
+    /// three subtract identically; they differ in what they mean.
+    pub posting_kind: String,
 }
 
 pub async fn load_rule(
@@ -104,7 +107,9 @@ pub async fn load_rule(
     };
 
     let row = sqlx::query(
-        "SELECT key, posting_target::text AS posting_target, required_party::text AS required_party
+        "SELECT key, posting_target::text AS posting_target,
+                required_party::text AS required_party,
+                COALESCE(posting_kind, 'advance') AS posting_kind
          FROM banksms.categories
          WHERE lower(key) = lower($1) AND enabled",
     )
@@ -119,6 +124,7 @@ pub async fn load_rule(
             _ => PostingTarget::None,
         },
         required_party: PartyRequirement::parse(&r.get::<String, _>("required_party")),
+        posting_kind: r.get("posting_kind"),
     }))
 }
 
@@ -183,7 +189,11 @@ pub async fn reconcile(
 
         // Post it.
         (true, None) => {
-            let loan_id = insert_loan(tx, t).await?;
+            let kind = rule
+                .as_ref()
+                .map(|r| r.posting_kind.as_str())
+                .unwrap_or("advance");
+            let loan_id = insert_loan(tx, t, kind).await?;
             sqlx::query(
                 "INSERT INTO banksms.transaction_postings
                      (transaction_id, target_table, target_id, posted_by)
@@ -230,16 +240,20 @@ pub async fn reconcile(
 /// `loans.date` is TEXT holding `YYYY-MM-DD` (FalconGo's convention), and the
 /// business date is the Cairo calendar day -- using UTC here would file a late
 /// evening advance under the previous day.
-async fn insert_loan(tx: &mut Transaction<'_, Postgres>, t: &Postable) -> AppResult<i64> {
+async fn insert_loan(
+    tx: &mut Transaction<'_, Postgres>,
+    t: &Postable,
+    kind: &str,
+) -> AppResult<i64> {
     let row = sqlx::query(
         r#"
         INSERT INTO public.loans
             (created_at, updated_at, amount, method, date,
-             driver_id, employee_id, is_paid, description)
+             driver_id, employee_id, is_paid, description, kind)
         VALUES (
             now(), now(), $1, $2,
             to_char(COALESCE($3::timestamptz, now()) AT TIME ZONE 'Africa/Cairo', 'YYYY-MM-DD'),
-            $4, $5, false, $6
+            $4, $5, false, $6, $7
         )
         -- loans.id is INT4, not INT8. Cast at the boundary so the Rust side has
         -- one integer width to reason about.
@@ -258,8 +272,9 @@ async fn insert_loan(tx: &mut Transaction<'_, Postgres>, t: &Postable) -> AppRes
         t.description
             .as_deref()
             .filter(|d| !d.trim().is_empty())
-            .unwrap_or("Advance recorded from a bank message"),
+            .unwrap_or("Recorded from a bank message"),
     )
+    .bind(kind)
     .fetch_one(&mut **tx)
     .await?;
 
@@ -336,6 +351,7 @@ mod tests {
             key: "Advance".into(),
             posting_target: target,
             required_party: party,
+            posting_kind: "advance".into(),
         }
     }
 

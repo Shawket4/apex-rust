@@ -4,6 +4,7 @@
 
 pub mod cursor;
 pub mod poller;
+pub mod webhook;
 pub mod whatsapp_client;
 
 pub use whatsapp_client::WhatsAppClient;

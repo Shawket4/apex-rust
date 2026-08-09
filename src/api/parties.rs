@@ -193,11 +193,43 @@ async fn list_parties(pool: web::Data<PgPool>, req: HttpRequest) -> AppResult<Ht
     Ok(HttpResponse::Ok().json(out))
 }
 
+#[derive(Debug, Serialize)]
+pub struct Vehicle {
+    pub id: i64,
+    pub plate: String,
+}
+
+/// Vehicles for the transaction form's dropdown.
+///
+/// Stored by id on the transaction, not by plate. A plate typed by hand is the
+/// same failure mode as a typed person: `ف ج م 8567` and `ف ج م  8567` are one
+/// vehicle to a human and two to a report.
+async fn list_vehicles(pool: web::Data<PgPool>, req: HttpRequest) -> AppResult<HttpResponse> {
+    require_read(&req)?;
+
+    let rows = sqlx::query(
+        "SELECT id::bigint AS id, COALESCE(car_no_plate, '') AS plate
+         FROM public.cars
+         WHERE deleted_at IS NULL AND COALESCE(car_no_plate, '') <> ''
+         ORDER BY car_no_plate",
+    )
+    .fetch_all(pool.get_ref())
+    .await?;
+
+    let out: Vec<Vehicle> = rows
+        .iter()
+        .map(|r| Vehicle { id: r.get("id"), plate: r.get("plate") })
+        .collect();
+
+    Ok(HttpResponse::Ok().json(out))
+}
+
 pub fn configure(cfg: &mut web::ServiceConfig) {
     cfg.service(
         web::scope("/api/v1/categories")
             .route("", web::get().to(list_categories).wrap(guard()))
             .route("", web::post().to(create_category).wrap(guard())),
     )
-    .service(web::scope("/api/v1/parties").route("", web::get().to(list_parties).wrap(guard())));
+    .service(web::scope("/api/v1/parties").route("", web::get().to(list_parties).wrap(guard())))
+    .service(web::scope("/api/v1/vehicles").route("", web::get().to(list_vehicles).wrap(guard())));
 }

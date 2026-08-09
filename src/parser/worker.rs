@@ -326,7 +326,11 @@ pub async fn mark_skeleton_as_noise(
 
 /// Promote an `ignored` message back into the pipeline: a human says this really
 /// was a transaction. Removes any noise-skeleton entry so the promotion sticks.
-pub async fn reclassify_as_transaction(pool: &sqlx::PgPool, raw_id: i64) -> AppResult<()> {
+pub async fn reclassify_as_transaction(
+    pool: &sqlx::PgPool,
+    raw_id: i64,
+    actor: &str,
+) -> AppResult<()> {
     let mut tx = pool.begin().await?;
 
     let hash: Option<Option<String>> =
@@ -342,10 +346,20 @@ pub async fn reclassify_as_transaction(pool: &sqlx::PgPool, raw_id: i64) -> AppR
             .await?;
     }
 
-    sqlx::query("UPDATE banksms.raw_messages SET parse_status = 'pending' WHERE id = $1")
-        .bind(raw_id)
-        .execute(&mut *tx)
-        .await?;
+    // Re-queue for the parser AND record that a human decided. The parser is
+    // deterministic: without the review stamp it reaches the same conclusion and
+    // the message returns to the queue immediately, forever. The stamp is what
+    // makes the operator's judgement terminal even when the parser still cannot
+    // fully read the message.
+    sqlx::query(
+        "UPDATE banksms.raw_messages
+         SET parse_status = 'pending', reviewed_at = now(), reviewed_by = $2
+         WHERE id = $1",
+    )
+    .bind(raw_id)
+    .bind(actor)
+    .execute(&mut *tx)
+    .await?;
 
     tx.commit().await?;
     Ok(())
