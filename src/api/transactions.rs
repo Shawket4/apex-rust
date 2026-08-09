@@ -348,6 +348,10 @@ async fn get_one(
 
 #[derive(Debug, Deserialize)]
 pub struct CreateTransaction {
+    /// Who the transaction is about. Required by categories whose
+    /// `required_party` is not `none` -- validated, not assumed.
+    pub driver_id: Option<i64>,
+    pub employee_id: Option<i64>,
     pub direction: String,
     pub amount: Decimal,
     pub currency: String,
@@ -421,6 +425,10 @@ async fn create(
     let c = body.into_inner();
     validate(&c)?;
 
+    // One transaction: the row and any loan it posts commit together, so a
+    // failure cannot leave a transaction without its loan or vice versa.
+    let mut tx = pool.begin().await?;
+
     let id: i64 = sqlx::query_scalar(
         r#"
         INSERT INTO banksms.transactions (
@@ -428,13 +436,13 @@ async fn create(
             parsed_account, parsed_counterparty, parsed_reference,
             parse_method, parser_version, confidence,
             category, description, payment_method, company, car_no_plate, paid_by,
-            verified, created_by
+            verified, created_by, driver_id, employee_id
         ) VALUES (
             'manual', $1::text::banksms.direction, $2, $3, $4,
             $5, $6, $7,
             'manual', 0, 100,
             $8, $9, $10, $11, $12, $13,
-            true, $14
+            true, $14, $15, $16
         )
         RETURNING id
         "#,
@@ -453,8 +461,22 @@ async fn create(
     .bind(&c.car_no_plate)
     .bind(&c.paid_by)
     .bind(ctx.actor())
-    .fetch_one(pool.get_ref())
+    .bind(c.driver_id)
+    .bind(c.employee_id)
+    .fetch_one(&mut *tx)
     .await?;
+
+    // Manual rows are created already verified -- a human typed them. That makes
+    // validating the category rule here essential rather than optional: without
+    // it a posting category could be created verified but with no party, which
+    // silently produces no loan and no error.
+    let created = load_postable(&mut tx, id).await?;
+    if let Some(rule) = postings::load_rule(&mut tx, created.category.as_deref()).await? {
+        postings::validate(&rule, &created)?;
+    }
+    postings::reconcile(&mut tx, &created, &ctx.actor()).await?;
+
+    tx.commit().await?;
 
     let sql = format!("{SELECT_EFFECTIVE} WHERE t.id = $1");
     let row = sqlx::query(&sql).bind(id).fetch_one(pool.get_ref()).await?;
