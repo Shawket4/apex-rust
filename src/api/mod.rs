@@ -12,6 +12,8 @@
 pub mod admin;
 pub mod health;
 pub mod notes_tags;
+pub mod parties;
+pub mod postings;
 pub mod raw;
 pub mod transactions;
 pub mod unified;
@@ -171,6 +173,19 @@ pub mod flexible_date {
     }
 }
 
+/// Deserialize a field that distinguishes "absent" from "explicitly null".
+///
+/// A PATCH needs three states for the party fields: leave alone, set to a value,
+/// and CLEAR. Plain `Option<i64>` collapses the last two, so clearing a driver
+/// would be indistinguishable from not mentioning one.
+pub fn double_option<'de, T, D>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    T: serde::Deserialize<'de>,
+    D: serde::Deserializer<'de>,
+{
+    serde::Deserialize::deserialize(deserializer).map(Some)
+}
+
 /// Cap on page size, so a client cannot ask for the whole ledger in one request.
 pub const MAX_LIMIT: i64 = 200;
 pub const DEFAULT_LIMIT: i64 = 50;
@@ -181,6 +196,7 @@ pub fn clamp_limit(requested: Option<i64>) -> i64 {
 
 pub fn configure(cfg: &mut web::ServiceConfig) {
     transactions::configure(cfg);
+    parties::configure(cfg);
     notes_tags::configure(cfg);
     raw::configure(cfg);
     admin::configure(cfg);
