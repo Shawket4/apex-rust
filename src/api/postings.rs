@@ -14,10 +14,14 @@
 //!
 //! # When posting happens
 //!
-//! On **verification**, not on categorisation. A bank SMS that was mis-parsed
-//! must not be able to quietly create a payroll deduction; requiring a human to
-//! confirm the amount first costs one click and removes that entire class of
-//! error. Un-verifying reverses the posting.
+//! As soon as the transaction has a posting category, a party and an amount.
+//!
+//! This used to wait on a human ticking "verified". That gate is gone: a tier-1
+//! template match already establishes that the parse is correct -- the pattern
+//! either matched the bank's message exactly or it did not -- and re-reading the
+//! same SMS added no information. What a human actually decides is the category
+//! and the person, so those are what drive posting. Clearing either one reverses
+//! it.
 //!
 //! # Direction
 //!
@@ -40,7 +44,6 @@ pub struct Postable {
     pub category: Option<String>,
     pub driver_id: Option<i64>,
     pub employee_id: Option<i64>,
-    pub verified: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -171,8 +174,7 @@ pub async fn reconcile(
     let should_post = matches!(
         rule.as_ref().map(|r| r.posting_target),
         Some(PostingTarget::Loan)
-    ) && t.verified
-        && (t.driver_id.is_some() || t.employee_id.is_some())
+    ) && (t.driver_id.is_some() || t.employee_id.is_some())
         && t.amount.map(|a| a > Decimal::ZERO).unwrap_or(false);
 
     let existing: Option<(String, i64)> = sqlx::query_as(
@@ -342,7 +344,6 @@ mod tests {
             category: Some("Advance".into()),
             driver_id: Some(7),
             employee_id: None,
-            verified: true,
         }
     }
 
