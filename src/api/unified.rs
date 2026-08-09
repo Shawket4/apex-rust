@@ -111,7 +111,7 @@ pub const UNIFIED_COLUMNS: &str = "
     parsed_occurred_at, parsed_template, parser_version,
     confidence, parse_method, category, verified,
     description, payment_method, company, car_no_plate, paid_by,
-    created_by, created_at, updated_at, has_overrides
+    created_by, created_at, updated_at, driver_id, employee_id, has_overrides
 ";
 
 /// The banksms branch: effective values with overrides applied.
@@ -137,6 +137,7 @@ pub const TRANSACTIONS_BRANCH: &str = r#"
         t.category, t.verified,
         t.description, t.payment_method, t.company, t.car_no_plate, t.paid_by,
         t.created_by, t.created_at, t.updated_at,
+        t.driver_id, t.employee_id,
         (o.transaction_id IS NOT NULL) AS has_overrides
     FROM banksms.transactions t
     LEFT JOIN LATERAL (
@@ -204,6 +205,7 @@ pub const FUEL_BRANCH: &str = r#"
         f.transporter AS company, f.car_no_plate, f.driver_name AS paid_by,
         NULL::text AS created_by, f.created_at AT TIME ZONE 'UTC' AS created_at,
         f.updated_at AT TIME ZONE 'UTC' AS updated_at,
+        NULL::bigint AS driver_id, NULL::bigint AS employee_id,
         FALSE AS has_overrides
     FROM public.fuel_events f
     WHERE f.deleted_at IS NULL AND f.created_at IS NOT NULL AND f.date IS NOT NULL
@@ -252,6 +254,7 @@ pub const LOAN_BRANCH: &str = r#"
         COALESCE(l.method, '')::text AS paid_by,
         NULL::text AS created_by, l.created_at AT TIME ZONE 'UTC' AS created_at,
         l.updated_at AT TIME ZONE 'UTC' AS updated_at,
+        l.driver_id, l.employee_id,
         FALSE AS has_overrides
     FROM public.loans l
     WHERE l.deleted_at IS NULL AND l.created_at IS NOT NULL AND l.date IS NOT NULL
@@ -372,17 +375,47 @@ mod tests {
         assert!(!build_union(&f).unwrap().contains("public.loans"));
     }
 
-    /// Every branch must project the same columns in the same order or Postgres
+    /// Count the columns a branch projects.
+    ///
+    /// Counts top-level commas in the SELECT list, tracking parenthesis depth so
+    /// commas inside calls like `to_char(x, 'fmt')` and `COALESCE(a, b)` are not
+    /// mistaken for column separators. An earlier version counted occurrences of
+    /// " AS ", which silently disagreed the moment a branch projected a bare
+    /// column name instead of an alias.
+    fn projected_columns(sql: &str) -> usize {
+        let head = sql.split("\n    FROM").next().unwrap_or(sql);
+        let head = head.trim_start().strip_prefix("SELECT").unwrap_or(head);
+
+        let mut depth = 0i32;
+        let mut commas = 0usize;
+        for c in head.chars() {
+            match c {
+                '(' => depth += 1,
+                ')' => depth -= 1,
+                ',' if depth == 0 => commas += 1,
+                _ => {}
+            }
+        }
+        commas + 1
+    }
+
+    /// Every branch must project the same columns in the same order, or Postgres
     /// will happily union mismatched values into the wrong fields.
     #[test]
     fn branches_project_the_same_column_count() {
-        let count = |sql: &str| {
-            let head = sql.split("FROM").next().unwrap();
-            head.matches(" AS ").count()
-        };
-        // The banksms branch relies on real column names for some fields, so
-        // compare the two synthesised branches, which must match each other.
-        assert_eq!(count(FUEL_BRANCH), count(LOAN_BRANCH));
+        let expected = UNIFIED_COLUMNS.split(',').count();
+        for (name, sql) in [
+            ("transactions", TRANSACTIONS_BRANCH),
+            ("fuel", FUEL_BRANCH),
+            ("loans", LOAN_BRANCH),
+        ] {
+            assert_eq!(
+                projected_columns(sql),
+                expected,
+                "{name} branch projects {} columns, expected {expected}",
+                projected_columns(sql)
+            );
+        }
     }
 
     #[test]

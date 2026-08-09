@@ -9,6 +9,7 @@ use sqlx::{PgPool, Row};
 use crate::api::{clamp_limit, if_match_version, require_read, require_write};
 use crate::auth::JwtAuth;
 use crate::errors::{AppError, AppResult};
+use crate::api::postings::{self, Postable};
 use crate::parser::derive_fee;
 
 /// Fields a user may override. Anything outside this list is rejected, so a
@@ -73,6 +74,8 @@ pub struct TransactionView {
     /// False for fuel events and loans: they are read here but owned by the
     /// PetroApp sync and FalconGo respectively, so the UI must not offer edits.
     pub editable: bool,
+    pub driver_id: Option<i64>,
+    pub employee_id: Option<i64>,
     pub parsed: ParsedView,
 
     pub created_by: Option<String>,
@@ -154,6 +157,8 @@ fn row_to_view(r: &sqlx::postgres::PgRow) -> TransactionView {
         fee,
         has_overrides: r.try_get("has_overrides").unwrap_or(false),
         editable: r.try_get("editable").unwrap_or(true),
+        driver_id: r.try_get("driver_id").unwrap_or(None),
+        employee_id: r.try_get("employee_id").unwrap_or(None),
         parsed: ParsedView {
             direction: r.get("parsed_direction"),
             amount: r.get("parsed_amount"),
@@ -458,6 +463,11 @@ async fn create(
 
 #[derive(Debug, Deserialize)]
 pub struct PatchTransaction {
+    /// Party the transaction is about. `Some(None)` clears it.
+    #[serde(default, deserialize_with = "crate::api::double_option")]
+    pub driver_id: Option<Option<i64>>,
+    #[serde(default, deserialize_with = "crate::api::double_option")]
+    pub employee_id: Option<Option<i64>>,
     // Overridable parser-owned fields.
     pub direction: Option<String>,
     pub amount: Option<Decimal>,
@@ -562,6 +572,8 @@ async fn patch(
             company        = COALESCE($6, company),
             car_no_plate   = COALESCE($7, car_no_plate),
             paid_by        = COALESCE($8, paid_by),
+            driver_id      = CASE WHEN $10 THEN $9  ELSE driver_id   END,
+            employee_id    = CASE WHEN $12 THEN $11 ELSE employee_id END,
             version        = version + 1,
             updated_at     = now()
         WHERE id = $1
@@ -575,14 +587,64 @@ async fn patch(
     .bind(&p.company)
     .bind(&p.car_no_plate)
     .bind(&p.paid_by)
+    .bind(p.driver_id.flatten())
+    .bind(p.driver_id.is_some())
+    .bind(p.employee_id.flatten())
+    .bind(p.employee_id.is_some())
     .execute(&mut *tx)
     .await?;
+
+    // Re-read inside the same transaction, then bring the posted state in line
+    // with it. Reading back rather than trusting the patch means the decision is
+    // made on what is actually stored, including fields this request did not
+    // touch (an advance verified today may have had its driver set last week).
+    let after = load_postable(&mut tx, id).await?;
+    if let Some(rule) = postings::load_rule(&mut tx, after.category.as_deref()).await? {
+        postings::validate(&rule, &after)?;
+    }
+    postings::reconcile(&mut tx, &after, &ctx.actor()).await?;
 
     tx.commit().await?;
 
     let sql = format!("{SELECT_EFFECTIVE} WHERE t.id = $1");
     let row = sqlx::query(&sql).bind(id).fetch_one(pool.get_ref()).await?;
     Ok(HttpResponse::Ok().json(row_to_view(&row)))
+}
+
+/// Load the fields posting decides on, from inside an open transaction.
+async fn load_postable(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    id: i64,
+) -> AppResult<Postable> {
+    let r = sqlx::query(
+        "SELECT t.id,
+                COALESCE(o.amount::numeric, t.parsed_amount)               AS amount,
+                COALESCE(o.occurred_at::timestamptz, t.parsed_occurred_at, t.created_at)
+                                                                            AS occurred_at,
+                t.description, t.category, t.driver_id, t.employee_id, t.verified
+         FROM banksms.transactions t
+         LEFT JOIN LATERAL (
+             SELECT MAX(CASE WHEN ov.field = 'amount'      THEN ov.value END) AS amount,
+                    MAX(CASE WHEN ov.field = 'occurred_at' THEN ov.value END) AS occurred_at
+             FROM banksms.transaction_overrides ov
+             WHERE ov.transaction_id = t.id AND ov.superseded_at IS NULL AND NOT ov.is_cleared
+         ) o ON TRUE
+         WHERE t.id = $1",
+    )
+    .bind(id)
+    .fetch_one(&mut **tx)
+    .await?;
+
+    Ok(Postable {
+        id: r.get("id"),
+        amount: r.get("amount"),
+        occurred_at: r.get("occurred_at"),
+        description: r.get("description"),
+        category: r.get("category"),
+        driver_id: r.get("driver_id"),
+        employee_id: r.get("employee_id"),
+        verified: r.get("verified"),
+    })
 }
 
 /// Soft delete. Parsed rows are never hard-deleted: the raw message still exists,
@@ -596,26 +658,35 @@ async fn soft_delete(
     let id = path.into_inner();
     let expected = if_match_version(&req)?;
 
+    let mut tx = pool.begin().await?;
+
     let result = sqlx::query(
         "UPDATE banksms.transactions SET deleted_at = now(), version = version + 1, \
          updated_at = now() WHERE id = $1 AND version = $2 AND deleted_at IS NULL",
     )
     .bind(id)
     .bind(expected)
-    .execute(pool.get_ref())
+    .execute(&mut *tx)
     .await?;
 
     if result.rows_affected() == 0 {
         let actual: Option<i32> =
             sqlx::query_scalar("SELECT version FROM banksms.transactions WHERE id = $1")
                 .bind(id)
-                .fetch_optional(pool.get_ref())
+                .fetch_optional(&mut *tx)
                 .await?;
         return match actual {
             Some(actual) => Err(AppError::VersionConflict { expected, actual }),
             None => Err(AppError::NotFound(format!("transaction {id}"))),
         };
     }
+
+    // Cascade to the posted loan in the same transaction. Without this, deleting
+    // an advance leaves an orphan payroll deduction that nothing in the UI can
+    // explain and nobody thinks to look for.
+    postings::unpost_for_deleted(&mut tx, id).await?;
+
+    tx.commit().await?;
 
     Ok(HttpResponse::NoContent().finish())
 }
