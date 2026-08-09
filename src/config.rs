@@ -30,6 +30,21 @@ pub struct Config {
     /// Ceiling for exponential backoff after WhatsApp API errors.
     pub poll_backoff_max_secs: u64,
 
+    // --- notifications ------------------------------------------------------
+    /// ntfy server. Defaults to the public instance; point it at a self-hosted
+    /// one by setting NTFY_URL.
+    pub ntfy_url: String,
+    /// Topic to publish to. EMPTY DISABLES NOTIFICATIONS -- a deploy without
+    /// this configured stays silent rather than erroring on every parse.
+    pub ntfy_topic: String,
+    pub ntfy_token: Option<String>,
+    /// Above this many new transactions in one run, send a single summary
+    /// instead of one push per row. Stops a backfill from firing 700 pushes.
+    pub ntfy_max_individual: usize,
+    /// Base URL used to build deep links, e.g.
+    /// https://apextransport.ddns.net/fleet-expenses/224/edit
+    pub dashboard_base_url: String,
+
     /// Set false to run the HTTP API without the background poller (useful for
     /// tests, and for running a second instance that only serves reads).
     pub ingest_enabled: bool,
@@ -78,6 +93,17 @@ pub static CONFIG: Lazy<Config> = Lazy::new(|| {
             .unwrap_or_else(|_| "900".to_string())
             .parse()
             .expect("POLL_BACKOFF_MAX_SECS must be a valid number"),
+
+        ntfy_url: env::var("NTFY_URL")
+            .unwrap_or_else(|_| "https://ntfy.sh".to_string()),
+        ntfy_topic: env::var("NTFY_TOPIC").unwrap_or_default(),
+        ntfy_token: env::var("NTFY_TOKEN").ok().filter(|s| !s.is_empty()),
+        ntfy_max_individual: env::var("NTFY_MAX_INDIVIDUAL")
+            .unwrap_or_else(|_| "5".to_string())
+            .parse()
+            .unwrap_or(5),
+        dashboard_base_url: env::var("DASHBOARD_BASE_URL")
+            .unwrap_or_else(|_| "https://apextransport.ddns.net".to_string()),
 
         ingest_enabled: env::var("INGEST_ENABLED")
             .map(|v| v != "false" && v != "0")
