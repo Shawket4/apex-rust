@@ -96,6 +96,16 @@ impl UnifiedFilters {
     }
 }
 
+/// How many bind parameters the union consumes ($1..$N).
+///
+/// Callers append their own parameters after the union -- a cursor, a limit --
+/// and must start numbering at UNION_PARAM_COUNT + 1. This drifted once already
+/// when the `verified` filter was removed: the union shrank from 15 slots to 14,
+/// the outer query kept reading $16, and every list request died with
+/// "cannot cast type bigint to timestamp with time zone", which points nowhere
+/// near the cause. The test below pins it.
+pub const UNION_PARAM_COUNT: usize = 14;
+
 /// Column list every branch must produce, in order. Kept in one place so a
 /// branch that drifts fails at the database rather than silently shifting
 /// values into the wrong column.
@@ -392,6 +402,35 @@ mod tests {
             }
         }
         commas + 1
+    }
+
+    /// The union must use exactly UNION_PARAM_COUNT slots, contiguously from $1.
+    ///
+    /// A gap or an overshoot silently shifts every parameter a caller appends
+    /// after it, and the resulting type error names a cast rather than the
+    /// filter that moved.
+    #[test]
+    fn union_uses_exactly_the_declared_parameter_slots() {
+        let sql = build_union(&base()).expect("default filters build a union");
+        let mut used: Vec<usize> = regex::Regex::new(r"\$(\d+)")
+            .unwrap()
+            .captures_iter(&sql)
+            .map(|c| c[1].parse::<usize>().unwrap())
+            .collect();
+        used.sort_unstable();
+        used.dedup();
+
+        assert_eq!(
+            used.last().copied(),
+            Some(UNION_PARAM_COUNT),
+            "union's highest slot is {:?}, but UNION_PARAM_COUNT is {UNION_PARAM_COUNT}",
+            used.last()
+        );
+        assert_eq!(
+            used,
+            (1..=UNION_PARAM_COUNT).collect::<Vec<_>>(),
+            "union slots must be contiguous from $1; got {used:?}"
+        );
     }
 
     /// Every branch must project the same columns in the same order, or Postgres

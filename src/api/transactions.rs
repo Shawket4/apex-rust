@@ -268,11 +268,15 @@ async fn list(
     let (cursor_ts, cursor_id) = parse_cursor(q.cursor.as_deref());
 
     let sql = format!(
+        // The union occupies $1..$14; the cursor and limit follow it. These must
+        // stay in step with UNION_PARAM_COUNT -- they silently drifted once
+        // already when a filter was removed, and a mismatched slot surfaces as
+        // an opaque cast error rather than anything pointing at the cause.
         "SELECT * FROM ({union}) u
-         WHERE ($16::timestamptz IS NULL
-                OR (u.eff_occurred_at, u.id) < ($16::timestamptz, $17::bigint))
+         WHERE ($15::timestamptz IS NULL
+                OR (u.eff_occurred_at, u.id) < ($15::timestamptz, $16::bigint))
          ORDER BY u.eff_occurred_at DESC NULLS LAST, u.id DESC
-         LIMIT $18"
+         LIMIT $17"
     );
 
     let rows = sqlx::query(&sql)
@@ -288,11 +292,11 @@ async fn list(
         .bind(&filters.template)         // $10
         .bind(filters.min_amount)        // $11
         .bind(filters.max_amount)        // $12
-        .bind(&filters.counterparty)     // $14
-        .bind(&filters.q)                // $15
-        .bind(cursor_ts)                 // $16
-        .bind(cursor_id)                 // $17
-        .bind(limit)                     // $18
+        .bind(&filters.counterparty)     // $13
+        .bind(&filters.q)                // $14
+        .bind(cursor_ts)                 // $15
+        .bind(cursor_id)                 // $16
+        .bind(limit)                     // $17
         .fetch_all(pool.get_ref())
         .await?;
 
