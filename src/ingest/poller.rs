@@ -304,6 +304,15 @@ pub async fn run(pool: sqlx::PgPool, client: WhatsAppClient) {
                 } else if outcome.ran {
                     debug!("ingest: nothing new ({} fetched)", outcome.fetched);
                 }
+                // Drain on EVERY cycle, not only when this poll inserted
+                // something. Messages can reach `pending` without an insert --
+                // a backfill, an operator re-queueing a row, or a reclassify --
+                // and previously those sat unparsed until some unrelated message
+                // happened to arrive. On a quiet chat that is indefinitely.
+                // The query is bounded and `pending` is normally empty, so the
+                // cost of doing this unconditionally is a no-op scan.
+                drain_pending(&pool).await;
+
                 tokio::time::sleep(Duration::from_secs(CONFIG.poll_interval_secs)).await;
             }
             Err(e) => {

@@ -225,3 +225,28 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod real_formats {
+    use super::*;
+    use crate::parser::normalize::normalize;
+
+    /// The instant-transfer format was reaching production and being ignored.
+    ///
+    /// It is the weakest-scoring real format: the currency is written `جم`
+    /// rather than an ISO code, so `currency_adjacent_number` never fires, and
+    /// its reference is bare hex with no `#` or `FT` prefix, so `bank_reference`
+    /// misses too. It clears the threshold on hotline, masked account, keyword
+    /// and date+time alone -- which is worth pinning, because losing any one of
+    /// those signals would drop it below 40.
+    #[test]
+    fn instant_transfer_scores_above_threshold() {
+        let raw = "يرجى العلم انه تم تنفيذ تحويل لحظي بمبلغ 4375.00 جم من حسابك المنتهي بـ \
+                   ********5447 برقم مرجعي 06d24f2f بتاريخ 09-08-2026 23:18 للمزيد، برجاء الاتصال بـ 19666";
+        let n = normalize(raw);
+        let t = score(&n, DEFAULT_THRESHOLD);
+        println!("normalized: {n}");
+        println!("score {} signals {:?} route {:?}", t.score, t.signals, t.route);
+        assert_eq!(t.route, Route::Extract, "scored {} via {:?}", t.score, t.signals);
+    }
+}
