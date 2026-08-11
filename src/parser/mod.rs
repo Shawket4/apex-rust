@@ -151,11 +151,30 @@ impl ParseOutcome {
 /// `noise_skeletons` is the set of skeleton hashes a human has confirmed are
 /// chatter; anything matching auto-ignores. That is what stops the review queue
 /// refilling with the same false positive after every reparse.
+/// Messages about PetroApp are excluded from the ledger entirely.
+///
+/// Fuel bought through PetroApp already reaches the system as `fuel_events` via
+/// the PetroApp sync. Recording the bank's transfer notification as well would
+/// count the same money twice -- once as a fuel event and once as a bank
+/// transaction -- and silently inflate every fuel and total figure.
+///
+/// Applied AFTER the templates run, not instead of them, so the format is still
+/// recognised: an unrecognised message is a gap to investigate, whereas a
+/// suppressed one is a decision. The distinction matters when a bank changes its
+/// wording.
+fn petroapp_pattern() -> &'static regex::Regex {
+    static P: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    P.get_or_init(|| regex::Regex::new(r"(?i)petroapp|بترو\s*اب|بتروآب").unwrap())
+}
+
 pub fn parse(
     body: &str,
     compiled: &[templates::CompiledTemplate],
     noise_skeletons: &std::collections::HashSet<String>,
     threshold: i32,
+    // `reference` is when the message arrived; it supplies the year for date
+    // formats that omit one.
+    reference: Option<chrono::DateTime<chrono::Utc>>,
 ) -> ParseOutcome {
     let normalized = normalize::normalize(body);
     let skel = skeleton::skeleton_hash(&normalized);
@@ -175,10 +194,24 @@ pub fn parse(
         return ParseOutcome::ignored(skel, &t);
     }
 
+    // PetroApp transfers are already counted as fuel events; see above.
+    if petroapp_pattern().is_match(&normalized) {
+        let suppressed = triage::Triage {
+            score: t.score,
+            route: triage::Route::Ignore,
+            signals: {
+                let mut sig = t.signals.clone();
+                sig.push("petroapp_suppressed");
+                sig
+            },
+        };
+        return ParseOutcome::ignored(skel, &suppressed);
+    }
+
     let triage_score = t.score.clamp(0, 100) as i16;
 
     // --- tier 1: template registry -----------------------------------------
-    if let Some(m) = templates::match_first(compiled, &normalized) {
+    if let Some(m) = templates::match_first(compiled, &normalized, reference) {
         // A template match is deterministic. Some formats genuinely lack fields
         // (cib_card has no reference number at all), so a missing optional field
         // does not reduce confidence.
@@ -203,7 +236,7 @@ pub fn parse(
     }
 
     // --- tier 2: field extractors ------------------------------------------
-    let e = extractors::extract(&normalized);
+    let e = extractors::extract(&normalized, reference);
     let status = if e.is_viable() {
         ParseStatus::Partial
     } else {

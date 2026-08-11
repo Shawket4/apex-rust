@@ -17,9 +17,15 @@ use crate::parser::templates::CompiledTemplate;
 const SEED_SQL: &str = concat!(
     include_str!("../../migrations/20260808120100_seed_parse_templates.up.sql"),
     include_str!("../../migrations/20260809180000_instant_transfer_template.up.sql"),
+    include_str!("../../migrations/20260810080000_wallet_transfer_template.up.sql"),
 );
 const BANK_SMS: &str = include_str!("../../tests/fixtures/bank_sms.json");
 const CHATTER: &str = include_str!("../../tests/fixtures/chatter.json");
+/// Messages that a template DOES recognise but which are deliberately excluded
+/// from the ledger -- currently PetroApp transfers, which already arrive as fuel
+/// events. They live apart from `bank_sms.json` because that set asserts every
+/// message becomes a transaction, and these must not.
+const SUPPRESSED: &str = include_str!("../../tests/fixtures/suppressed.json");
 
 #[derive(serde::Deserialize)]
 struct Fixture {
@@ -75,8 +81,8 @@ fn seeded_templates() -> Vec<CompiledTemplate> {
 
     assert_eq!(
         out.len(),
-        5,
-        "expected 5 seeded templates, parsed {} from the migrations",
+        6,
+        "expected 6 seeded templates, parsed {} from the migrations",
         out.len()
     );
     out
@@ -121,7 +127,11 @@ fn no_noise() -> HashSet<String> {
 #[test]
 fn every_seeded_template_matches_real_traffic() {
     let templates = seeded_templates();
-    let fixtures: Vec<Fixture> = serde_json::from_str(BANK_SMS).unwrap();
+    // Suppressed formats count as real traffic: the point of this test is that a
+    // pattern matches the wording banks actually send, not that it produces a
+    // transaction.
+    let mut fixtures: Vec<Fixture> = serde_json::from_str(BANK_SMS).unwrap();
+    fixtures.extend(serde_json::from_str::<Vec<Fixture>>(SUPPRESSED).unwrap());
 
     for t in &templates {
         let hits = fixtures
@@ -150,7 +160,15 @@ fn all_bank_sms_parse_via_tier_one() {
     let mut failures = Vec::new();
 
     for f in &fixtures {
-        let outcome = parse(&f.body, &templates, &no_noise(), triage::DEFAULT_THRESHOLD);
+        // Pass the fixture's own arrival time: formats that omit the year
+        // resolve against it, exactly as they do in production.
+        let outcome = parse(
+            &f.body,
+            &templates,
+            &no_noise(),
+            triage::DEFAULT_THRESHOLD,
+            f.wa_timestamp.parse::<chrono::DateTime<chrono::Utc>>().ok(),
+        );
 
         if outcome.status != ParseStatus::Parsed {
             failures.push(format!(
@@ -213,7 +231,15 @@ fn all_chatter_routes_to_ignored() {
 
     let mut leaked = Vec::new();
     for f in &fixtures {
-        let outcome = parse(&f.body, &templates, &no_noise(), triage::DEFAULT_THRESHOLD);
+        // Pass the fixture's own arrival time: formats that omit the year
+        // resolve against it, exactly as they do in production.
+        let outcome = parse(
+            &f.body,
+            &templates,
+            &no_noise(),
+            triage::DEFAULT_THRESHOLD,
+            f.wa_timestamp.parse::<chrono::DateTime<chrono::Utc>>().ok(),
+        );
         if outcome.status != ParseStatus::Ignored {
             leaked.push(format!(
                 "[{:?} score={}] {}",
@@ -244,7 +270,15 @@ fn parsed_dates_agree_with_the_whatsapp_envelope() {
     let fixtures: Vec<Fixture> = serde_json::from_str(BANK_SMS).unwrap();
 
     for f in &fixtures {
-        let outcome = parse(&f.body, &templates, &no_noise(), triage::DEFAULT_THRESHOLD);
+        // Pass the fixture's own arrival time: formats that omit the year
+        // resolve against it, exactly as they do in production.
+        let outcome = parse(
+            &f.body,
+            &templates,
+            &no_noise(),
+            triage::DEFAULT_THRESHOLD,
+            f.wa_timestamp.parse::<chrono::DateTime<chrono::Utc>>().ok(),
+        );
         let parsed = outcome.occurred_at.expect("bank SMS must have a date");
         let envelope: DateTime<Utc> = f.wa_timestamp.parse().unwrap();
 
@@ -271,13 +305,13 @@ fn noise_skeletons_short_circuit_triage() {
     let templates = seeded_templates();
     let body = "ALERT: EGP 1250.75 debited from card **9911 on 03/02/2026 at 09:15 ref FT26034ABCDE";
 
-    let normal = parse(body, &templates, &no_noise(), triage::DEFAULT_THRESHOLD);
+    let normal = parse(body, &templates, &no_noise(), triage::DEFAULT_THRESHOLD, None);
     assert_ne!(normal.status, ParseStatus::Ignored);
 
     let mut noise = HashSet::new();
     noise.insert(normal.skeleton_hash.clone());
 
-    let suppressed = parse(body, &templates, &noise, triage::DEFAULT_THRESHOLD);
+    let suppressed = parse(body, &templates, &noise, triage::DEFAULT_THRESHOLD, None);
     assert_eq!(suppressed.status, ParseStatus::Ignored);
     assert!(suppressed.triage_signals.contains(&"known_noise_skeleton"));
 }
@@ -292,7 +326,7 @@ fn every_message_gets_a_terminal_status_and_a_skeleton() {
     all.extend(serde_json::from_str::<Vec<Fixture>>(CHATTER).unwrap());
 
     for f in &all {
-        let o = parse(&f.body, &templates, &no_noise(), triage::DEFAULT_THRESHOLD);
+        let o = parse(&f.body, &templates, &no_noise(), triage::DEFAULT_THRESHOLD, None);
         assert!(
             !o.skeleton_hash.is_empty(),
             "{}: no skeleton hash",
@@ -323,13 +357,13 @@ fn threshold_sweep() {
         let lost = bank
             .iter()
             .filter(|f| {
-                parse(&f.body, &templates, &no_noise(), threshold).status == ParseStatus::Ignored
+                parse(&f.body, &templates, &no_noise(), threshold, None).status == ParseStatus::Ignored
             })
             .count();
         let queued = chatter
             .iter()
             .filter(|f| {
-                parse(&f.body, &templates, &no_noise(), threshold).status != ParseStatus::Ignored
+                parse(&f.body, &templates, &no_noise(), threshold, None).status != ParseStatus::Ignored
             })
             .count();
         let note = if threshold == triage::DEFAULT_THRESHOLD { "<- DEFAULT" } else { "" };
@@ -339,11 +373,11 @@ fn threshold_sweep() {
     println!("\nscore distribution:");
     let mut bank_scores: Vec<i16> = bank
         .iter()
-        .map(|f| parse(&f.body, &templates, &no_noise(), 0).triage_score)
+        .map(|f| parse(&f.body, &templates, &no_noise(), 0, None).triage_score)
         .collect();
     let mut chat_scores: Vec<i16> = chatter
         .iter()
-        .map(|f| parse(&f.body, &templates, &no_noise(), 0).triage_score)
+        .map(|f| parse(&f.body, &templates, &no_noise(), 0, None).triage_score)
         .collect();
     bank_scores.sort();
     chat_scores.sort();
@@ -356,4 +390,48 @@ fn threshold_sweep() {
         chat_scores.len(), chat_scores[0], chat_scores[chat_scores.len()/2],
         chat_scores[chat_scores.len()*95/100], chat_scores[chat_scores.len()-1]
     );
+
+    /// PetroApp transfers are recognised and then deliberately dropped.
+    ///
+    /// Fuel bought through PetroApp already reaches the system as a fuel_event
+    /// via the PetroApp sync, so recording the bank's notification as well would
+    /// count the same money twice and inflate every fuel and total figure.
+    #[test]
+    fn petroapp_messages_are_recognised_then_suppressed() {
+        let templates = seeded_templates();
+        let fixtures: Vec<Fixture> = serde_json::from_str(SUPPRESSED).unwrap();
+        assert!(!fixtures.is_empty(), "suppressed fixture set is empty");
+
+        for f in &fixtures {
+            let normalized = normalize::normalize(&f.body);
+
+            // Recognised: some template does match it. An unrecognised message is
+            // a gap to chase; a suppressed one is a decision.
+            assert!(
+                templates.iter().any(|t| t.regex.is_match(&normalized)),
+                "{}: no template matched, so suppression is hiding a parse gap",
+                f.wa_message_id
+            );
+
+            let outcome = parse(
+                &f.body,
+                &templates,
+                &no_noise(),
+                triage::DEFAULT_THRESHOLD,
+                f.wa_timestamp.parse::<chrono::DateTime<chrono::Utc>>().ok(),
+            );
+            assert_eq!(
+                outcome.status,
+                ParseStatus::Ignored,
+                "{}: PetroApp must not reach the ledger",
+                f.wa_message_id
+            );
+            assert!(
+                outcome.triage_signals.contains(&"petroapp_suppressed"),
+                "{}: ignored for the wrong reason -- signals {:?}",
+                f.wa_message_id,
+                outcome.triage_signals
+            );
+        }
+    }
 }

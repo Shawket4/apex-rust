@@ -100,7 +100,7 @@ fn pats() -> &'static Pats {
 /// convention this bank uses -- so day-first is tried before month-first. That is
 /// the more common convention in the observed corpus (3 of 4 templates), and the
 /// resulting row is queued for human review anyway.
-pub fn extract(normalized: &str) -> Extracted {
+pub fn extract(normalized: &str, reference: Option<chrono::DateTime<chrono::Utc>>) -> Extracted {
     let p = pats();
     let mut out = Extracted::default();
 
@@ -144,7 +144,7 @@ pub fn extract(normalized: &str) -> Extracted {
             "%m/%d/%Y".to_string(),
             "%m/%d/%y".to_string(),
         ];
-        out.occurred_at = parse_datetime(&d, time.as_deref(), &formats);
+        out.occurred_at = parse_datetime(&d, time.as_deref(), &formats, reference);
     }
 
     // Debit wins ties: an outgoing transfer misfiled as incoming inverts the
@@ -170,7 +170,7 @@ mod tests {
     fn extracts_from_an_unknown_english_format() {
         // Deliberately not one of the seed templates.
         let s = normalize("ALERT: EGP 1250.75 was debited from card **9911 on 03/02/2026 at 09:15, ref FT26034ABCDE");
-        let e = extract(&s);
+        let e = extract(&s, None);
         assert_eq!(e.amount, Some(dec!(1250.75)));
         assert_eq!(e.currency.as_deref(), Some("EGP"));
         assert_eq!(e.account.as_deref(), Some("9911"));
@@ -183,7 +183,7 @@ mod tests {
     #[test]
     fn extracts_from_an_unknown_arabic_format() {
         let s = normalize("إشعار: تم إضافة مبلغ EGP 5000.00 إلى حسابك ********1234 بتاريخ 15/03/2026 11:20");
-        let e = extract(&s);
+        let e = extract(&s, None);
         assert_eq!(e.amount, Some(dec!(5000.00)));
         assert_eq!(e.direction, Some(Direction::In));
         assert_eq!(e.account.as_deref(), Some("1234"));
@@ -192,33 +192,33 @@ mod tests {
 
     #[test]
     fn missing_amount_or_date_is_not_viable() {
-        let e = extract(&normalize("your account was debited today"));
+        let e = extract(&normalize("your account was debited today"), None);
         assert!(!e.is_viable());
     }
 
     #[test]
     fn confidence_rises_with_recovered_fields() {
-        let sparse = extract(&normalize("EGP 100.00 on 01/02/2026"));
+        let sparse = extract(&normalize("EGP 100.00 on 01/02/2026"), None);
         let rich = extract(&normalize(
             "EGP 100.00 debited from **1234 on 01/02/2026 at 10:00 ref FT26032ABCDE balance is 500.00",
-        ));
+        ), None);
         assert!(rich.confidence() > sparse.confidence());
         assert!(rich.confidence() <= 95);
     }
 
     #[test]
     fn extracts_balance_in_both_languages() {
-        let en = extract(&normalize("debited EGP 85.00 on 01/02/2026 10:00, your available balance is 11720.54"));
+        let en = extract(&normalize("debited EGP 85.00 on 01/02/2026 10:00, your available balance is 11720.54"), None);
         assert_eq!(en.balance_after, Some(dec!(11720.54)));
 
-        let ar = extract(&normalize("تم سحب مبلغ EGP 8000.00 في 08/08/26 10:32 ، الرصيد المتاح EGP 8579.76"));
+        let ar = extract(&normalize("تم سحب مبلغ EGP 8000.00 في 08/08/26 10:32 ، الرصيد المتاح EGP 8579.76"), None);
         assert_eq!(ar.balance_after, Some(dec!(8579.76)));
     }
 
     #[test]
     fn debit_wins_when_both_words_appear() {
         // Mis-signing money is worse than being unsure about it.
-        let e = extract(&normalize("EGP 10.00 debited then credited on 01/02/2026 10:00"));
+        let e = extract(&normalize("EGP 10.00 debited then credited on 01/02/2026 10:00"), None);
         assert_eq!(e.direction, Some(Direction::Out));
     }
 }

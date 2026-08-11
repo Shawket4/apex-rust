@@ -7,7 +7,7 @@
 //!
 //! Patterns are stored in POST-NORMALIZATION form -- see parser::normalize.
 
-use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
+use chrono::{DateTime, Datelike, NaiveDateTime, TimeZone, Utc};
 use chrono_tz::Africa::Cairo;
 use regex::Regex;
 use rust_decimal::Decimal;
@@ -144,13 +144,19 @@ pub fn validate_pattern(pattern: &str) -> AppResult<()> {
 }
 
 /// Try each template in priority order; first match wins.
-pub fn match_first(templates: &[CompiledTemplate], normalized: &str) -> Option<TemplateMatch> {
-    templates
-        .iter()
-        .find_map(|t| apply(t, normalized).map(|m| m))
+pub fn match_first(
+    templates: &[CompiledTemplate],
+    normalized: &str,
+    reference: Option<DateTime<Utc>>,
+) -> Option<TemplateMatch> {
+    templates.iter().find_map(|t| apply(t, normalized, reference))
 }
 
-fn apply(t: &CompiledTemplate, normalized: &str) -> Option<TemplateMatch> {
+fn apply(
+    t: &CompiledTemplate,
+    normalized: &str,
+    reference: Option<DateTime<Utc>>,
+) -> Option<TemplateMatch> {
     let caps = t.regex.captures(normalized)?;
     let get = |n: &str| caps.name(n).map(|m| m.as_str().trim().to_string());
 
@@ -166,7 +172,7 @@ fn apply(t: &CompiledTemplate, normalized: &str) -> Option<TemplateMatch> {
         });
 
     let occurred_at = match (get("date"), get("time")) {
-        (Some(d), time) => parse_datetime(&d, time.as_deref(), &t.date_formats),
+        (Some(d), time) => parse_datetime(&d, time.as_deref(), &t.date_formats, reference),
         _ => None,
     };
 
@@ -218,12 +224,24 @@ pub fn parse_datetime(
     date: &str,
     time: Option<&str>,
     formats: &[String],
+    reference: Option<DateTime<Utc>>,
 ) -> Option<DateTime<Utc>> {
     let time = time.unwrap_or("00:00");
     // Bank SMS use both H:MM and HH:MM.
     let time_formats = ["%H:%M:%S", "%H:%M"];
 
     for df in formats {
+        // Some banks omit the year entirely ("يوم 08-09"). The year comes from
+        // the message's own arrival time, which is the only trustworthy source:
+        // guessing "this year" is right until an old message is reparsed, and a
+        // wrong year on a transfer is worse than no date at all.
+        if !df.contains("%Y") && !df.contains("%y") {
+            if let Some(dt) = parse_yearless(date, time, df, reference) {
+                return Some(dt);
+            }
+            continue;
+        }
+
         for tf in time_formats {
             let combined = format!("{date} {time}");
             let fmt = format!("{df} {tf}");
@@ -235,6 +253,54 @@ pub fn parse_datetime(
                     .from_local_datetime(&naive)
                     .earliest()
                     .map(|dt| dt.with_timezone(&Utc));
+            }
+        }
+    }
+    None
+}
+
+/// Resolve a date that carries no year, using the message's arrival time.
+///
+/// The year is taken from `reference`, then corrected across the year boundary:
+/// a message that arrives on 2 January reporting "31-12" means LAST year, not a
+/// date eleven months in the future. Anything landing more than a week ahead of
+/// the reference is treated as the previous year.
+fn parse_yearless(
+    date: &str,
+    time: &str,
+    date_format: &str,
+    reference: Option<DateTime<Utc>>,
+) -> Option<DateTime<Utc>> {
+    // Without a reference there is nothing to infer from, and inventing a year
+    // would silently file the row under the wrong one.
+    let reference = reference?;
+    let ref_cairo = reference.with_timezone(&Cairo);
+    let ref_year = ref_cairo.year();
+
+    for tf in ["%H:%M:%S", "%H:%M"] {
+        let fmt = format!("{date_format} {tf}");
+        // Parse against a leap year so 29 February is never rejected outright.
+        let probe = format!("2024 {date} {time}");
+        let probe_fmt = format!("%Y {fmt}");
+        let Ok(naive) = NaiveDateTime::parse_from_str(&probe, &probe_fmt) else {
+            continue;
+        };
+
+        for candidate_year in [ref_year, ref_year - 1] {
+            let Some(dated) = naive.with_year(candidate_year) else {
+                continue; // 29 Feb in a non-leap year
+            };
+            let Some(utc) = Cairo
+                .from_local_datetime(&dated)
+                .earliest()
+                .map(|dt| dt.with_timezone(&Utc))
+            else {
+                continue;
+            };
+            // A week of slack absorbs clock skew and late delivery without
+            // letting a genuinely old date be read as this year.
+            if utc <= reference + chrono::Duration::days(7) {
+                return Some(utc);
             }
         }
     }
@@ -258,7 +324,7 @@ mod tests {
         ];
 
         for (name, date, formats) in cases {
-            let dt = parse_datetime(date, Some("12:00"), &formats)
+            let dt = parse_datetime(date, Some("12:00"), &formats, None)
                 .unwrap_or_else(|| panic!("{name}: {date} failed to parse"));
             let cairo = dt.with_timezone(&Cairo);
             assert_eq!(
@@ -273,8 +339,8 @@ mod tests {
     /// different real dates.
     #[test]
     fn ambiguous_date_means_different_days_under_different_formats() {
-        let month_first = parse_datetime("8/6/26", Some("12:00"), &["%m/%d/%y".into()]).unwrap();
-        let day_first = parse_datetime("8/6/26", Some("12:00"), &["%d/%m/%y".into()]).unwrap();
+        let month_first = parse_datetime("8/6/26", Some("12:00"), &["%m/%d/%y".into()], None).unwrap();
+        let day_first = parse_datetime("8/6/26", Some("12:00"), &["%d/%m/%y".into()], None).unwrap();
         assert_ne!(month_first, day_first);
         assert_eq!(
             month_first.with_timezone(&Cairo).format("%Y-%m-%d").to_string(),
@@ -289,10 +355,10 @@ mod tests {
     #[test]
     fn cairo_is_utc_plus_3_in_summer_and_plus_2_in_winter() {
         // Egypt observes DST; a fixed offset would be wrong half the year.
-        let summer = parse_datetime("08/08/2026", Some("14:32"), &["%d/%m/%Y".into()]).unwrap();
+        let summer = parse_datetime("08/08/2026", Some("14:32"), &["%d/%m/%Y".into()], None).unwrap();
         assert_eq!(summer.format("%H:%M").to_string(), "11:32");
 
-        let winter = parse_datetime("01/11/2025", Some("14:32"), &["%d/%m/%Y".into()]).unwrap();
+        let winter = parse_datetime("01/11/2025", Some("14:32"), &["%d/%m/%Y".into()], None).unwrap();
         assert_eq!(winter.format("%H:%M").to_string(), "12:32");
     }
 
@@ -307,7 +373,7 @@ mod tests {
     #[test]
     fn single_digit_hour_times_parse() {
         // "8/6/26 9:05" occurs in ABK messages.
-        assert!(parse_datetime("8/6/26", Some("9:05"), &["%m/%d/%y".into()]).is_some());
+        assert!(parse_datetime("8/6/26", Some("9:05"), &["%m/%d/%y".into()], None).is_some());
     }
 
     #[test]
