@@ -5,6 +5,7 @@
 //! us a message, because the raw body is already durable before this runs.
 
 use log::{info, warn};
+use chrono::{DateTime, Utc};
 use sqlx::Row;
 use std::collections::HashSet;
 
@@ -69,11 +70,11 @@ pub async fn run(pool: &sqlx::PgPool, scope: Scope, max_rows: i64) -> AppResult<
 
     loop {
         let sql = format!(
-            "SELECT id, body FROM banksms.raw_messages \
+            "SELECT id, body, wa_timestamp FROM banksms.raw_messages \
              WHERE ({}) AND id > $1 ORDER BY id ASC LIMIT $2",
             scope.sql_filter()
         );
-        let rows: Vec<(i64, String)> = sqlx::query_as(&sql)
+        let rows: Vec<(i64, String, DateTime<Utc>)> = sqlx::query_as(&sql)
             .bind(after_id)
             .bind(batch_size.min(max_rows - run.examined as i64))
             .fetch_all(pool)
@@ -83,7 +84,7 @@ pub async fn run(pool: &sqlx::PgPool, scope: Scope, max_rows: i64) -> AppResult<
             break;
         }
 
-        after_id = rows.last().map(|(id, _)| *id).unwrap_or(after_id);
+        after_id = rows.last().map(|(id, _, _)| *id).unwrap_or(after_id);
         let batch_len = rows.len();
 
         process_batch(pool, rows, &compiled, &noise, &mut run, &mut created).await?;
@@ -113,19 +114,22 @@ pub async fn run(pool: &sqlx::PgPool, scope: Scope, max_rows: i64) -> AppResult<
 
 async fn process_batch(
     pool: &sqlx::PgPool,
-    rows: Vec<(i64, String)>,
+    rows: Vec<(i64, String, DateTime<Utc>)>,
     compiled: &[templates::CompiledTemplate],
     noise: &HashSet<String>,
     run: &mut ParseRun,
     created: &mut Vec<NewTransaction>,
 ) -> AppResult<()> {
-    for (raw_id, body) in rows {
+    for (raw_id, body, wa_timestamp) in rows {
         run.examined += 1;
         let outcome = parser::parse(
             &body,
             compiled,
             noise,
             crate::parser::triage::DEFAULT_THRESHOLD,
+            // The message's own arrival time supplies the year for bank formats
+            // that omit one.
+            Some(wa_timestamp),
         );
 
         match outcome.status {
