@@ -57,7 +57,9 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
             .route("", web::get().to(refdata::list_categories).wrap(admin())),
     )
     .service(
-        web::scope("/api/v1/parties").route("", web::get().to(refdata::list_parties).wrap(admin())),
+        web::scope("/api/v1/parties")
+            .route("/suggest", web::get().to(refdata::suggest_party).wrap(admin()))
+            .route("", web::get().to(refdata::list_parties).wrap(admin())),
     )
     .service(
         web::scope("/api/v1/vehicles")

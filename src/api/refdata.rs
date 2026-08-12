@@ -121,3 +121,66 @@ pub async fn list_vehicles(pool: web::Data<PgPool>) -> AppResult<HttpResponse> {
         .collect();
     Ok(HttpResponse::Ok().json(out))
 }
+
+#[derive(Debug, serde::Deserialize)]
+pub struct SuggestQuery {
+    pub counterparty: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PartySuggestion {
+    pub driver_id: Option<i64>,
+    pub employee_id: Option<i64>,
+    pub name: String,
+    pub kind: String,
+    /// How many past transactions with this exact counterparty were linked to
+    /// this person. The banks mask names consistently, so exact match works.
+    pub times: i64,
+}
+
+/// Who this counterparty has been before. The masked bank name is stable per
+/// person, so the most frequent past link is almost always the right one —
+/// the UI offers it as a prefill with an explicit "someone else" escape, never
+/// as a silent decision.
+pub async fn suggest_party(
+    pool: web::Data<PgPool>,
+    query: web::Query<SuggestQuery>,
+) -> AppResult<HttpResponse> {
+    let counterparty = query.counterparty.trim();
+    if counterparty.is_empty() {
+        return Ok(HttpResponse::Ok().json(serde_json::Value::Null));
+    }
+
+    let row = sqlx::query(
+        r#"
+        SELECT t.driver_id, t.employee_id,
+               COALESCE(d.name, e.name) AS name,
+               CASE WHEN t.driver_id IS NOT NULL THEN 'driver' ELSE 'employee' END AS kind,
+               COUNT(*) AS times, MAX(t.updated_at) AS last_used
+        FROM banksms.transactions t
+        LEFT JOIN public.drivers d ON d.id = t.driver_id
+        LEFT JOIN public.employees e ON e.id = t.employee_id
+        WHERE t.deleted_at IS NULL
+          AND t.counterparty = $1
+          AND (t.driver_id IS NOT NULL OR t.employee_id IS NOT NULL)
+        GROUP BY t.driver_id, t.employee_id, COALESCE(d.name, e.name),
+                 CASE WHEN t.driver_id IS NOT NULL THEN 'driver' ELSE 'employee' END
+        ORDER BY times DESC, last_used DESC
+        LIMIT 1
+        "#,
+    )
+    .bind(counterparty)
+    .fetch_optional(pool.get_ref())
+    .await?;
+
+    match row {
+        Some(r) => Ok(HttpResponse::Ok().json(PartySuggestion {
+            driver_id: r.get("driver_id"),
+            employee_id: r.get("employee_id"),
+            name: r.get::<Option<String>, _>("name").unwrap_or_default(),
+            kind: r.get("kind"),
+            times: r.get("times"),
+        })),
+        None => Ok(HttpResponse::Ok().json(serde_json::Value::Null)),
+    }
+}
