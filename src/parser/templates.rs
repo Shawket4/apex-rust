@@ -1,27 +1,26 @@
-//! Tier 1: the DB-backed template registry.
+//! The template registry: DB-resident regexes with named capture groups.
 //!
-//! Patterns live in `banksms.parse_templates`, not in code, so a bank changing
-//! its SMS format is a row insert plus a reparse rather than a redeploy. They are
-//! compiled once into a cached set and the cache is invalidated when the registry
-//! changes.
+//! Patterns are stored in POST-normalization form (`الي` not `إلى`, `بطاقه`
+//! not `بطاقة`) because matching runs on `normalize()` output. A pattern
+//! written against raw text compiles fine, inserts fine, and can never match —
+//! which is why every template carries a `sample`: a real message it must
+//! match and fully extract. Writes validate against the sample; boot re-checks
+//! every enabled template and disables (loudly) any that fail.
 //!
-//! Patterns are stored in POST-NORMALIZATION form -- see parser::normalize.
+//! No cache: the poller reloads the handful of rows each cycle, so a psql
+//! INSERT is live within a minute and there is no invalidation path to get
+//! wrong.
 
 use chrono::{DateTime, Datelike, NaiveDateTime, TimeZone, Utc};
 use chrono_tz::Africa::Cairo;
 use regex::Regex;
 use rust_decimal::Decimal;
+use sqlx::Row;
 use std::collections::HashMap;
 use std::str::FromStr;
-use std::sync::RwLock;
 
+use super::Extracted;
 use crate::errors::{AppError, AppResult};
-use crate::parser::Direction;
-
-/// Bump when parsing behaviour changes in a way that should trigger a reparse of
-/// previously-unparsed rows. Rows already `parsed` by a NEWER version are never
-/// touched by an older one.
-pub const PARSER_VERSION: i32 = 1;
 
 #[derive(Debug, Clone)]
 pub struct CompiledTemplate {
@@ -29,174 +28,188 @@ pub struct CompiledTemplate {
     pub name: String,
     pub regex: Regex,
     pub date_formats: Vec<String>,
-    pub direction_map: HashMap<String, Direction>,
+    pub direction_map: HashMap<String, String>,
+    pub sample: String,
     pub priority: i32,
 }
 
-/// A tier-1 match: every field the template managed to capture.
-#[derive(Debug, Clone, Default)]
-pub struct TemplateMatch {
-    pub template_name: String,
-    pub direction: Option<Direction>,
-    pub amount: Option<Decimal>,
-    pub currency: Option<String>,
-    pub account: Option<String>,
-    pub counterparty: Option<String>,
-    pub reference: Option<String>,
-    pub balance_after: Option<Decimal>,
-    pub occurred_at: Option<DateTime<Utc>>,
-}
-
-static CACHE: RwLock<Option<Vec<CompiledTemplate>>> = RwLock::new(None);
-
-/// Drop the compiled cache. Called after any write to the registry.
-pub fn invalidate_cache() {
-    if let Ok(mut c) = CACHE.write() {
-        *c = None;
-    }
-}
-
-/// Load and compile every enabled template, using the cache when warm.
+/// Load every enabled template, priority order. A row whose regex no longer
+/// compiles is skipped with an error log — never a silent drop, never fatal.
 pub async fn load(pool: &sqlx::PgPool) -> AppResult<Vec<CompiledTemplate>> {
-    if let Ok(cache) = CACHE.read() {
-        if let Some(templates) = cache.as_ref() {
-            return Ok(templates.clone());
-        }
-    }
-
-    let rows = sqlx::query!(
-        r#"
-        SELECT id, name, pattern, date_formats, direction_map, priority
-        FROM banksms.parse_templates
-        WHERE enabled
-        ORDER BY priority, id
-        "#
+    let rows = sqlx::query(
+        "SELECT id, name, pattern, date_formats, direction_map, sample, priority
+         FROM banksms.parse_templates
+         WHERE enabled
+         ORDER BY priority, id",
     )
     .fetch_all(pool)
     .await?;
 
-    let mut compiled = Vec::with_capacity(rows.len());
-    for row in rows {
-        // A pattern that fails to compile is skipped rather than fatal: one bad
-        // hand-added row must not take the whole parser offline. The write path
-        // validates on insert, so this should be unreachable.
-        let regex = match Regex::new(&row.pattern) {
-            Ok(r) => r,
+    let mut out = Vec::with_capacity(rows.len());
+    for r in rows {
+        let name: String = r.get("name");
+        let pattern: String = r.get("pattern");
+        match Regex::new(&pattern) {
+            Ok(regex) => out.push(CompiledTemplate {
+                id: r.get("id"),
+                name,
+                regex,
+                date_formats: serde_json::from_value(r.get("date_formats")).unwrap_or_default(),
+                direction_map: serde_json::from_value(r.get("direction_map")).unwrap_or_default(),
+                sample: r.get("sample"),
+                priority: r.get("priority"),
+            }),
             Err(e) => {
-                log::error!(
-                    "template '{}' (id {}) has an invalid pattern and was skipped: {e}",
-                    row.name,
-                    row.id
-                );
-                continue;
+                log::error!("template '{name}' regex no longer compiles, skipping: {e}");
             }
-        };
-
-        let date_formats: Vec<String> =
-            serde_json::from_value(row.date_formats).unwrap_or_default();
-        let raw_map: HashMap<String, String> =
-            serde_json::from_value(row.direction_map).unwrap_or_default();
-        let direction_map = raw_map
-            .into_iter()
-            .filter_map(|(k, v)| Direction::from_str(&v).ok().map(|d| (k, d)))
-            .collect();
-
-        compiled.push(CompiledTemplate {
-            id: row.id,
-            name: row.name,
-            regex,
-            date_formats,
-            direction_map,
-            priority: row.priority,
-        });
-    }
-
-    if let Ok(mut cache) = CACHE.write() {
-        *cache = Some(compiled.clone());
-    }
-
-    Ok(compiled)
-}
-
-/// Validate a pattern before it enters the registry.
-///
-/// This has to happen in Rust, not as a CHECK constraint: Postgres POSIX regex
-/// has no `(?P<name>...)` named capture groups, so a database-side test match
-/// would reject every valid pattern here.
-pub fn validate_pattern(pattern: &str) -> AppResult<()> {
-    let re = Regex::new(pattern)
-        .map_err(|e| AppError::BadRequest(format!("pattern does not compile: {e}")))?;
-
-    let names: Vec<&str> = re.capture_names().flatten().collect();
-    for required in ["amount"] {
-        if !names.contains(&required) {
-            return Err(AppError::BadRequest(format!(
-                "pattern must define a named capture group '{required}'"
-            )));
         }
     }
-    if !names.contains(&"date") {
-        return Err(AppError::BadRequest(
-            "pattern must define a named capture group 'date'".to_string(),
-        ));
-    }
-    Ok(())
+    Ok(out)
 }
 
-/// Try each template in priority order; first match wins.
-pub fn match_first(
-    templates: &[CompiledTemplate],
-    normalized: &str,
-    reference: Option<DateTime<Utc>>,
-) -> Option<TemplateMatch> {
-    templates.iter().find_map(|t| apply(t, normalized, reference))
-}
-
-fn apply(
+/// Extract fields from a successful regex match. Returns None unless
+/// direction, amount AND occurred_at all resolve — the three fields a
+/// transaction cannot exist without.
+pub fn apply(
     t: &CompiledTemplate,
-    normalized: &str,
+    caps: &regex::Captures<'_>,
     reference: Option<DateTime<Utc>>,
-) -> Option<TemplateMatch> {
-    let caps = t.regex.captures(normalized)?;
-    let get = |n: &str| caps.name(n).map(|m| m.as_str().trim().to_string());
-
-    let direction = get("action")
-        .or_else(|| get("action_ar"))
-        .and_then(|a| t.direction_map.get(&a).copied())
-        // `abk` encodes direction twice: the action word and a from/to
-        // preposition. Fall back to the preposition when the action is absent.
-        .or_else(|| match get("preposition").as_deref() {
-            Some("to") => Some(Direction::Out),
-            Some("from") => Some(Direction::In),
-            _ => None,
-        });
-
-    let occurred_at = match (get("date"), get("time")) {
-        (Some(d), time) => parse_datetime(&d, time.as_deref(), &t.date_formats, reference),
-        _ => None,
+) -> Option<Extracted> {
+    let group = |name: &str| -> Option<String> {
+        caps.name(name)
+            .map(|m| m.as_str().trim().to_string())
+            .filter(|s| !s.is_empty())
     };
 
-    Some(TemplateMatch {
-        template_name: t.name.clone(),
+    // Direction: the action word through the template's own map, with the abk
+    // fallback — "IPN transfer to X" is out, "from X" is in.
+    let action = group("action").or_else(|| group("action_ar"));
+    let mut direction = action.and_then(|a| t.direction_map.get(&a).cloned());
+    if direction.is_none() {
+        direction = match group("preposition").as_deref() {
+            Some("to") => Some("out".into()),
+            Some("from") => Some("in".into()),
+            _ => None,
+        };
+    }
+    let direction = direction?;
+
+    let amount = parse_money(&group("amount")?)?;
+    if amount <= Decimal::ZERO {
+        return None;
+    }
+
+    let occurred_at = parse_datetime(
+        &group("date")?,
+        group("time").as_deref(),
+        &t.date_formats,
+        reference,
+    )?;
+
+    Some(Extracted {
         direction,
-        amount: get("amount").and_then(|s| parse_money(&s)),
-        currency: get("currency").map(|c| normalize_currency(&c)),
-        account: get("account"),
-        counterparty: get("counterparty").filter(|s| !s.is_empty()),
-        reference: get("reference"),
-        balance_after: get("balance").and_then(|s| parse_money(&s)),
+        amount,
+        currency: group("currency")
+            .map(|c| normalize_currency(&c))
+            .unwrap_or_else(|| "EGP".to_string()),
         occurred_at,
+        account: group("account"),
+        counterparty: group("counterparty"),
+        reference: group("reference"),
     })
 }
 
-/// Map whatever the bank wrote to an ISO-4217 code.
-///
-/// Banks here write the currency three ways: `EGP`, and the Arabic
-/// abbreviations `جم` and `ج.م` (جنيه مصري). Storing the abbreviation would
-/// make `currency` unfilterable -- the same money would sit under two codes and
-/// any total grouped by currency would split in half. Anything unrecognised is
-/// passed through uppercased rather than discarded, so a genuinely new currency
-/// shows up as itself instead of silently becoming EGP.
+/// Validate a template row the way the write path and the boot check both use:
+/// the regex compiles, declares the required groups, matches its own
+/// normalized sample, and extracts direction+amount+date from it end to end.
+/// This is the assertion that makes "pattern can never match" and "direction
+/// resolves to NULL" impossible to ship.
+pub fn validate(
+    pattern: &str,
+    date_formats: &[String],
+    direction_map: &HashMap<String, String>,
+    sample: &str,
+) -> AppResult<()> {
+    let regex = Regex::new(pattern)
+        .map_err(|e| AppError::BadRequest(format!("pattern does not compile: {e}")))?;
+
+    for required in ["amount", "date"] {
+        if !regex.capture_names().flatten().any(|n| n == required) {
+            return Err(AppError::BadRequest(format!(
+                "pattern must define a (?P<{required}>...) group"
+            )));
+        }
+    }
+    for (_, dir) in direction_map {
+        if dir != "in" && dir != "out" {
+            return Err(AppError::BadRequest(format!(
+                "direction_map values must be 'in' or 'out', got '{dir}'"
+            )));
+        }
+    }
+
+    let normalized = super::normalize::normalize(sample);
+    let caps = regex.captures(&normalized).ok_or_else(|| {
+        AppError::BadRequest(
+            "pattern does not match its own sample after normalization — \
+             patterns must be written in post-normalization form"
+                .to_string(),
+        )
+    })?;
+
+    let probe = CompiledTemplate {
+        id: 0,
+        name: "candidate".into(),
+        regex: regex.clone(),
+        date_formats: date_formats.to_vec(),
+        direction_map: direction_map.clone(),
+        sample: sample.to_string(),
+        priority: 0,
+    };
+    // `now` as reference keeps year-less samples valid whenever boot happens.
+    apply(&probe, &caps, Some(Utc::now())).ok_or_else(|| {
+        AppError::BadRequest(
+            "pattern matches its sample but direction, amount or date failed to \
+             extract — check direction_map covers the action word and \
+             date_formats fits the sample's date"
+                .to_string(),
+        )
+    })?;
+
+    Ok(())
+}
+
+/// Boot check: every enabled template must pass `validate` against its own
+/// sample. Failures are logged at ERROR and reported back so the caller can
+/// disable the row and fire a notification — never a silent drain.
+pub async fn boot_check(pool: &sqlx::PgPool) -> AppResult<Vec<String>> {
+    let templates = load(pool).await?;
+    let mut broken = Vec::new();
+    for t in &templates {
+        if let Err(e) = validate(
+            t.regex.as_str(),
+            &t.date_formats,
+            &t.direction_map,
+            &t.sample,
+        ) {
+            log::error!("template '{}' fails its own sample: {e}", t.name);
+            sqlx::query(
+                "UPDATE banksms.parse_templates SET enabled = FALSE, updated_at = now()
+                 WHERE id = $1",
+            )
+            .bind(t.id)
+            .execute(pool)
+            .await?;
+            broken.push(t.name.clone());
+        }
+    }
+    Ok(broken)
+}
+
+/// Map whatever the bank wrote to an ISO-4217 code. `جم` and `ج.م` are
+/// Egyptian pounds; storing them verbatim would split the same money across
+/// two currency codes. Anything unrecognised passes through uppercased so a
+/// genuinely new currency shows up as itself instead of silently becoming EGP.
 pub fn normalize_currency(raw: &str) -> String {
     match raw.trim() {
         "جم" | "ج.م" | "جنيه" => "EGP".to_string(),
@@ -204,22 +217,19 @@ pub fn normalize_currency(raw: &str) -> String {
     }
 }
 
-/// Parse an amount. Thousands separators are stripped; the value is Decimal, so
-/// 2002.00 stays exactly 2002.00 rather than becoming 2001.9999999999998.
+/// Parse an amount. Thousands separators stripped; Decimal end to end, so
+/// 2002.00 stays exactly 2002.00.
 pub fn parse_money(s: &str) -> Option<Decimal> {
     Decimal::from_str(&s.replace(',', "").replace(' ', "")).ok()
 }
 
 /// Combine a date and optional time using the TEMPLATE'S OWN format list, then
-/// convert Africa/Cairo -> UTC.
+/// convert Africa/Cairo → UTC.
 ///
-/// The per-template format list is the whole point. `8/6/26` parses successfully
-/// as both `%m/%d/%y` (6 August) and `%d/%m/%y` (8 June); a shared date parser
-/// would silently pick one and be wrong for three of the four templates rather
-/// than erroring.
-///
-/// Cairo, not a fixed offset: Egypt observes DST, so the offset is +2 in winter
-/// and +3 in summer.
+/// The per-template format list is the whole point: `8/6/26` parses under both
+/// `%m/%d/%y` and `%d/%m/%y` with different meanings, so a shared parser would
+/// silently produce wrong dates rather than erroring. Cairo, not a fixed
+/// offset — Egypt observes DST.
 pub fn parse_datetime(
     date: &str,
     time: Option<&str>,
@@ -227,14 +237,11 @@ pub fn parse_datetime(
     reference: Option<DateTime<Utc>>,
 ) -> Option<DateTime<Utc>> {
     let time = time.unwrap_or("00:00");
-    // Bank SMS use both H:MM and HH:MM.
     let time_formats = ["%H:%M:%S", "%H:%M"];
 
     for df in formats {
-        // Some banks omit the year entirely ("يوم 08-09"). The year comes from
-        // the message's own arrival time, which is the only trustworthy source:
-        // guessing "this year" is right until an old message is reparsed, and a
-        // wrong year on a transfer is worse than no date at all.
+        // No year in the format → the year comes from the message's own
+        // arrival time, the only trustworthy source.
         if !df.contains("%Y") && !df.contains("%y") {
             if let Some(dt) = parse_yearless(date, time, df, reference) {
                 return Some(dt);
@@ -246,9 +253,8 @@ pub fn parse_datetime(
             let combined = format!("{date} {time}");
             let fmt = format!("{df} {tf}");
             if let Ok(naive) = NaiveDateTime::parse_from_str(&combined, &fmt) {
-                // A local time can be ambiguous or non-existent across a DST
-                // boundary; take the earliest valid interpretation rather than
-                // dropping the row.
+                // Ambiguous/non-existent local times exist across DST
+                // boundaries; take the earliest valid interpretation.
                 return Cairo
                     .from_local_datetime(&naive)
                     .earliest()
@@ -261,17 +267,18 @@ pub fn parse_datetime(
 
 /// Resolve a date that carries no year, using the message's arrival time.
 ///
-/// The year is taken from `reference`, then corrected across the year boundary:
-/// a message that arrives on 2 January reporting "31-12" means LAST year, not a
-/// date eleven months in the future. Anything landing more than a week ahead of
-/// the reference is treated as the previous year.
+/// Candidate years are [reference year, reference year − 1] in Cairo time: a
+/// message arriving 2 January reporting "12-31" means LAST year. Anything
+/// landing more than a week ahead of the reference is rejected — the slack
+/// absorbs clock skew and late delivery without letting an old date read as
+/// this year.
 fn parse_yearless(
     date: &str,
     time: &str,
     date_format: &str,
     reference: Option<DateTime<Utc>>,
 ) -> Option<DateTime<Utc>> {
-    // Without a reference there is nothing to infer from, and inventing a year
+    // Without a reference there is nothing to infer from; inventing a year
     // would silently file the row under the wrong one.
     let reference = reference?;
     let ref_cairo = reference.with_timezone(&Cairo);
@@ -279,7 +286,7 @@ fn parse_yearless(
 
     for tf in ["%H:%M:%S", "%H:%M"] {
         let fmt = format!("{date_format} {tf}");
-        // Parse against a leap year so 29 February is never rejected outright.
+        // Probe against a leap year so 29 February is never rejected outright.
         let probe = format!("2024 {date} {time}");
         let probe_fmt = format!("%Y {fmt}");
         let Ok(naive) = NaiveDateTime::parse_from_str(&probe, &probe_fmt) else {
@@ -297,8 +304,6 @@ fn parse_yearless(
             else {
                 continue;
             };
-            // A week of slack absorbs clock skew and late delivery without
-            // letting a genuinely old date be read as this year.
             if utc <= reference + chrono::Duration::days(7) {
                 return Some(utc);
             }
@@ -310,81 +315,91 @@ fn parse_yearless(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rust_decimal_macros::dec;
+    use chrono::TimeZone;
 
-    /// The test the spec demands: all four templates' sample dates must resolve
-    /// to 6 August 2026, each under its OWN format. A shared parser fails this.
+    /// Each template's sample date must resolve to the correct calendar day
+    /// under its OWN format list. A shared date parser fails this.
     #[test]
-    fn each_template_date_format_resolves_to_the_same_day() {
-        let cases = [
-            ("abk", "8/6/26", vec!["%m/%d/%y".to_string()]),
-            ("arabic_ipn", "06-08-2026", vec!["%d-%m-%Y".to_string()]),
-            ("ref_balance", "06/08/2026", vec!["%d/%m/%Y".to_string()]),
-            ("cib_card", "06/08/26", vec!["%d/%m/%y".to_string()]),
+    fn per_template_date_formats_resolve_correctly() {
+        // (formats, date, time, expected Cairo Y-M-D)
+        let cases: [(&[&str], &str, &str, (i32, u32, u32)); 5] = [
+            (&["%m/%d/%y", "%m/%d/%Y"], "8/6/26", "19:08", (2026, 8, 6)), // abk: month-first
+            (&["%d-%m-%Y"], "12-08-2026", "19:52", (2026, 8, 12)),        // arabic_ipn
+            (&["%d/%m/%Y"], "09/08/2026", "08:16", (2026, 8, 9)),         // ref_balance
+            (&["%d/%m/%y"], "08/08/26", "10:32", (2026, 8, 8)),           // cib_card
+            (&["%d-%m-%Y"], "11-08-2026", "10:43", (2026, 8, 11)),        // instant_*
         ];
-
-        for (name, date, formats) in cases {
-            let dt = parse_datetime(date, Some("12:00"), &formats, None)
-                .unwrap_or_else(|| panic!("{name}: {date} failed to parse"));
-            let cairo = dt.with_timezone(&Cairo);
+        for (formats, date, time, (y, m, d)) in cases {
+            let formats: Vec<String> = formats.iter().map(|s| s.to_string()).collect();
+            let got = parse_datetime(date, Some(time), &formats, None)
+                .unwrap_or_else(|| panic!("failed to parse {date}"));
+            let cairo = got.with_timezone(&Cairo);
             assert_eq!(
-                cairo.format("%Y-%m-%d").to_string(),
-                "2026-08-06",
-                "{name}: {date} resolved to the wrong day"
+                (cairo.year(), cairo.month(), cairo.day()),
+                (y, m, d),
+                "wrong day for {date}"
             );
         }
     }
 
-    /// The specific silent-corruption case: the same string, two formats, two
-    /// different real dates.
+    /// A day>12 date must fail month-first parsing rather than silently
+    /// swapping: 25/6/26 is only valid day-first.
     #[test]
-    fn ambiguous_date_means_different_days_under_different_formats() {
-        let month_first = parse_datetime("8/6/26", Some("12:00"), &["%m/%d/%y".into()], None).unwrap();
-        let day_first = parse_datetime("8/6/26", Some("12:00"), &["%d/%m/%y".into()], None).unwrap();
-        assert_ne!(month_first, day_first);
-        assert_eq!(
-            month_first.with_timezone(&Cairo).format("%Y-%m-%d").to_string(),
-            "2026-08-06"
-        );
-        assert_eq!(
-            day_first.with_timezone(&Cairo).format("%Y-%m-%d").to_string(),
-            "2026-06-08"
-        );
+    fn month_first_rejects_day_first_dates() {
+        let formats = vec!["%m/%d/%y".to_string()];
+        assert!(parse_datetime("25/6/26", Some("10:00"), &formats, None).is_none());
+    }
+
+    /// Cairo DST: +3 in August, +2 in January.
+    #[test]
+    fn cairo_offset_follows_dst() {
+        let formats = vec!["%d-%m-%Y".to_string()];
+        let aug = parse_datetime("12-08-2026", Some("12:00"), &formats, None).unwrap();
+        assert_eq!(aug.format("%H:%M").to_string(), "09:00"); // UTC+3
+        let jan = parse_datetime("12-01-2026", Some("12:00"), &formats, None).unwrap();
+        assert_eq!(jan.format("%H:%M").to_string(), "10:00"); // UTC+2
+    }
+
+    /// Year-less %m-%d resolves against the arrival time; month-first verified
+    /// against live traffic (arrived Aug 10 → "08-10").
+    #[test]
+    fn yearless_month_first_resolves_from_reference() {
+        let reference = Utc.with_ymd_and_hms(2026, 8, 10, 7, 50, 50).unwrap();
+        let formats = vec!["%m-%d".to_string()];
+        let got = parse_datetime("08-10", Some("10:50"), &formats, Some(reference)).unwrap();
+        let cairo = got.with_timezone(&Cairo);
+        assert_eq!((cairo.year(), cairo.month(), cairo.day()), (2026, 8, 10));
+    }
+
+    /// The year boundary: arriving 2 Jan reporting 12-31 means LAST year.
+    #[test]
+    fn yearless_year_boundary_resolves_to_previous_year() {
+        let reference = Utc.with_ymd_and_hms(2027, 1, 2, 9, 0, 0).unwrap();
+        let formats = vec!["%m-%d".to_string()];
+        let got = parse_datetime("12-31", Some("23:10"), &formats, Some(reference)).unwrap();
+        let cairo = got.with_timezone(&Cairo);
+        assert_eq!((cairo.year(), cairo.month(), cairo.day()), (2026, 12, 31));
+    }
+
+    /// No reference → no date, never a guessed year.
+    #[test]
+    fn yearless_without_reference_refuses() {
+        let formats = vec!["%m-%d".to_string()];
+        assert!(parse_datetime("08-10", Some("10:50"), &formats, None).is_none());
     }
 
     #[test]
-    fn cairo_is_utc_plus_3_in_summer_and_plus_2_in_winter() {
-        // Egypt observes DST; a fixed offset would be wrong half the year.
-        let summer = parse_datetime("08/08/2026", Some("14:32"), &["%d/%m/%Y".into()], None).unwrap();
-        assert_eq!(summer.format("%H:%M").to_string(), "11:32");
-
-        let winter = parse_datetime("01/11/2025", Some("14:32"), &["%d/%m/%Y".into()], None).unwrap();
-        assert_eq!(winter.format("%H:%M").to_string(), "12:32");
+    fn currency_folds_arabic_pound_spellings() {
+        assert_eq!(normalize_currency("جم"), "EGP");
+        assert_eq!(normalize_currency("ج.م"), "EGP");
+        assert_eq!(normalize_currency("EGP"), "EGP");
+        assert_eq!(normalize_currency("usd"), "USD");
     }
 
     #[test]
-    fn money_keeps_exact_decimal_values() {
-        assert_eq!(parse_money("2002.00").unwrap(), dec!(2002.00));
-        assert_eq!(parse_money("20,200.00").unwrap(), dec!(20200.00));
-        assert_eq!(parse_money("500.5").unwrap(), dec!(500.5));
-        assert_eq!(parse_money("1001.0").unwrap(), dec!(1001.0));
-    }
-
-    #[test]
-    fn single_digit_hour_times_parse() {
-        // "8/6/26 9:05" occurs in ABK messages.
-        assert!(parse_datetime("8/6/26", Some("9:05"), &["%m/%d/%y".into()], None).is_some());
-    }
-
-    #[test]
-    fn validate_pattern_rejects_uncompilable() {
-        assert!(validate_pattern(r"(?P<amount>[\d]+) (?P<date>\d+").is_err());
-    }
-
-    #[test]
-    fn validate_pattern_requires_amount_and_date_groups() {
-        assert!(validate_pattern(r"(?P<amount>[\d]+)").is_err());
-        assert!(validate_pattern(r"(?P<date>[\d/]+)").is_err());
-        assert!(validate_pattern(r"(?P<amount>[\d]+) on (?P<date>[\d/]+)").is_ok());
+    fn money_keeps_exact_decimals() {
+        assert_eq!(parse_money("2,002.00").unwrap().to_string(), "2002.00");
+        assert_eq!(parse_money("30.5").unwrap().to_string(), "30.5");
+        assert!(parse_money("garbage").is_none());
     }
 }

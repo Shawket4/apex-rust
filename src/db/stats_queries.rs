@@ -1,7 +1,7 @@
 // db.rs - Complete with deleted_at fix and extended Watanya fees
 
-use sqlx::{PgPool, Row};
 use anyhow::Result;
+use sqlx::{PgPool, Row};
 use std::collections::HashMap;
 
 use crate::models::*;
@@ -19,7 +19,7 @@ pub async fn get_companies(
                  WHERE deleted_at IS NULL 
                  AND date BETWEEN $1 AND $2 
                  AND company = $3
-                 ORDER BY company"
+                 ORDER BY company",
             )
             .bind(start_date)
             .bind(end_date)
@@ -32,7 +32,7 @@ pub async fn get_companies(
                 "SELECT DISTINCT company FROM trips 
                  WHERE deleted_at IS NULL 
                  AND date BETWEEN $1 AND $2 
-                 ORDER BY company"
+                 ORDER BY company",
             )
             .bind(start_date)
             .bind(end_date)
@@ -44,7 +44,7 @@ pub async fn get_companies(
                 "SELECT DISTINCT company FROM trips 
                  WHERE deleted_at IS NULL 
                  AND company = $1
-                 ORDER BY company"
+                 ORDER BY company",
             )
             .bind(company)
             .fetch_all(pool)
@@ -54,13 +54,13 @@ pub async fn get_companies(
             sqlx::query_scalar(
                 "SELECT DISTINCT company FROM trips 
                  WHERE deleted_at IS NULL 
-                 ORDER BY company"
+                 ORDER BY company",
             )
             .fetch_all(pool)
             .await?
         }
     };
-    
+
     Ok(query)
 }
 
@@ -254,13 +254,9 @@ pub async fn get_taqa_stats(
             let base_revenue: f64 = row.get("base_revenue");
             let car_rental: Option<f64> = row.try_get("car_rental").ok().flatten();
             let vat: Option<f64> = row.try_get("vat").ok().flatten();
-            
+
             let total_with_vat = if has_financial_access {
-                Some(
-                    base_revenue + 
-                    car_rental.unwrap_or(0.0) + 
-                    vat.unwrap_or(0.0)
-                )
+                Some(base_revenue + car_rental.unwrap_or(0.0) + vat.unwrap_or(0.0))
             } else {
                 None
             };
@@ -361,13 +357,9 @@ pub async fn get_petromin_stats(
             let base_revenue: f64 = row.get("base_revenue");
             let car_rental: Option<f64> = row.try_get("car_rental").ok().flatten();
             let vat: Option<f64> = row.try_get("vat").ok().flatten();
-            
+
             let total_with_vat = if has_financial_access {
-                Some(
-                    base_revenue + 
-                    car_rental.unwrap_or(0.0) + 
-                    vat.unwrap_or(0.0)
-                )
+                Some(base_revenue + car_rental.unwrap_or(0.0) + vat.unwrap_or(0.0))
             } else {
                 None
             };
@@ -469,7 +461,7 @@ pub async fn get_watanya_stats(
         .map(|row| {
             let base_revenue: f64 = row.get("base_revenue");
             let vat: Option<f64> = row.try_get("vat").ok().flatten();
-            
+
             let total_with_vat = if has_financial_access {
                 Some(base_revenue + vat.unwrap_or(0.0))
             } else {
@@ -504,10 +496,16 @@ pub async fn get_route_details(
     has_financial_access: bool,
 ) -> Result<Vec<RouteRevenueStats>> {
     match company {
-        "Watanya" => get_watanya_route_details(pool, start_date, end_date, has_financial_access).await,
+        "Watanya" => {
+            get_watanya_route_details(pool, start_date, end_date, has_financial_access).await
+        }
         "TAQA" => get_taqa_route_details(pool, start_date, end_date, has_financial_access).await,
-        "Petromin" => get_petromin_route_details(pool, start_date, end_date, has_financial_access).await,
-        "Petrol Arrows" => get_petrol_arrows_route_details(pool, start_date, end_date, has_financial_access).await,
+        "Petromin" => {
+            get_petromin_route_details(pool, start_date, end_date, has_financial_access).await
+        }
+        "Petrol Arrows" => {
+            get_petrol_arrows_route_details(pool, start_date, end_date, has_financial_access).await
+        }
         _ => Ok(vec![]),
     }
 }
@@ -595,7 +593,7 @@ async fn get_watanya_route_details(
     for row in rows {
         let fee: f64 = row.try_get("fee").unwrap_or(0.0);
         let fee_int = fee as i32;
-        
+
         let car = CarStats {
             car_no_plate: row.get("car_no_plate"),
             total_trips: row.get("total_trips"),
@@ -769,7 +767,7 @@ async fn get_taqa_route_details(
 
     for row in rows {
         let terminal: String = row.get("terminal");
-        
+
         let car = CarStats {
             car_no_plate: row.get("car_no_plate"),
             total_trips: row.get("total_trips"),
@@ -782,7 +780,10 @@ async fn get_taqa_route_details(
             total_with_vat: row.try_get("total_with_vat").ok().flatten(),
         };
 
-        terminal_stats.entry(terminal).or_insert_with(Vec::new).push(car);
+        terminal_stats
+            .entry(terminal)
+            .or_insert_with(Vec::new)
+            .push(car);
     }
 
     let mut result = Vec::new();
@@ -912,7 +913,7 @@ async fn get_petromin_route_details(
 
     for row in rows {
         let terminal: String = row.get("terminal");
-        
+
         let car = CarStats {
             car_no_plate: row.get("car_no_plate"),
             total_trips: row.get("total_trips"),
@@ -925,7 +926,10 @@ async fn get_petromin_route_details(
             total_with_vat: row.try_get("total_with_vat").ok().flatten(),
         };
 
-        terminal_stats.entry(terminal).or_insert_with(Vec::new).push(car);
+        terminal_stats
+            .entry(terminal)
+            .or_insert_with(Vec::new)
+            .push(car);
     }
 
     let mut result = Vec::new();
@@ -1040,7 +1044,7 @@ async fn get_petrol_arrows_route_details(
         let drop_off_point: String = row.get("drop_off_point");
         let fee: f64 = row.try_get("fee").unwrap_or(0.0);
         let key = (terminal.clone(), drop_off_point.clone());
-        
+
         let car = CarStats {
             car_no_plate: row.get("car_no_plate"),
             total_trips: row.get("total_trips"),
@@ -1053,7 +1057,11 @@ async fn get_petrol_arrows_route_details(
             total_with_vat: row.try_get("total_with_vat").ok().flatten(),
         };
 
-        route_stats.entry(key).or_insert_with(|| (fee, Vec::new())).1.push(car);
+        route_stats
+            .entry(key)
+            .or_insert_with(|| (fee, Vec::new()))
+            .1
+            .push(car);
     }
 
     let mut result = Vec::new();
@@ -1091,7 +1099,8 @@ async fn get_petrol_arrows_route_details(
     }
 
     result.sort_by(|a, b| {
-        a.terminal.cmp(&b.terminal)
+        a.terminal
+            .cmp(&b.terminal)
             .then_with(|| a.drop_off_point.cmp(&b.drop_off_point))
     });
     Ok(result)
@@ -1324,10 +1333,10 @@ pub async fn get_stats_by_date(
         let total_volume: f64 = row.get("total_volume");
         let total_distance: f64 = row.get("total_distance");
         let total_revenue: f64 = row.get("total_revenue");
-        
+
         let company_details_json: serde_json::Value = row.get("company_details");
         let mut company_details = Vec::new();
-        
+
         if let Some(array) = company_details_json.as_array() {
             for item in array {
                 if let (Some(company), Some(trips), Some(volume), Some(distance)) = (
@@ -1336,19 +1345,34 @@ pub async fn get_stats_by_date(
                     item.get("total_volume").and_then(|v| v.as_f64()),
                     item.get("total_distance").and_then(|v| v.as_f64()),
                 ) {
-                    let revenue = item.get("total_revenue").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                    let revenue = item
+                        .get("total_revenue")
+                        .and_then(|v| v.as_f64())
+                        .unwrap_or(0.0);
                     let car_rental = item.get("car_rental").and_then(|v| v.as_f64());
                     let vat = item.get("vat").and_then(|v| v.as_f64());
-                    
+
                     company_details.push(CompanyRevenueDetails {
                         company: company.to_string(),
                         total_trips: trips,
                         total_volume: volume,
                         total_distance: distance,
-                        total_revenue: if has_financial_access { Some(revenue) } else { None },
+                        total_revenue: if has_financial_access {
+                            Some(revenue)
+                        } else {
+                            None
+                        },
                         vat: if has_financial_access { vat } else { None },
-                        car_rental: if has_financial_access { car_rental } else { None },
-                        total_with_vat: if has_financial_access { Some(revenue) } else { None },
+                        car_rental: if has_financial_access {
+                            car_rental
+                        } else {
+                            None
+                        },
+                        total_with_vat: if has_financial_access {
+                            Some(revenue)
+                        } else {
+                            None
+                        },
                     });
                 }
             }
@@ -1359,7 +1383,11 @@ pub async fn get_stats_by_date(
             total_trips,
             total_volume,
             total_distance,
-            total_revenue: if has_financial_access { Some(total_revenue) } else { None },
+            total_revenue: if has_financial_access {
+                Some(total_revenue)
+            } else {
+                None
+            },
             company_details,
         });
     }

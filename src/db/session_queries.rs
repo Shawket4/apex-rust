@@ -1,6 +1,6 @@
-use sqlx::PgPool;
-use anyhow::Result;
 use crate::models::session::*;
+use anyhow::Result;
+use sqlx::PgPool;
 
 /// Check if session exists and get driver_id for permission check
 pub async fn get_session_for_permission_check(
@@ -8,12 +8,12 @@ pub async fn get_session_for_permission_check(
     session_id: i32,
 ) -> Result<Option<SessionPermissionCheck>> {
     let session = sqlx::query_as::<_, SessionPermissionCheck>(
-        "SELECT id, driver_id FROM driver_sessions WHERE id = $1"
+        "SELECT id, driver_id FROM driver_sessions WHERE id = $1",
     )
     .bind(session_id)
     .fetch_optional(pool)
     .await?;
-    
+
     Ok(session)
 }
 
@@ -29,15 +29,15 @@ pub async fn get_session_stats_from_view(
             SELECT FROM pg_matviews 
             WHERE matviewname = 'session_location_summary'
         )
-        "#
+        "#,
     )
     .fetch_one(pool)
     .await?;
-    
+
     if !view_exists {
         return Ok(None);
     }
-    
+
     let summary = sqlx::query_as::<_, SessionLocationSummary>(
         r#"
         SELECT 
@@ -45,45 +45,41 @@ pub async fn get_session_stats_from_view(
             avg_speed, max_speed, min_lat, max_lat, min_lng, max_lng
         FROM session_location_summary
         WHERE session_id = $1
-        "#
+        "#,
     )
     .bind(session_id)
     .fetch_optional(pool)
     .await?;
-    
+
     Ok(summary)
 }
 
 /// Get total ping count (fallback when no materialized view)
 pub async fn get_ping_count(pool: &PgPool, session_id: i32) -> Result<i64> {
-    let count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM location_pings WHERE session_id = $1"
-    )
-    .bind(session_id)
-    .fetch_one(pool)
-    .await?;
-    
+    let count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM location_pings WHERE session_id = $1")
+            .bind(session_id)
+            .fetch_one(pool)
+            .await?;
+
     Ok(count)
 }
 
 /// Fetch all location pings for a session - optimized query
 /// Uses raw query for maximum performance
-pub async fn fetch_location_pings(
-    pool: &PgPool,
-    session_id: i32,
-) -> Result<Vec<LocationPingLite>> {
+pub async fn fetch_location_pings(pool: &PgPool, session_id: i32) -> Result<Vec<LocationPingLite>> {
     let pings = sqlx::query_as::<_, LocationPingLite>(
         r#"
         SELECT id, lat, lng, time_stamp, speed
         FROM location_pings
         WHERE session_id = $1
         ORDER BY time_stamp ASC
-        "#
+        "#,
     )
     .bind(session_id)
     .fetch_all(pool)
     .await?;
-    
+
     Ok(pings)
 }
 
@@ -115,6 +111,6 @@ pub async fn fetch_location_pings_downsampled(
     .bind(target_count)
     .fetch_all(pool)
     .await?;
-    
+
     Ok(pings)
 }

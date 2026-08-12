@@ -4,7 +4,9 @@
 //! the person reading it on a phone can add a note or fix a field without
 //! hunting for it:
 //!
-//!     https://apextransport.ddns.net/fleet-expenses/224/edit
+//! ```text
+//! https://apextransport.ddns.net/fleet-expenses/224/edit
+//! ```
 //!
 //! Disabled unless `NTFY_TOPIC` is set, so a deploy without the config is silent
 //! rather than noisy or broken.
@@ -156,9 +158,7 @@ pub fn notify_new_transactions(items: Vec<NewTransaction>) {
             );
             publish(
                 format!("{} new bank transactions", items.len()),
-                format!(
-                    "Total EGP {total}\nParsed from WhatsApp. Tap to review them.",
-                ),
+                format!("Total EGP {total}\nParsed from WhatsApp. Tap to review them.",),
                 "bank,receipt",
                 "default",
                 Some(url),
@@ -179,31 +179,20 @@ pub fn notify_new_transactions(items: Vec<NewTransaction>) {
     });
 }
 
-/// Announce messages that looked like bank SMS but did not fully parse.
-///
-/// Higher priority than a clean parse: these are the ones that need a human, and
-/// they are rare by design. A recurring skeleton means a bank changed its format
-/// (see ops::alarm), which is the case actually worth waking someone for.
-pub fn notify_needs_review(count: usize) {
-    if !enabled() || count == 0 {
+/// Operator alert: something needs a human (cutover pending, a template
+/// failed its own sample at boot). High priority, no deep link.
+pub async fn notify_ops(title: &str, body: &str) {
+    if !enabled() {
         return;
     }
-
-    tokio::spawn(async move {
-        let url = format!(
-            "{}/fleet-expenses/review",
-            CONFIG.dashboard_base_url.trim_end_matches('/')
-        );
-        publish(
-            format!("{count} message(s) need review"),
-            "A bank message could not be fully parsed. Tap to review and complete it."
-                .to_string(),
-            "warning,mag",
-            "high",
-            Some(url),
-        )
-        .await;
-    });
+    publish(
+        header_safe(title, 60),
+        body.to_string(),
+        "warning",
+        "high",
+        None,
+    )
+    .await;
 }
 
 #[cfg(test)]

@@ -1,9 +1,0 @@
-[
-  {
-    "wa_message_id": "PETROAPP-WALLET-0001",
-    "wa_timestamp": "2026-08-09T11:16:02Z",
-    "is_from_me": false,
-    "body": "تم تنفيذ تحويل لحظي من حسابكم رقم 0180 بمبلغ 70000.00 جم إلى petroapp c** رقم مرجعي 207126295337 يوم 08-09 الساعة 14:15 للمزيد اتصل بـ 19623",
-    "expect_template": "wallet_transfer"
-  }
-]

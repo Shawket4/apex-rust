@@ -1,0 +1,114 @@
+{
+    "id": 1,
+    "name": "arabic_ipn",
+    "notes": "Hotline 19666. Reference format FT + alphanumeric. Counterparty is partially masked.",
+    "enabled": true,
+    "pattern": "تم\\s+(?P<action_ar>خصم|اضافه|ايداع)\\s+مبلغ\\s+(?P<currency>[A-Z]{3})\\s+(?P<amount>[\\d,]+\\.\\d{2})\\s+من\\s+حساب\\s+\\**(?P<account>\\d{3,6})\\b.*?بتاريخ\\s+(?P<date>\\d{2}-\\d{2}-\\d{4})\\s+(?P<time>\\d{2}:\\d{2})\\s+الي\\s+(?P<counterparty>.+?)\\s+برقم\\s+مرجعي\\s+(?P<reference>[A-Z0-9]+)",
+    "version": 1,
+    "priority": 10,
+    "created_at": "2026-08-08T14:17:56.567138+00:00",
+    "created_by": "migration",
+    "updated_at": "2026-08-08T14:17:56.567138+00:00",
+    "date_formats": [
+        "%d-%m-%Y"
+    ],
+    "direction_map": {
+        "خصم": "out",
+        "اضافه": "in",
+        "ايداع": "in"
+    }
+}
+{
+    "id": 2,
+    "name": "cib_card",
+    "notes": "CIB debit-card withdrawal. No reference number exists in this format. Counterparty is a branch/merchant.",
+    "enabled": true,
+    "pattern": "تم\\s+(?P<action_ar>سحب|خصم)\\s+مبلغ\\s+(?P<currency>[A-Z]{3})\\s+(?P<amount>[\\d,]+\\.\\d{2})\\s+من\\s+بطاقه\\s+الخصم\\s+المباشر\\s+المنتهيه\\s+ب\\s+\\**(?P<account>\\d{4})\\s+من\\s+(?P<counterparty>.+?)\\s+في\\s+(?P<date>\\d{1,2}/\\d{1,2}/\\d{2})\\s+(?P<time>\\d{1,2}:\\d{2})\\s*،\\s*الرصيد\\s+المتاح\\s+(?:[A-Z]{3}\\s+)?(?P<balance>[\\d,]+\\.\\d{2})",
+    "version": 1,
+    "priority": 20,
+    "created_at": "2026-08-08T14:17:56.567138+00:00",
+    "created_by": "migration",
+    "updated_at": "2026-08-08T14:17:56.567138+00:00",
+    "date_formats": [
+        "%d/%m/%y"
+    ],
+    "direction_map": {
+        "خصم": "out",
+        "سحب": "out"
+    }
+}
+{
+    "id": 3,
+    "name": "abk",
+    "notes": "Hotline 19322. MONTH-FIRST dates (%m/%d/%y) -- the only template that is. Reference is the (ID ...) value.",
+    "enabled": true,
+    "pattern": "Your\\s+(?P<bank>[\\w\\-]+)\\s+account\\s+\\*(?P<account>\\d{3,6})\\s+was\\s+(?P<action>credited|debited)\\s+with\\s+(?P<currency>[A-Z]{3})\\s+(?P<amount>[\\d,]+(?:\\.\\d+)?)\\s+on\\s+(?P<date>\\d{1,2}/\\d{1,2}/\\d{2,4})\\s+(?P<time>\\d{1,2}:\\d{2})\\s+(?:with|for)\\s+IPN\\s+transfer\\s+(?P<preposition>from|to)\\s+(?P<counterparty>.+?)\\s*\\(ID\\s+(?P<reference>\\w+)\\)",
+    "version": 1,
+    "priority": 30,
+    "created_at": "2026-08-08T14:17:56.567138+00:00",
+    "created_by": "migration",
+    "updated_at": "2026-08-08T14:17:56.567138+00:00",
+    "date_formats": [
+        "%m/%d/%y",
+        "%m/%d/%Y"
+    ],
+    "direction_map": {
+        "debited": "out",
+        "credited": "in"
+    }
+}
+{
+    "id": 4,
+    "name": "ref_balance",
+    "notes": "Hotline 19555. Reference is lowercase hex. Balance drift here is how fee-exclusive amounts are detectable.",
+    "enabled": true,
+    "pattern": "Transfer\\s+reference\\s+#(?P<reference>\\w+)\\s+of\\s+(?P<currency>[A-Z]{3})\\s+(?P<amount>[\\d,]+\\.\\d{2})\\s+has\\s+been\\s+(?P<action>debited|credited)\\s+from\\s+your\\s+account\\s+(?P<account>[\\d\\-]+)\\s+through\\s+IPN\\s+on\\s+(?P<date>\\d{2}/\\d{2}/\\d{4})\\s+at\\s+(?P<time>\\d{2}:\\d{2}),\\s*your\\s+available\\s+balance\\s+is\\s+(?P<balance>[\\d,]+\\.\\d{2})",
+    "version": 1,
+    "priority": 40,
+    "created_at": "2026-08-08T14:17:56.567138+00:00",
+    "created_by": "migration",
+    "updated_at": "2026-08-08T14:17:56.567138+00:00",
+    "date_formats": [
+        "%d/%m/%Y"
+    ],
+    "direction_map": {
+        "debited": "out",
+        "credited": "in"
+    }
+}
+{
+    "id": 5,
+    "name": "instant_transfer",
+    "notes": "Hotline 19666. Currency written as جم. No counterparty. Reference precedes the date.",
+    "enabled": true,
+    "pattern": "تم\\s+تنفيذ\\s+تحويل\\s+(?P<action_ar>لحظي)\\s+بمبلغ\\s+(?P<amount>[\\d,]+\\.\\d{2})\\s+(?P<currency>جم|ج\\.م|[A-Z]{3})\\s+من\\s+حسابك\\s+المنتهي\\s+ب\\s*\\**(?P<account>\\d{3,6})\\b.*?برقم\\s+مرجعي\\s+(?P<reference>[A-Za-z0-9]+)\\s+بتاريخ\\s+(?P<date>\\d{2}-\\d{2}-\\d{4})\\s+(?P<time>\\d{2}:\\d{2})",
+    "version": 1,
+    "priority": 15,
+    "created_at": "2026-08-09T14:23:29.625811+00:00",
+    "created_by": "migration",
+    "updated_at": "2026-08-09T14:23:29.625811+00:00",
+    "date_formats": [
+        "%d-%m-%Y"
+    ],
+    "direction_map": {
+        "لحظي": "out"
+    }
+}
+{
+    "id": 6,
+    "name": "wallet_transfer",
+    "notes": "Hotline 19623. Year-less date resolved from the message timestamp. Usually PetroApp, which is suppressed.",
+    "enabled": true,
+    "pattern": "تم\\s+تنفيذ\\s+تحويل\\s+(?P<action_ar>لحظي)\\s+من\\s+حسابكم\\s+رقم\\s+\\**(?P<account>\\d{3,6})\\s+بمبلغ\\s+(?P<amount>[\\d,]+\\.\\d{2})\\s+(?P<currency>جم|ج\\.م|[A-Z]{3})\\s+الي\\s+(?P<counterparty>.+?)\\s+رقم\\s+مرجعي\\s+(?P<reference>[A-Za-z0-9]+)\\s+يوم\\s+(?P<date>\\d{2}-\\d{2})\\s+الساعه\\s+(?P<time>\\d{1,2}:\\d{2})",
+    "version": 1,
+    "priority": 16,
+    "created_at": "2026-08-11T21:57:23.766345+00:00",
+    "created_by": "migration",
+    "updated_at": "2026-08-11T21:57:23.766345+00:00",
+    "date_formats": [
+        "%m-%d"
+    ],
+    "direction_map": {
+        "لحظي": "out"
+    }
+}

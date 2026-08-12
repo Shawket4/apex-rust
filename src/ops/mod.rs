@@ -1,6 +1,3 @@
-//! Operational surface: counters, the unmatched-format alarm, and metrics
-//! exposition.
+//! Operational surface: ntfy push notifications.
 
-pub mod alarm;
-pub mod metrics;
 pub mod notify;
