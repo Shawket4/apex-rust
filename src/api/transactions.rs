@@ -69,6 +69,7 @@ pub struct ListQuery {
     pub to: Option<DateTime<Utc>>,
     pub category: Option<String>,
     pub company: Option<String>,
+    pub direction: Option<String>,
     pub payment_method: Option<String>,
     pub q: Option<String>,
     pub source: Option<String>,
@@ -97,12 +98,14 @@ impl ListQuery {
         flag(&self.include_fuel, true)
             && self.source.is_none()
             && self.category.as_deref().map_or(true, |c| c == "Fuel")
+            && self.direction.as_deref().map_or(true, |d| d == "out")
     }
     fn wants_loans(&self) -> bool {
         flag(&self.include_loans, true)
             && self.source.is_none()
             && self.category.as_deref().map_or(true, |c| c == "Loan")
             && self.company.is_none()
+            && self.direction.as_deref().map_or(true, |d| d == "out")
     }
 }
 
@@ -143,6 +146,9 @@ fn push_union<'a>(qb: &mut QueryBuilder<'a, Postgres>, f: &'a ListQuery) {
     if let Some(s) = &f.source {
         qb.push(" AND t.source = ").push_bind(s);
     }
+    if let Some(d) = &f.direction {
+        qb.push(" AND t.direction = ").push_bind(d);
+    }
     if let Some(q) = &f.q {
         qb.push(" AND (t.counterparty ILIKE '%' || ")
             .push_bind(q)
@@ -156,8 +162,11 @@ fn push_union<'a>(qb: &mut QueryBuilder<'a, Postgres>, f: &'a ListQuery) {
     }
 
     if f.wants_fuel() {
-        // Mapping mirrors the legacy costs view exactly so historical numbers
-        // keep matching: driver as counterparty, transporter as company.
+        // Mapping mirrors the legacy costs view: driver as counterparty,
+        // transporter as company. PetroApp-synced rows ONLY
+        // (petroapp_bill_id): a manually entered fuel event is paid through
+        // the bank, so its money already arrives as a bank SMS — blending
+        // both would count the same money twice.
         qb.push(
             " UNION ALL SELECT (fe.id + 1000000000000)::bigint, 'fuel_event', NULL::bigint, FALSE, \
              'out', COALESCE(fe.price, 0)::numeric, 'EGP', \
@@ -168,7 +177,8 @@ fn push_union<'a>(qb: &mut QueryBuilder<'a, Postgres>, f: &'a ListQuery) {
              NULL::bigint, fe.driver_name, 1, NULL, NULL, NULL::timestamptz, \
              fe.created_at AT TIME ZONE 'UTC', fe.updated_at AT TIME ZONE 'UTC' \
              FROM public.fuel_events fe \
-             WHERE fe.deleted_at IS NULL AND fe.date IS NOT NULL AND fe.created_at IS NOT NULL",
+             WHERE fe.deleted_at IS NULL AND fe.date IS NOT NULL AND fe.created_at IS NOT NULL \
+             AND fe.petroapp_bill_id IS NOT NULL",
         );
         if let Some(from) = &f.from {
             qb.push(" AND (fe.date::date::timestamp AT TIME ZONE 'Africa/Cairo') >= ")
@@ -383,8 +393,6 @@ pub async fn list(
 struct DateBucket {
     date: String,
     out: Decimal,
-    #[serde(rename = "in")]
-    inflow: Decimal,
     count: i64,
 }
 
@@ -407,13 +415,20 @@ struct PartyBucket {
     count: i64,
 }
 
+/// Incoming money awaiting a human verdict (switch to cash-out, or ignore).
+/// It is a badge, not an analytic — the ledger measures spending only.
+#[derive(Debug, Serialize)]
+struct PendingIn {
+    count: i64,
+    total: Decimal,
+}
+
 #[derive(Debug, Serialize)]
 struct Statistics {
     count: i64,
-    total_in: Decimal,
     total_out: Decimal,
-    net: Decimal,
     total_fees: Decimal,
+    pending_in: PendingIn,
     by_date: Vec<DateBucket>,
     by_category: Vec<CategoryBucket>,
     by_party: Vec<PartyBucket>,
@@ -423,7 +438,11 @@ pub async fn statistics(
     pool: web::Data<PgPool>,
     query: web::Query<ListQuery>,
 ) -> AppResult<HttpResponse> {
-    let f = query.into_inner();
+    let mut f = query.into_inner();
+    // Analytics are cash-out only, by construction: incoming transfers are
+    // not spending, so they never enter a total or a chart. They surface
+    // solely as the pending_in badge below.
+    f.direction = Some("out".to_string());
 
     // Totals + per-day + per-category in one pass over the union.
     let mut qb: QueryBuilder<Postgres> = QueryBuilder::new(
@@ -433,7 +452,6 @@ pub async fn statistics(
     push_union(&mut qb, &f);
     let rows = qb.build().fetch_all(pool.get_ref()).await?;
 
-    let mut total_in = Decimal::ZERO;
     let mut total_out = Decimal::ZERO;
     let mut total_fees = Decimal::ZERO;
     let mut by_date: HashMap<String, DateBucket> = HashMap::new();
@@ -442,40 +460,51 @@ pub async fn statistics(
     for r in &rows {
         let day: String = r.get("cairo_day");
         let category: Option<String> = r.get("category");
-        let direction: String = r.get("direction");
         let amount: Decimal = r.get("amount");
         let source: String = r.get("source");
 
         let d = by_date.entry(day.clone()).or_insert_with(|| DateBucket {
             date: day,
             out: Decimal::ZERO,
-            inflow: Decimal::ZERO,
             count: 0,
         });
         d.count += 1;
-        if direction == "in" {
-            d.inflow += amount;
-            total_in += amount;
-        } else {
-            d.out += amount;
-            total_out += amount;
-            let c = by_cat
-                .entry(category.clone())
-                .or_insert_with(|| CategoryBucket {
-                    key: category.clone(),
-                    label: None,
-                    label_ar: None,
-                    out: Decimal::ZERO,
-                    count: 0,
-                });
-            c.out += amount;
-            c.count += 1;
-        }
+        d.out += amount;
+        total_out += amount;
+        let c = by_cat
+            .entry(category.clone())
+            .or_insert_with(|| CategoryBucket {
+                key: category.clone(),
+                label: None,
+                label_ar: None,
+                out: Decimal::ZERO,
+                count: 0,
+            });
+        c.out += amount;
+        c.count += 1;
         if matches!(source.as_str(), "whatsapp" | "import" | "manual") {
             let (_, fee) = derive_fee(amount);
             total_fees += fee;
         }
     }
+
+    // The badge: live incoming rows in range, awaiting switch-or-ignore.
+    let mut qb: QueryBuilder<Postgres> = QueryBuilder::new(
+        "SELECT COUNT(*) AS c, COALESCE(SUM(amount), 0)::numeric AS s \
+         FROM banksms.transactions \
+         WHERE deleted_at IS NULL AND direction = 'in'",
+    );
+    if let Some(from) = &f.from {
+        qb.push(" AND occurred_at >= ").push_bind(from);
+    }
+    if let Some(to) = &f.to {
+        qb.push(" AND occurred_at <= ").push_bind(to);
+    }
+    let pending_row = qb.build().fetch_one(pool.get_ref()).await?;
+    let pending_in = PendingIn {
+        count: pending_row.get("c"),
+        total: pending_row.get("s"),
+    };
 
     // Labels for the category buckets.
     let cats = sqlx::query("SELECT key, label, label_ar FROM banksms.categories")
@@ -527,10 +556,9 @@ pub async fn statistics(
 
     Ok(HttpResponse::Ok().json(Statistics {
         count: rows.len() as i64,
-        total_in,
         total_out,
-        net: total_in - total_out,
         total_fees,
+        pending_in,
         by_date,
         by_category,
         by_party,
