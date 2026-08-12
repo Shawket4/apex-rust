@@ -1,3 +1,6 @@
+use crate::auth::claims::Claims;
+use crate::auth::permissions::AuthContext;
+use crate::config::CONFIG;
 use actix_web::{
     dev::{forward_ready, Service, ServiceRequest, ServiceResponse, Transform},
     Error, HttpMessage,
@@ -5,9 +8,6 @@ use actix_web::{
 use futures_util::future::LocalBoxFuture;
 use jsonwebtoken::{decode, DecodingKey, Validation};
 use std::future::{ready, Ready};
-use crate::config::CONFIG;
-use crate::auth::claims::Claims;
-use crate::auth::permissions::AuthContext;
 
 /// Validation rules, derived from what FalconGo actually emits.
 ///
@@ -29,8 +29,6 @@ fn validation() -> Validation {
     v.validate_aud = false;
     v
 }
-
-
 
 pub struct JwtAuth {
     pub required_permission: Option<i32>,
@@ -98,7 +96,7 @@ where
         }
 
         let token = token.unwrap();
-        
+
         let token_data = decode::<Claims>(
             &token,
             &DecodingKey::from_secret(CONFIG.jwt_secret.as_bytes()),
@@ -113,9 +111,7 @@ where
                 // Handler will determine what data to show based on permission level
                 if !claims.is_admin() {
                     return Box::pin(async move {
-                        Err(actix_web::error::ErrorForbidden(
-                            "Admin access required"
-                        ))
+                        Err(actix_web::error::ErrorForbidden("Admin access required"))
                     });
                 }
 
@@ -137,10 +133,10 @@ where
                 })
             }
             Err(err) => Box::pin(async move {
-                crate::ops::metrics::incr(&crate::ops::metrics::AUTH_FAILURES, 1);
-                Err(actix_web::error::ErrorUnauthorized(
-                    format!("Invalid token: {}", err)
-                ))
+                Err(actix_web::error::ErrorUnauthorized(format!(
+                    "Invalid token: {}",
+                    err
+                )))
             }),
         }
     }

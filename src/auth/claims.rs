@@ -13,11 +13,11 @@ impl Claims {
     pub fn is_admin(&self) -> bool {
         self.user_type == "admin_user"
     }
-    
+
     pub fn is_driver(&self) -> bool {
         self.user_type == "driver"
     }
-    
+
     pub fn has_permission(&self, required: i32, user_permission: i32) -> bool {
         self.is_admin() && user_permission >= required
     }

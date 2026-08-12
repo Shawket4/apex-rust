@@ -1,456 +1,347 @@
-//! Background ingestion poller.
+//! The poller: the ONE ingest path.
 //!
-//! Runs as an independent tokio task, decoupled from the HTTP server: parsing
-//! and serving never block ingestion, and ingestion never blocks a request.
+//! Every message enters through `process_batch` — the poller, the backfill CLI
+//! and the reparse sweep all share it. Store raw first (verbatim), verdict from
+//! the parser, transaction inserted in the same per-page transaction. The
+//! cursor advances once per cycle, after all pages commit (see `cursor.rs` for
+//! why that ordering is the whole silent-skip fix).
 //!
-//! Invariants this module exists to protect:
-//!   * A crash mid-batch REPLAYS, never skips. Batch insert and cursor advance
-//!     happen in one transaction.
-//!   * Two instances cannot double-poll. Each cycle holds a Postgres advisory
-//!     lock.
-//!   * Re-reading is free. `ON CONFLICT (wa_message_id) DO NOTHING` plus the
-//!     overlap window means late-delivered messages get picked up without
-//!     duplicating anything.
-//!   * Nothing is dropped. Every fetched message is stored verbatim before any
-//!     parsing is attempted.
+//! There is no webhook. At 3-8 bank SMS per day, a 60-second poll is the
+//! latency floor anyone can perceive, and the poller is the delivery
+//! *guarantee*; the old webhook was 216 lines buying less than a minute.
 
 use chrono::{DateTime, Utc};
-use log::{debug, error, info, warn};
+use log::{error, info, warn};
+use sqlx::{PgPool, Row};
 use std::time::Duration;
 
+use super::cursor;
+use super::whatsapp_client::{WaMessage, WhatsAppClient, MAX_PAGE_LIMIT};
 use crate::config::CONFIG;
-use crate::errors::{AppError, AppResult};
-use crate::ingest::cursor::{self, Cursor};
-use crate::ingest::whatsapp_client::{WaMessage, WhatsAppClient, MAX_PAGE_LIMIT};
-use crate::parser::worker;
+use crate::errors::AppResult;
+use crate::ops::notify::{self, NewTransaction};
+use crate::parser::{self, templates::CompiledTemplate, Verdict};
 
-/// Advisory-lock key for the poll cycle. Arbitrary but must stay stable: changing
-/// it would let an old and a new build poll concurrently during a deploy.
-const POLL_LOCK_KEY: i64 = 0x62_61_6E_6B_73_6D_73; // "banksms" in hex bytes
+/// Hard ceiling on pages per cycle; a runaway loop stops here and the next
+/// cycle continues from wherever the cursor still points.
+const MAX_PAGES_PER_CYCLE: u32 = 200;
 
-#[derive(Debug, Default)]
-pub struct PollOutcome {
-    pub fetched: usize,
-    pub inserted: usize,
-    pub pages: usize,
-    /// False when another instance held the lock, so this cycle did nothing.
-    pub ran: bool,
+/// One new transaction created by an ingest pass, for notifications.
+pub struct Created {
+    pub txn: NewTransaction,
 }
 
-/// Insert a batch of raw messages, skipping ones already stored.
+/// Insert a batch of messages and their verdicts, one DB transaction.
 ///
-/// Returns the number of genuinely new rows. Bodies are stored verbatim --
-/// normalization happens on a copy at parse time, so the original is always
-/// recoverable.
-async fn insert_batch(
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+/// Returns the transactions actually created (only for raws that were NEW —
+/// a message seen before is never re-parsed here, so human edits and
+/// promotions are never disturbed).
+pub async fn process_batch(
+    pool: &PgPool,
+    templates: &[CompiledTemplate],
     messages: &[WaMessage],
-) -> AppResult<usize> {
+) -> AppResult<Vec<Created>> {
     if messages.is_empty() {
-        return Ok(0);
+        return Ok(Vec::new());
     }
 
-    // UNNEST rather than a loop: one round-trip per batch instead of per message.
-    let ids: Vec<String> = messages.iter().map(|m| m.id.clone()).collect();
-    let chat_jids: Vec<String> = messages.iter().map(|m| m.chat_jid.clone()).collect();
-    let senders: Vec<Option<String>> = messages.iter().map(|m| m.sender_jid.clone()).collect();
-    let from_me: Vec<bool> = messages.iter().map(|m| m.is_from_me).collect();
-    let timestamps: Vec<DateTime<Utc>> = messages.iter().map(|m| m.timestamp).collect();
-    let bodies: Vec<String> = messages.iter().map(|m| m.content.clone()).collect();
-
-    let inserted = sqlx::query!(
-        r#"
-        INSERT INTO banksms.raw_messages
-            (wa_message_id, chat_jid, sender, is_from_me, wa_timestamp, body)
-        SELECT * FROM UNNEST(
-            $1::text[], $2::text[], $3::text[], $4::bool[], $5::timestamptz[], $6::text[]
-        )
-        ON CONFLICT (wa_message_id) DO NOTHING
-        "#,
-        &ids,
-        &chat_jids,
-        &senders as &[Option<String>],
-        &from_me,
-        &timestamps,
-        &bodies
-    )
-    .execute(&mut **tx)
-    .await?
-    .rows_affected();
-
-    Ok(inserted as usize)
-}
-
-/// Store messages and parse them. The single entry point used by BOTH the
-/// poller and the webhook receiver, so there is exactly one way a message enters
-/// the system and one place for that behaviour to be wrong.
-pub async fn ingest_messages(pool: &sqlx::PgPool, messages: &[WaMessage]) -> AppResult<usize> {
-    if messages.is_empty() {
-        return Ok(0);
-    }
+    // Verdict per message, computed up front (pure CPU, no I/O).
+    let verdicts: Vec<Verdict> = messages
+        .iter()
+        .map(|m| parser::parse(&m.content, templates, Some(m.timestamp)))
+        .collect();
 
     let mut tx = pool.begin().await?;
-    let inserted = insert_batch(&mut tx, messages).await?;
-    tx.commit().await?;
 
-    // Parse only when something new landed. A duplicate push must not trigger a
-    // parse sweep.
-    if inserted > 0 {
-        drain_pending(pool).await;
-    }
+    // Batch-insert raws via UNNEST; RETURNING tells us which were genuinely new.
+    let ids: Vec<&str> = messages.iter().map(|m| m.id.as_str()).collect();
+    let chat_jids: Vec<&str> = messages.iter().map(|m| m.chat_jid.as_str()).collect();
+    let senders: Vec<Option<&str>> = messages.iter().map(|m| m.sender_jid.as_deref()).collect();
+    let from_me: Vec<bool> = messages.iter().map(|m| m.is_from_me).collect();
+    let timestamps: Vec<DateTime<Utc>> = messages.iter().map(|m| m.timestamp).collect();
+    let bodies: Vec<&str> = messages.iter().map(|m| m.content.as_str()).collect();
+    let media: Vec<Option<&str>> = messages.iter().map(|m| m.media_type.as_deref()).collect();
+    let statuses: Vec<&str> = verdicts.iter().map(|v| v.status()).collect();
+    let templates_used: Vec<Option<&str>> = verdicts.iter().map(|v| v.template()).collect();
 
-    Ok(inserted)
-}
+    let inserted = sqlx::query(
+        r#"
+        INSERT INTO banksms.raw_messages
+            (wa_message_id, chat_jid, sender, is_from_me, wa_timestamp, body,
+             media_type, status, template)
+        SELECT * FROM UNNEST(
+            $1::text[], $2::text[], $3::text[], $4::boolean[], $5::timestamptz[],
+            $6::text[], $7::text[], $8::text[], $9::text[])
+        ON CONFLICT (wa_message_id) DO NOTHING
+        RETURNING id, wa_message_id
+        "#,
+    )
+    .bind(&ids)
+    .bind(&chat_jids)
+    .bind(&senders)
+    .bind(&from_me)
+    .bind(&timestamps)
+    .bind(&bodies)
+    .bind(&media)
+    .bind(&statuses)
+    .bind(&templates_used)
+    .fetch_all(&mut *tx)
+    .await?;
 
-/// One poll cycle: fetch everything at or after the cursor (minus the overlap
-/// window), store it, advance the cursor.
-///
-/// Returns `ran: false` if another instance held the advisory lock.
-pub async fn poll_once(pool: &sqlx::PgPool, client: &WhatsAppClient) -> AppResult<PollOutcome> {
-    let chat_jid = CONFIG.target_chat_jid.clone();
-    if chat_jid.is_empty() {
-        return Err(AppError::Internal(
-            "TARGET_CHAT_JID is not configured".to_string(),
-        ));
-    }
-
-    // The advisory lock is session-scoped, so it must be taken and released on
-    // one connection that stays checked out for the whole cycle.
-    let mut conn = pool.acquire().await?;
-
-    let got_lock: bool = sqlx::query_scalar!("SELECT pg_try_advisory_lock($1)", POLL_LOCK_KEY)
-        .fetch_one(&mut *conn)
-        .await?
-        .unwrap_or(false);
-
-    if !got_lock {
-        debug!("poll skipped: another instance holds the ingest lock");
-        crate::ops::metrics::incr(&crate::ops::metrics::POLL_SKIPPED_LOCKED, 1);
-        return Ok(PollOutcome {
-            ran: false,
-            ..Default::default()
-        });
-    }
-
-    // Always release, including on the error paths below.
-    let result = poll_locked(pool, client, &chat_jid).await;
-
-    if let Err(e) = sqlx::query_scalar!("SELECT pg_advisory_unlock($1)", POLL_LOCK_KEY)
-        .fetch_one(&mut *conn)
-        .await
-    {
-        // Not fatal: the lock dies with the session anyway.
-        warn!("failed to release ingest advisory lock: {e}");
-    }
-
-    result
-}
-
-async fn poll_locked(
-    pool: &sqlx::PgPool,
-    client: &WhatsAppClient,
-    chat_jid: &str,
-) -> AppResult<PollOutcome> {
-    let cur: Cursor = cursor::load(pool).await?;
-    let start_time = cur.poll_from();
-
-    let mut outcome = PollOutcome {
-        ran: true,
-        ..Default::default()
-    };
-    let mut offset: u32 = 0;
-
-    // The newest message seen anywhere in this cycle. The cursor is advanced to
-    // this ONCE, after every page has been committed -- never per page.
-    //
-    // This matters because the API returns newest-first and we page downwards
-    // into older messages. Advancing per page would push the cursor to the newest
-    // message while pages of OLDER messages were still unfetched; a crash at that
-    // point would leave the cursor in the future and those older messages would
-    // never be read again. That is a silent skip, which is the one failure mode
-    // this poller must not have.
-    //
-    // Advancing at the end instead means a crash mid-cycle leaves the cursor
-    // untouched, so the next cycle re-reads the whole range. Re-reading is free
-    // (ON CONFLICT DO NOTHING on wa_message_id), so replay is strictly preferable
-    // to any risk of skipping.
-    let mut newest_seen: Option<(DateTime<Utc>, String)> = None;
-
-    loop {
-        let batch = client
-            .list_messages(chat_jid, start_time, MAX_PAGE_LIMIT, offset)
+    let mut created = Vec::new();
+    for row in &inserted {
+        let raw_id: i64 = row.get("id");
+        let wa_id: &str = row.get("wa_message_id");
+        let idx = messages.iter().position(|m| m.id == wa_id).unwrap();
+        if let Verdict::Matched { template, fields } = &verdicts[idx] {
+            let txn = sqlx::query(
+                r#"
+                INSERT INTO banksms.transactions
+                    (source, raw_message_id, direction, amount, currency, occurred_at,
+                     account, counterparty, reference, created_by)
+                VALUES ('whatsapp', $1, $2, $3, $4, $5, $6, $7, $8, 'parser')
+                ON CONFLICT (raw_message_id) DO NOTHING
+                RETURNING id
+                "#,
+            )
+            .bind(raw_id)
+            .bind(&fields.direction)
+            .bind(fields.amount)
+            .bind(&fields.currency)
+            .bind(fields.occurred_at)
+            .bind(&fields.account)
+            .bind(&fields.counterparty)
+            .bind(&fields.reference)
+            .fetch_optional(&mut *tx)
             .await?;
 
-        if batch.is_empty() {
+            if let Some(t) = txn {
+                created.push(Created {
+                    txn: NewTransaction {
+                        id: t.get("id"),
+                        amount: Some(fields.amount),
+                        currency: Some(fields.currency.clone()),
+                        direction: Some(fields.direction.clone()),
+                        counterparty: fields.counterparty.clone(),
+                        account: fields.account.clone(),
+                        reference: fields.reference.clone(),
+                        template: Some(template.clone()),
+                    },
+                });
+            }
+        }
+    }
+
+    tx.commit().await?;
+    Ok(created)
+}
+
+/// One poll cycle: page from `cursor − overlap` until a short page, insert
+/// every page, then advance the cursor once.
+pub async fn poll_once(pool: &PgPool, client: &WhatsAppClient) -> AppResult<Vec<Created>> {
+    let chat_jid = &CONFIG.target_chat_jid;
+    let templates = parser::templates::load(pool).await?;
+
+    let cur = cursor::load(pool).await?;
+    let start_time = cur.poll_from();
+
+    let mut newest: Option<(DateTime<Utc>, String)> = None;
+    let mut all_created = Vec::new();
+    let mut offset = 0u32;
+    let mut pages = 0u32;
+
+    loop {
+        let page = client
+            .list_messages(chat_jid, start_time, MAX_PAGE_LIMIT, offset)
+            .await?;
+        let n = page.len() as u32;
+        if n == 0 {
             break;
         }
 
-        outcome.fetched += batch.len();
-        outcome.pages += 1;
-
-        // Defensive: the endpoint is already chat-scoped, but never let a message
-        // from another chat into the store on the strength of that assumption.
-        let batch: Vec<WaMessage> = batch
+        // Defensive: the API is filtered by path, but a message from another
+        // chat must never enter this table.
+        let page: Vec<WaMessage> = page
             .into_iter()
-            .filter(|m| m.chat_jid == chat_jid)
+            .filter(|m| &m.chat_jid == chat_jid)
             .collect();
 
-        if let Some(page_newest) = batch.iter().max_by_key(|m| (m.timestamp, m.id.clone())) {
-            let candidate = (page_newest.timestamp, page_newest.id.clone());
-            newest_seen = match newest_seen {
-                Some(current) if current >= candidate => Some(current),
-                _ => Some(candidate),
-            };
+        for m in &page {
+            match &newest {
+                Some((ts, _)) if *ts >= m.timestamp => {}
+                _ => newest = Some((m.timestamp, m.id.clone())),
+            }
         }
 
-        let mut tx = pool.begin().await?;
-        let inserted = insert_batch(&mut tx, &batch).await?;
-        tx.commit().await?;
+        all_created.extend(process_batch(pool, &templates, &page).await?);
 
-        outcome.inserted += inserted;
-
-        // `pagination.total` from the API is the chat's unfiltered total, so it
-        // cannot tell us whether more pages match `start_time`. Page until short.
-        if batch.len() < MAX_PAGE_LIMIT as usize {
+        pages += 1;
+        if n < MAX_PAGE_LIMIT || pages >= MAX_PAGES_PER_CYCLE {
+            if pages >= MAX_PAGES_PER_CYCLE {
+                warn!(
+                    "poll cycle hit the {MAX_PAGES_PER_CYCLE}-page ceiling; continuing next cycle"
+                );
+            }
             break;
         }
         offset += MAX_PAGE_LIMIT;
-
-        // Safety valve. A cursor that never advances plus an API that keeps
-        // returning full pages would otherwise spin forever.
-        if outcome.pages >= 200 {
-            warn!(
-                "poll stopped at {} pages ({} fetched); will continue next cycle",
-                outcome.pages, outcome.fetched
-            );
-            break;
-        }
     }
 
-    // Every page is now durably stored, so it is safe to declare the range read.
-    match newest_seen {
-        Some((ts, id)) => {
-            let mut tx = pool.begin().await?;
-            cursor::advance(&mut tx, chat_jid, ts, &id).await?;
-            tx.commit().await?;
-        }
-        // Nothing fetched at all: still record the poll so ingest-status can tell
-        // "healthy but quiet" from "stalled".
-        None => cursor::touch_poll(pool).await?,
+    // The cursor advances only now, after every page above has committed.
+    match &newest {
+        Some((ts, id)) => cursor::advance(pool, chat_jid, *ts, id).await?,
+        None => cursor::touch_poll(pool, chat_jid).await?,
     }
 
-    Ok(outcome)
+    Ok(all_created)
 }
 
-/// Long-running poll loop. Spawn once at startup.
-///
-/// Backoff is exponential with jitter and capped. The jitter matters: without it
-/// two instances that error at the same moment retry in lockstep forever.
-pub async fn run(pool: sqlx::PgPool, client: WhatsAppClient) {
+/// The forever loop. Exponential backoff with full jitter on errors.
+pub async fn run(pool: PgPool, client: WhatsAppClient) {
     if CONFIG.target_chat_jid.is_empty() {
-        warn!("ingest disabled: TARGET_CHAT_JID is not set");
+        warn!("TARGET_CHAT_JID is empty — poller not started");
         return;
     }
-
     info!(
-        "ingest poller started (chat={}, interval={}s, overlap={}s)",
+        "poller started: chat={} every {}s, overlap {}s",
         CONFIG.target_chat_jid, CONFIG.poll_interval_secs, CONFIG.overlap_window_secs
     );
 
-    // Drain anything already sitting at `pending` before the first poll. Without
-    // this, messages ingested by `backfill` (or by a build that had no parse
-    // step) would stay unparsed forever -- the poller only ever parsed what it
-    // had just fetched itself.
-    drain_pending(&pool).await;
-
-    let mut consecutive_failures: u32 = 0;
-
+    let mut consecutive_failures = 0u32;
     loop {
         match poll_once(&pool, &client).await {
-            Ok(outcome) => {
+            Ok(created) => {
                 consecutive_failures = 0;
-                crate::ops::metrics::incr(&crate::ops::metrics::POLL_CYCLES, 1);
-                crate::ops::metrics::incr(
-                    &crate::ops::metrics::MESSAGES_INGESTED,
-                    outcome.inserted as u64,
-                );
-                if outcome.inserted > 0 {
-                    info!(
-                        "ingest: {} new of {} fetched across {} page(s)",
-                        outcome.inserted, outcome.fetched, outcome.pages
-                    );
-
-                    // Parse what was just stored. Deliberately after the ingest
-                    // transaction committed: a parser failure must never be able
-                    // to roll back or delay an ingest.
-                    if let Err(e) =
-                        crate::parser::worker::run(&pool, crate::parser::worker::Scope::Pending, 50_000)
-                            .await
-                    {
-                        error!("parse run failed (messages are stored and will retry): {e}");
-                        crate::ops::metrics::incr(&crate::ops::metrics::PARSE_ERRORS, 1);
-                    }
-
-                    // A bank changing its SMS format is the one thing worth
-                    // paging for, so check after every batch that produced work.
-                    if let Err(e) = crate::ops::alarm::check(
-                        &pool,
-                        crate::ops::alarm::DEFAULT_ALARM_THRESHOLD,
-                    )
-                    .await
-                    {
-                        warn!("alarm check failed: {e}");
-                    }
-                } else if outcome.ran {
-                    debug!("ingest: nothing new ({} fetched)", outcome.fetched);
+                if !created.is_empty() {
+                    info!("poll cycle created {} transaction(s)", created.len());
+                    let txns: Vec<NewTransaction> = created.into_iter().map(|c| c.txn).collect();
+                    notify::notify_new_transactions(txns);
                 }
-                // Drain on EVERY cycle, not only when this poll inserted
-                // something. Messages can reach `pending` without an insert --
-                // a backfill, an operator re-queueing a row, or a reclassify --
-                // and previously those sat unparsed until some unrelated message
-                // happened to arrive. On a quiet chat that is indefinitely.
-                // The query is bounded and `pending` is normally empty, so the
-                // cost of doing this unconditionally is a no-op scan.
-                drain_pending(&pool).await;
-
                 tokio::time::sleep(Duration::from_secs(CONFIG.poll_interval_secs)).await;
             }
             Err(e) => {
-                consecutive_failures = consecutive_failures.saturating_add(1);
-                crate::ops::metrics::incr(&crate::ops::metrics::POLL_ERRORS, 1);
-                error!("ingest poll failed (attempt {consecutive_failures}): {e}");
-
-                if let Err(log_err) = cursor::record_error(&pool, &e.to_string()).await {
-                    error!("could not record ingest error: {log_err}");
-                }
-
-                let delay = backoff_delay(consecutive_failures, CONFIG.poll_interval_secs);
-                warn!("backing off {delay:?} before next poll");
-                tokio::time::sleep(delay).await;
+                consecutive_failures += 1;
+                error!("poll cycle failed ({consecutive_failures} in a row): {e}");
+                let _ = cursor::record_error(&pool, &CONFIG.target_chat_jid, &e.to_string()).await;
+                tokio::time::sleep(backoff_delay(consecutive_failures)).await;
             }
         }
     }
 }
 
-/// Parse every `pending` message, logging rather than propagating failures.
-///
-/// Parsing is best-effort by design: a bad template or a panic-adjacent edge
-/// case should degrade to "these rows stay pending and get retried next cycle",
-/// never to "ingestion stops".
-async fn drain_pending(pool: &sqlx::PgPool) {
-    match worker::run(pool, worker::Scope::Pending, 100_000).await {
-        Ok(run) if run.examined > 0 => info!(
-            "parse: examined {}, parsed {}, partial {}, unmatched {}, ignored {}, {} transaction(s) created",
-            run.examined, run.parsed, run.partial, run.unmatched, run.ignored,
-            run.transactions_created
-        ),
-        Ok(_) => {}
-        Err(e) => error!("parse run failed: {e}"),
-    }
-}
-
-/// Exponential backoff with full jitter, capped at `POLL_BACKOFF_MAX_SECS`.
-fn backoff_delay(attempt: u32, base_secs: u64) -> Duration {
-    let base = base_secs.max(1);
-    let exp = base.saturating_mul(1u64 << attempt.min(10).saturating_sub(1).min(16));
+/// Exponential backoff with full jitter, capped at POLL_BACKOFF_MAX_SECS.
+/// Jitter is derived from the clock's nanoseconds — good enough to de-align
+/// retries without pulling in a randomness crate.
+fn backoff_delay(failures: u32) -> Duration {
+    let base = CONFIG.poll_interval_secs.max(1);
+    let exp = base.saturating_mul(2u64.saturating_pow(failures.min(6)));
     let capped = exp.min(CONFIG.poll_backoff_max_secs.max(base));
-
-    // Full jitter: sleep a uniform random amount in [base, capped]. Derived from
-    // the clock rather than pulling in a RNG dependency; the quality needed here
-    // is "don't retry in lockstep", not cryptographic.
+    let span = capped.saturating_sub(base).max(1);
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.subsec_nanos() as u64)
         .unwrap_or(0);
-
-    let span = capped.saturating_sub(base);
-    let jitter = if span == 0 { 0 } else { nanos % (span + 1) };
-
-    Duration::from_secs(base + jitter)
+    Duration::from_secs(base + nanos % span)
 }
 
-/// One-shot backfill: walk history from the oldest end forwards, feeding the same
-/// insert path the poller uses, so there is no second code path that could store
-/// messages differently.
-///
-/// Deliberately does NOT touch the cursor: the cursor tracks the live tail, and
-/// moving it based on a historical walk would make the poller skip the present.
-pub async fn backfill(pool: &sqlx::PgPool, client: &WhatsAppClient) -> AppResult<usize> {
-    let chat_jid = CONFIG.target_chat_jid.clone();
-    if chat_jid.is_empty() {
-        return Err(AppError::Internal(
-            "TARGET_CHAT_JID is not configured".to_string(),
-        ));
-    }
-
-    info!("backfill starting for chat {chat_jid}");
-
-    let mut offset: u32 = 0;
-    let mut total_inserted = 0usize;
-    let mut total_fetched = 0usize;
+/// One-shot full-history backfill (`apex-rust backfill`). Same insert path,
+/// never touches the cursor — the cursor tracks the live tail.
+pub async fn backfill(pool: &PgPool, client: &WhatsAppClient) -> AppResult<usize> {
+    let chat_jid = &CONFIG.target_chat_jid;
+    let templates = parser::templates::load(pool).await?;
+    let mut total = 0usize;
+    let mut offset = 0u32;
 
     loop {
-        let batch = client
-            .list_messages(&chat_jid, None, MAX_PAGE_LIMIT, offset)
+        let page = client
+            .list_messages(chat_jid, None, MAX_PAGE_LIMIT, offset)
             .await?;
-
-        if batch.is_empty() {
+        let n = page.len() as u32;
+        if n == 0 {
             break;
         }
-
-        total_fetched += batch.len();
-        let batch_len = batch.len();
-
-        let batch: Vec<WaMessage> = batch
+        let page: Vec<WaMessage> = page
             .into_iter()
-            .filter(|m| m.chat_jid == chat_jid)
+            .filter(|m| &m.chat_jid == chat_jid)
             .collect();
-
-        let mut tx = pool.begin().await?;
-        let inserted = insert_batch(&mut tx, &batch).await?;
-        tx.commit().await?;
-
-        total_inserted += inserted;
-        info!(
-            "backfill: offset {offset}, {inserted} new of {batch_len} ({total_inserted} total)"
-        );
-
-        if batch_len < MAX_PAGE_LIMIT as usize {
+        total += process_batch(pool, &templates, &page).await?.len();
+        if n < MAX_PAGE_LIMIT {
             break;
         }
         offset += MAX_PAGE_LIMIT;
     }
-
-    info!("backfill complete: {total_inserted} new of {total_fetched} fetched");
-
-    // Parse in the same run. Otherwise a fresh backfill leaves every message at
-    // `pending` and the operator sees no transactions until the poller happens
-    // to fetch something new.
-    drain_pending(pool).await;
-
-    Ok(total_inserted)
+    Ok(total)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+/// Re-run the parser over stored raws that never produced a transaction
+/// (`apex-rust reparse`, and after template writes). This is what makes
+/// "status is recomputable" true in practice: seed a new template row, run
+/// this, and the backlog it covers becomes transactions. Idempotent — a raw
+/// with a transaction (parsed or human-promoted) is never touched.
+pub async fn reparse_sweep(pool: &PgPool) -> AppResult<(usize, usize)> {
+    let templates = parser::templates::load(pool).await?;
 
-    #[test]
-    fn backoff_grows_and_stays_capped() {
-        // Never below the base interval, never above the configured ceiling.
-        for attempt in 1..=20 {
-            let d = backoff_delay(attempt, 60).as_secs();
-            assert!(d >= 60, "attempt {attempt} gave {d}s, below base");
-            assert!(
-                d <= CONFIG.poll_backoff_max_secs.max(60),
-                "attempt {attempt} gave {d}s, above cap"
-            );
+    let rows = sqlx::query(
+        r#"
+        SELECT r.id, r.body, r.wa_timestamp, r.status, r.template
+        FROM banksms.raw_messages r
+        LEFT JOIN banksms.transactions t ON t.raw_message_id = r.id
+        WHERE t.id IS NULL
+        ORDER BY r.id
+        "#,
+    )
+    .fetch_all(pool)
+    .await?;
+
+    let mut status_changes = 0usize;
+    let mut created = 0usize;
+
+    for r in rows {
+        let raw_id: i64 = r.get("id");
+        let body: String = r.get("body");
+        let wa_ts: DateTime<Utc> = r.get("wa_timestamp");
+        let old_status: String = r.get("status");
+        let old_template: Option<String> = r.get("template");
+
+        let verdict = parser::parse(&body, &templates, Some(wa_ts));
+
+        let mut tx = pool.begin().await?;
+        if verdict.status() != old_status || verdict.template() != old_template.as_deref() {
+            sqlx::query("UPDATE banksms.raw_messages SET status = $1, template = $2 WHERE id = $3")
+                .bind(verdict.status())
+                .bind(verdict.template())
+                .bind(raw_id)
+                .execute(&mut *tx)
+                .await?;
+            status_changes += 1;
         }
+        if let Verdict::Matched { fields, .. } = &verdict {
+            let done = sqlx::query(
+                r#"
+                INSERT INTO banksms.transactions
+                    (source, raw_message_id, direction, amount, currency, occurred_at,
+                     account, counterparty, reference, created_by)
+                VALUES ('whatsapp', $1, $2, $3, $4, $5, $6, $7, $8, 'parser')
+                ON CONFLICT (raw_message_id) DO NOTHING
+                RETURNING id
+                "#,
+            )
+            .bind(raw_id)
+            .bind(&fields.direction)
+            .bind(fields.amount)
+            .bind(&fields.currency)
+            .bind(fields.occurred_at)
+            .bind(&fields.account)
+            .bind(&fields.counterparty)
+            .bind(&fields.reference)
+            .fetch_optional(&mut *tx)
+            .await?;
+            if done.is_some() {
+                created += 1;
+            }
+        }
+        tx.commit().await?;
     }
 
-    #[test]
-    fn backoff_first_attempt_is_base() {
-        // attempt 1 => shift 0 => exactly the base interval, plus jitter of 0.
-        assert_eq!(backoff_delay(1, 30).as_secs(), 30);
-    }
+    Ok((status_changes, created))
 }

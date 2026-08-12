@@ -60,8 +60,7 @@ pub static CONFIG: Lazy<Config> = Lazy::new(|| {
     dotenv::dotenv().ok();
 
     Config {
-        database_url: env::var("DATABASE_URL")
-            .expect("DATABASE_URL must be set"),
+        database_url: env::var("DATABASE_URL").expect("DATABASE_URL must be set"),
 
         // Previously this fell back to the literal string "secret". That silently
         // turned a missing env var into a service that accepts forged admin
@@ -70,8 +69,7 @@ pub static CONFIG: Lazy<Config> = Lazy::new(|| {
         jwt_secret: env::var("JWT_SECRET")
             .expect("JWT_SECRET must be set — it must match FalconGo's signing secret"),
 
-        server_host: env::var("SERVER_HOST")
-            .unwrap_or_else(|_| "127.0.0.1".to_string()),
+        server_host: env::var("SERVER_HOST").unwrap_or_else(|_| "127.0.0.1".to_string()),
         server_port: env::var("SERVER_PORT")
             .unwrap_or_else(|_| "8080".to_string())
             .parse()
@@ -83,7 +81,9 @@ pub static CONFIG: Lazy<Config> = Lazy::new(|| {
 
         whatsapp_api_url: env::var("WHATSAPP_API_URL")
             .unwrap_or_else(|_| "http://127.0.0.1:3000".to_string()),
-        whatsapp_api_token: env::var("WHATSAPP_API_TOKEN").ok().filter(|s| !s.is_empty()),
+        whatsapp_api_token: env::var("WHATSAPP_API_TOKEN")
+            .ok()
+            .filter(|s| !s.is_empty()),
 
         target_chat_jid: env::var("TARGET_CHAT_JID").unwrap_or_default(),
 
@@ -104,8 +104,7 @@ pub static CONFIG: Lazy<Config> = Lazy::new(|| {
             .ok()
             .filter(|s| !s.is_empty()),
 
-        ntfy_url: env::var("NTFY_URL")
-            .unwrap_or_else(|_| "https://ntfy.sh".to_string()),
+        ntfy_url: env::var("NTFY_URL").unwrap_or_else(|_| "https://ntfy.sh".to_string()),
         ntfy_topic: env::var("NTFY_TOPIC").unwrap_or_default(),
         ntfy_token: env::var("NTFY_TOKEN").ok().filter(|s| !s.is_empty()),
         ntfy_max_individual: env::var("NTFY_MAX_INDIVIDUAL")

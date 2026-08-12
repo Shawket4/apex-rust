@@ -101,10 +101,10 @@ impl ResponseError for AppError {
             // sqlx errors are classified by SQLSTATE rather than lumped into 500:
             // a unique violation is the caller's problem, not ours.
             AppError::Database(e) => match sqlstate(e).as_deref() {
-                Some("23505") => StatusCode::CONFLICT,            // unique_violation
-                Some("23503") => StatusCode::CONFLICT,            // foreign_key_violation
-                Some("23502") => StatusCode::BAD_REQUEST,         // not_null_violation
-                Some("23514") => StatusCode::BAD_REQUEST,         // check_violation
+                Some("23505") => StatusCode::CONFLICT,    // unique_violation
+                Some("23503") => StatusCode::CONFLICT,    // foreign_key_violation
+                Some("23502") => StatusCode::BAD_REQUEST, // not_null_violation
+                Some("23514") => StatusCode::BAD_REQUEST, // check_violation
                 Some(code) if code.starts_with("22") => StatusCode::BAD_REQUEST, // data exception
                 _ => StatusCode::INTERNAL_SERVER_ERROR,
             },

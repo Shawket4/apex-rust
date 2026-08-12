@@ -35,6 +35,15 @@ sqlx = { version = "0.8", features = [
 serde = { version = "1.0", features = ["derive"] }
 rmp-serde = "1.1"
 serde_json = "1.0"
+# double_option: PATCH bodies must distinguish "field absent" from "field: null".
+serde_with = "3"
+
+# Server-side XLSX export (pure Rust, no native deps).
+rust_xlsxwriter = "0.79"
+
+# SHA-384 of the baseline migration, so the cutover can stamp
+# banksms._sqlx_migrations with the checksum sqlx::migrate! expects.
+sha2 = "0.10"
 
 # Money. NEVER f64 for currency amounts: NUMERIC(18,4) <-> rust_decimal::Decimal.
 rust_decimal = { version = "1", features = ["serde-with-str", "maths"] }

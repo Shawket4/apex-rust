@@ -1,5 +1,5 @@
+use chrono::NaiveDateTime;
 use serde::{Deserialize, Serialize};
-use chrono::{DateTime, Utc, NaiveDateTime};
 
 // ============================================================================
 // Database Models
@@ -7,13 +7,13 @@ use chrono::{DateTime, Utc, NaiveDateTime};
 
 #[derive(Debug, sqlx::FromRow)]
 pub struct SessionPermissionCheck {
-    pub id: i32,          // driver_sessions.id = int
-    pub driver_id: i64,   // driver_sessions.driver_id = bigint
+    pub id: i32,        // driver_sessions.id = int
+    pub driver_id: i64, // driver_sessions.driver_id = bigint
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct LocationPingLite {
-    pub id: i32,          // location_pings.id = int
+    pub id: i32, // location_pings.id = int
     pub lat: f64,
     pub lng: f64,
     #[serde(rename = "time_stamp")]
@@ -33,7 +33,7 @@ where
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct SessionLocationSummary {
-    pub session_id: i64,  // location_pings.session_id = bigint
+    pub session_id: i64, // location_pings.session_id = bigint
     pub total_pings: i64,
     pub first_ping_time: Option<NaiveDateTime>,
     pub last_ping_time: Option<NaiveDateTime>,
@@ -70,7 +70,10 @@ pub struct SessionStats {
 }
 
 // Serialize Option<NaiveDateTime> as ISO 8601 string
-fn serialize_option_naive_datetime<S>(dt: &Option<NaiveDateTime>, serializer: S) -> Result<S::Ok, S::Error>
+fn serialize_option_naive_datetime<S>(
+    dt: &Option<NaiveDateTime>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
 where
     S: serde::Serializer,
 {
@@ -108,4 +111,6 @@ pub struct LocationPingsQuery {
     pub format: Option<String>,
 }
 
-fn default_true() -> bool { true }
+fn default_true() -> bool {
+    true
+}

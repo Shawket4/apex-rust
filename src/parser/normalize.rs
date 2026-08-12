@@ -9,8 +9,11 @@
 
 /// Normalize a message body for matching.
 ///
-/// Order matters: NFKC runs last, because the Arabic-specific folds below assume
-/// the pre-composed forms that NFKC would otherwise have already altered.
+/// No NFKC pass: the folds this parser depends on (digits, alef forms, ta
+/// marbuta, tatweel, bidi marks) are all explicit below, and compatibility
+/// forms have never appeared in the corpus. The previous implementation
+/// carried an NFKC step that was a do-nothing stub — deleted rather than
+/// pretended.
 pub fn normalize(input: &str) -> String {
     let mut s = String::with_capacity(input.len());
 
@@ -26,7 +29,10 @@ pub fn normalize(input: &str) -> String {
 
             // Bidi control marks. Invisible, and they sit right between the
             // number and the currency code in real bank SMS.
-            '\u{200E}' | '\u{200F}' | '\u{061C}' | '\u{202A}'..='\u{202E}'
+            '\u{200E}'
+            | '\u{200F}'
+            | '\u{061C}'
+            | '\u{202A}'..='\u{202E}'
             | '\u{2066}'..='\u{2069}' => {}
 
             // Zero-width characters.
@@ -56,8 +62,6 @@ pub fn normalize(input: &str) -> String {
         }
     }
 
-    let s: String = unicode_nfkc(&s);
-
     // Collapse whitespace runs and trim. Real messages contain double spaces
     // around amounts ("مبلغ  EGP 8000.00  من"), which would otherwise force
     // every pattern to guess at spacing.
@@ -76,18 +80,6 @@ pub fn normalize(input: &str) -> String {
     }
 
     out.trim().to_string()
-}
-
-/// NFKC via the standard library's built-in normalization where available.
-///
-/// The `unicode-normalization` crate is not a dependency here; the folds this
-/// parser depends on (digits, alef forms, ta marbuta, tatweel, bidi marks) are
-/// all handled explicitly above. NFKC's remaining job for this corpus is
-/// compatibility forms of Latin/Arabic presentation characters, which have not
-/// appeared in any observed message. Kept as a named seam so swapping in a real
-/// NFKC implementation later is a one-function change.
-fn unicode_nfkc(s: &str) -> String {
-    s.to_string()
 }
 
 #[cfg(test)]
