@@ -7,6 +7,7 @@ pub mod messages;
 pub mod refdata;
 pub mod registration;
 pub mod templates_admin;
+pub mod splits;
 pub mod transactions;
 
 use actix_web::{web, HttpMessage, HttpRequest, HttpResponse};
@@ -40,6 +41,10 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
             .route("/export", web::get().to(transactions::export).wrap(admin()))
             .route("", web::get().to(transactions::list).wrap(admin()))
             .route("", web::post().to(transactions::create).wrap(admin()))
+            .route("/{id}/split", web::get().to(splits::get).wrap(admin()))
+            .route("/{id}/split", web::post().to(splits::split).wrap(admin()))
+            .route("/{id}/split", web::put().to(splits::replace).wrap(admin()))
+            .route("/{id}/unsplit", web::post().to(splits::unsplit).wrap(admin()))
             .route("/{id}", web::get().to(transactions::get).wrap(admin()))
             .route("/{id}", web::patch().to(transactions::patch).wrap(admin()))
             .route(

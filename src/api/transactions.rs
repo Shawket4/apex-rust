@@ -48,6 +48,10 @@ pub struct TransactionView {
     pub loan: Option<LoanInfo>,
     pub principal: Option<Decimal>,
     pub fee: Option<Decimal>,
+    /// Set on split children: the transaction this is a part of.
+    pub parent_id: Option<i64>,
+    /// Set on split children: the full amount of the source transfer.
+    pub parent_amount: Option<Decimal>,
     pub version: i32,
     pub editable: bool,
     pub edited_by: Option<String>,
@@ -121,8 +125,11 @@ fn push_union<'a>(qb: &mut QueryBuilder<'a, Postgres>, f: &'a ListQuery) {
         "t.direction, t.amount, t.currency, t.occurred_at, t.account, t.counterparty, \
          t.reference, t.category, t.description, t.payment_method, t.company, \
          t.car_id, t.car_no_plate, t.driver_id, t.employee_id, t.loan_id, t.paid_by, \
+         t.parent_id, par.amount AS parent_amount, \
          t.version, t.created_by, t.edited_by, t.edited_at, t.created_at, t.updated_at \
-         FROM banksms.transactions t WHERE t.deleted_at IS NULL",
+         FROM banksms.transactions t \
+         LEFT JOIN banksms.transactions par ON par.id = t.parent_id \
+         WHERE t.deleted_at IS NULL AND t.split_at IS NULL",
     );
     if let Some(from) = &f.from {
         qb.push(" AND t.occurred_at >= ").push_bind(from);
@@ -174,7 +181,8 @@ fn push_union<'a>(qb: &mut QueryBuilder<'a, Postgres>, f: &'a ListQuery) {
              NULL, 'Fuel', CONCAT('Fuel: ', COALESCE(fe.liters::text, '0'), 'L @ ', \
              COALESCE(fe.price_per_liter::text, '0'), '/L'), COALESCE(fe.method, 'Cash'), \
              fe.transporter, NULL::bigint, fe.car_no_plate, NULL::bigint, NULL::bigint, \
-             NULL::bigint, fe.driver_name, 1, NULL, NULL, NULL::timestamptz, \
+             NULL::bigint, fe.driver_name, NULL::bigint, NULL::numeric, \
+             1, NULL, NULL, NULL::timestamptz, \
              fe.created_at AT TIME ZONE 'UTC', fe.updated_at AT TIME ZONE 'UTC' \
              FROM public.fuel_events fe \
              WHERE fe.deleted_at IS NULL AND fe.date IS NOT NULL AND fe.created_at IS NOT NULL \
@@ -216,7 +224,8 @@ fn push_union<'a>(qb: &mut QueryBuilder<'a, Postgres>, f: &'a ListQuery) {
              COALESCE(d.name, e.name), NULL, 'Loan', l.description, \
              COALESCE(l.method, 'Cash'), NULL, NULL::bigint, NULL, \
              l.driver_id::bigint, l.employee_id::bigint, NULL::bigint, \
-             COALESCE(l.method, ''), 1, NULL, NULL, NULL::timestamptz, \
+             COALESCE(l.method, ''), NULL::bigint, NULL::numeric, \
+             1, NULL, NULL, NULL::timestamptz, \
              l.created_at AT TIME ZONE 'UTC', l.updated_at AT TIME ZONE 'UTC' \
              FROM public.loans l \
              LEFT JOIN public.drivers d ON d.id = l.driver_id \
@@ -282,6 +291,8 @@ fn row_to_view(r: &sqlx::postgres::PgRow, loans: &HashMap<i64, LoanInfo>) -> Tra
         driver_id: r.get("driver_id"),
         employee_id: r.get("employee_id"),
         paid_by: r.get("paid_by"),
+        parent_id: r.try_get("parent_id").ok().flatten(),
+        parent_amount: r.try_get("parent_amount").ok().flatten(),
         loan: loan_id.and_then(|id| loans.get(&id).cloned()),
         principal,
         fee,
@@ -492,7 +503,7 @@ pub async fn statistics(
     let mut qb: QueryBuilder<Postgres> = QueryBuilder::new(
         "SELECT COUNT(*) AS c, COALESCE(SUM(amount), 0)::numeric AS s \
          FROM banksms.transactions \
-         WHERE deleted_at IS NULL AND direction = 'in'",
+         WHERE deleted_at IS NULL AND direction = 'in' AND split_at IS NULL",
     );
     if let Some(from) = &f.from {
         qb.push(" AND occurred_at >= ").push_bind(from);
@@ -526,7 +537,7 @@ pub async fn statistics(
          JOIN banksms.categories c ON lower(c.key) = lower(t.category) AND c.posting_kind IS NOT NULL \
          LEFT JOIN public.drivers d ON d.id = t.driver_id \
          LEFT JOIN public.employees e ON e.id = t.employee_id \
-         WHERE t.deleted_at IS NULL",
+         WHERE t.deleted_at IS NULL AND t.split_at IS NULL",
     );
     if let Some(from) = &f.from {
         qb.push(" AND t.occurred_at >= ").push_bind(from);
@@ -803,15 +814,19 @@ pub async fn create(
 }
 
 /// Load one bank transaction as a view (not fuel/loan synthetics).
+const VIEW_COLUMNS: &str = "SELECT t.id, t.source, t.raw_message_id, TRUE AS editable, \
+     t.direction, t.amount, t.currency, t.occurred_at, t.account, t.counterparty, \
+     t.reference, t.category, t.description, t.payment_method, t.company, t.car_id, \
+     t.car_no_plate, t.driver_id, t.employee_id, t.loan_id, t.paid_by, \
+     t.parent_id, par.amount AS parent_amount, \
+     t.version, t.created_by, t.edited_by, t.edited_at, t.created_at, t.updated_at \
+     FROM banksms.transactions t \
+     LEFT JOIN banksms.transactions par ON par.id = t.parent_id";
+
 async fn fetch_view(pool: &PgPool, id: i64) -> AppResult<TransactionView> {
-    let row = sqlx::query(
-        "SELECT t.id, t.source, t.raw_message_id, TRUE AS editable, t.direction, t.amount, \
-         t.currency, t.occurred_at, t.account, t.counterparty, t.reference, t.category, \
-         t.description, t.payment_method, t.company, t.car_id, t.car_no_plate, t.driver_id, \
-         t.employee_id, t.loan_id, t.paid_by, t.version, t.created_by, t.edited_by, \
-         t.edited_at, t.created_at, t.updated_at \
-         FROM banksms.transactions t WHERE t.id = $1 AND t.deleted_at IS NULL",
-    )
+    let row = sqlx::query(&format!(
+        "{VIEW_COLUMNS} WHERE t.id = $1 AND t.deleted_at IS NULL"
+    ))
     .bind(id)
     .fetch_optional(pool)
     .await?
@@ -819,6 +834,23 @@ async fn fetch_view(pool: &PgPool, id: i64) -> AppResult<TransactionView> {
 
     let loans = loans_for(pool, std::slice::from_ref(&row)).await?;
     Ok(row_to_view(&row, &loans))
+}
+
+/// One transaction as a view — the splits module's read path.
+pub async fn view_by_id(pool: &PgPool, id: i64) -> AppResult<TransactionView> {
+    fetch_view(pool, id).await
+}
+
+/// The live children of a split, oldest first.
+pub async fn views_by_parent(pool: &PgPool, parent_id: i64) -> AppResult<Vec<TransactionView>> {
+    let rows = sqlx::query(&format!(
+        "{VIEW_COLUMNS} WHERE t.parent_id = $1 AND t.deleted_at IS NULL ORDER BY t.id"
+    ))
+    .bind(parent_id)
+    .fetch_all(pool)
+    .await?;
+    let loans = loans_for(pool, &rows).await?;
+    Ok(rows.iter().map(|r| row_to_view(r, &loans)).collect())
 }
 
 #[derive(Debug, Serialize)]
@@ -834,7 +866,22 @@ struct DetailView {
 pub async fn get(pool: web::Data<PgPool>, path: web::Path<i64>) -> AppResult<HttpResponse> {
     let id = path.into_inner();
     let view = fetch_view(pool.get_ref(), id).await?;
-    let (raw_body, raw_wa_timestamp) = match view.raw_message_id {
+    // A split child carries no raw link of its own; the message lives on the
+    // parent and must still be visible from the part's edit screen.
+    let effective_raw = match view.raw_message_id {
+        Some(rid) => Some(rid),
+        None => match view.parent_id {
+            Some(pid) => sqlx::query_scalar::<_, Option<i64>>(
+                "SELECT raw_message_id FROM banksms.transactions WHERE id = $1",
+            )
+            .bind(pid)
+            .fetch_optional(pool.get_ref())
+            .await?
+            .flatten(),
+            None => None,
+        },
+    };
+    let (raw_body, raw_wa_timestamp) = match effective_raw {
         Some(rid) => {
             let r =
                 sqlx::query("SELECT body, wa_timestamp FROM banksms.raw_messages WHERE id = $1")
@@ -917,9 +964,9 @@ pub async fn patch(
     let row = sqlx::query(
         "SELECT direction, amount, currency, occurred_at, account, counterparty, reference,
                 category, description, payment_method, company, car_id, driver_id,
-                employee_id, paid_by, loan_id, version
+                employee_id, paid_by, loan_id, version, source, split_at, parent_id
          FROM banksms.transactions
-         WHERE id = $1 AND deleted_at IS NULL AND source <> '' FOR UPDATE",
+         WHERE id = $1 AND deleted_at IS NULL FOR UPDATE",
     )
     .bind(id)
     .fetch_optional(&mut *tx)
@@ -929,6 +976,25 @@ pub async fn patch(
     let actual: i32 = row.get("version");
     if actual != expected {
         return Err(AppError::VersionConflict { expected, actual });
+    }
+
+    // A split parent's money left the ledger for its parts — edit the split
+    // (or unsplit) instead of the container.
+    if row.get::<Option<chrono::DateTime<Utc>>, _>("split_at").is_some() {
+        return Err(AppError::Conflict(
+            "this transaction is split into parts — edit the split, or unsplit first".into(),
+        ));
+    }
+    // A child's money fields are the split's invariant (parts sum to the
+    // transfer, exactly); category/person/description edits are fine.
+    if row.get::<Option<i64>, _>("parent_id").is_some()
+        && (b.amount.is_some() || b.direction.is_some() || b.occurred_at.is_some())
+    {
+        return Err(AppError::BadRequest(
+            "a split part's amount, direction and date are set by the split — \
+             edit the split as a whole"
+                .into(),
+        ));
     }
 
     // Merge: patch wins where present.
@@ -1023,7 +1089,7 @@ pub async fn delete(
     let mut tx = pool.begin().await?;
     let row = sqlx::query(
         "SELECT version, amount, occurred_at, description, category, driver_id,
-                employee_id, loan_id
+                employee_id, loan_id, split_at, parent_id
          FROM banksms.transactions WHERE id = $1 AND deleted_at IS NULL FOR UPDATE",
     )
     .bind(id)
@@ -1034,6 +1100,14 @@ pub async fn delete(
     let actual: i32 = row.get("version");
     if actual != expected {
         return Err(AppError::VersionConflict { expected, actual });
+    }
+    if row.get::<Option<chrono::DateTime<Utc>>, _>("split_at").is_some() {
+        return Err(AppError::Conflict("unsplit before deleting".into()));
+    }
+    if row.get::<Option<i64>, _>("parent_id").is_some() {
+        return Err(AppError::BadRequest(
+            "a split part is removed by editing the split, not deleted on its own".into(),
+        ));
     }
 
     let reg = Registrable {

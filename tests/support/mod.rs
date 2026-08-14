@@ -221,7 +221,8 @@ pub async fn fresh_db(name: &str) -> PgPool {
             created_at TIMESTAMPTZ DEFAULT now(), updated_at TIMESTAMPTZ DEFAULT now(),
             deleted_at TIMESTAMPTZ,
             date TEXT, driver_name TEXT, car_no_plate TEXT, transporter TEXT,
-            liters NUMERIC, price_per_liter NUMERIC, price NUMERIC, method TEXT
+            liters NUMERIC, price_per_liter NUMERIC, price NUMERIC, method TEXT,
+            petroapp_bill_id BIGINT
         );
         CREATE TABLE public.fleet_expenses (
             id SERIAL PRIMARY KEY, car_no_plate VARCHAR(50), expense_date DATE,
