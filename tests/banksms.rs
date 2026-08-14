@@ -626,3 +626,177 @@ async fn every_seeded_template_passes_its_own_sample() {
         other => panic!("wallet sample must suppress, got {:?}", other.status()),
     }
 }
+
+/* ------------------------------------------------------------------------ */
+/* Split lifecycle: strict sums, per-part loans, guards, unsplit.            */
+/* ------------------------------------------------------------------------ */
+
+#[actix_web::test]
+async fn split_lifecycle_keeps_the_money_exact() {
+    use actix_web::{test, web, App};
+
+    support::init();
+    let pool = support::fresh_db("apex_bsms_split").await;
+    apex::boot::run_banksms_migrations(&pool).await.unwrap();
+    sqlx::raw_sql("INSERT INTO public.employees (id, name) VALUES (12, 'عماد جرجس');")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let app = test::init_service(
+        App::new()
+            .app_data(web::Data::new(pool.clone()))
+            .configure(apex::api::configure),
+    )
+    .await;
+    let auth = ("Authorization", format!("Bearer {}", support::admin_token(3)));
+
+    // A 20,000 transfer that actually covers an advance and parts.
+    let req = test::TestRequest::post()
+        .uri("/api/v1/transactions")
+        .insert_header(auth.clone())
+        .set_json(serde_json::json!({
+            "direction": "out", "amount": "20000", "occurred_at": "2026-08-12T10:00:00Z",
+            "counterparty": "عماد ج... ي... ج..."
+        }))
+        .to_request();
+    let parent: serde_json::Value = test::call_and_read_body_json(&app, req).await;
+    let pid = parent["id"].as_i64().unwrap();
+
+    // Parts that don't add up are refused with the amounts in the message.
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/transactions/{pid}/split"))
+        .insert_header(auth.clone())
+        .insert_header(("If-Match", "1"))
+        .set_json(serde_json::json!({ "parts": [
+            { "amount": "15000", "category": "Advance", "employee_id": 12 },
+            { "amount": "4000", "category": "Parts" }
+        ]}))
+        .to_request();
+    assert_eq!(test::call_service(&app, req).await.status(), 400, "wrong sum must refuse");
+
+    // The exact split works and registers the advance part's loan.
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/transactions/{pid}/split"))
+        .insert_header(auth.clone())
+        .insert_header(("If-Match", "1"))
+        .set_json(serde_json::json!({ "parts": [
+            { "amount": "15000", "category": "Advance", "employee_id": 12 },
+            { "amount": "5000", "category": "Parts" }
+        ]}))
+        .to_request();
+    let resp = test::call_service(&app, req).await;
+    assert_eq!(resp.status(), 200);
+    let set: serde_json::Value = test::read_body_json(resp).await;
+    assert_eq!(set["parts"].as_array().unwrap().len(), 2);
+    let advance_child = set["parts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["category"] == "Advance")
+        .unwrap();
+    let loan_id = advance_child["loan"]["id"].as_i64().expect("advance part registers");
+    let child_id = advance_child["id"].as_i64().unwrap();
+    let loan_amount: f64 = sqlx::query_scalar("SELECT amount FROM public.loans WHERE id = $1")
+        .bind(loan_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(loan_amount, 15000.0);
+
+    // The ledger shows the parts, never the split container.
+    let req = test::TestRequest::get()
+        .uri("/api/v1/transactions?direction=out")
+        .insert_header(auth.clone())
+        .to_request();
+    let page: serde_json::Value = test::call_and_read_body_json(&app, req).await;
+    let ids: Vec<i64> = page["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v["id"].as_i64().unwrap())
+        .collect();
+    assert!(!ids.contains(&pid), "split parent must leave the ledger");
+    assert!(ids.contains(&child_id), "split parts are ledger rows");
+
+    // Child money fields are the split's invariant.
+    let req = test::TestRequest::patch()
+        .uri(&format!("/api/v1/transactions/{child_id}"))
+        .insert_header(auth.clone())
+        .insert_header(("If-Match", "1"))
+        .set_json(serde_json::json!({ "amount": "14000" }))
+        .to_request();
+    assert_eq!(test::call_service(&app, req).await.status(), 400);
+    // ...but its meaning stays editable.
+    let req = test::TestRequest::patch()
+        .uri(&format!("/api/v1/transactions/{child_id}"))
+        .insert_header(auth.clone())
+        .insert_header(("If-Match", "1"))
+        .set_json(serde_json::json!({ "description": "سلفة أغسطس" }))
+        .to_request();
+    assert_eq!(test::call_service(&app, req).await.status(), 200);
+
+    // Unsplit restores the parent and unregisters the unpaid loan.
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/transactions/{pid}/unsplit"))
+        .insert_header(auth.clone())
+        .insert_header(("If-Match", "2"))
+        .to_request();
+    assert_eq!(test::call_service(&app, req).await.status(), 200);
+    let loan_gone: Option<chrono::DateTime<chrono::Utc>> =
+        sqlx::query_scalar("SELECT deleted_at FROM public.loans WHERE id = $1")
+            .bind(loan_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(loan_gone.is_some(), "unsplit unregisters the part's loan");
+    let live_children: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM banksms.transactions WHERE parent_id = $1 AND deleted_at IS NULL",
+    )
+    .bind(pid)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(live_children, 0);
+
+    // A settled loan on any part locks the split, same as everywhere else.
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/transactions/{pid}/split"))
+        .insert_header(auth.clone())
+        .insert_header(("If-Match", "3"))
+        .set_json(serde_json::json!({ "parts": [
+            { "amount": "18000", "category": "Advance", "employee_id": 12 },
+            { "amount": "2000", "category": "Other" }
+        ]}))
+        .to_request();
+    let set: serde_json::Value = test::call_and_read_body_json(&app, {
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), 200);
+        test::TestRequest::get()
+            .uri(&format!("/api/v1/transactions/{pid}/split"))
+            .insert_header(auth.clone())
+            .to_request()
+    })
+    .await;
+    let new_loan = set["parts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find_map(|p| p["loan"]["id"].as_i64())
+        .unwrap();
+    sqlx::query("UPDATE public.loans SET is_paid = true WHERE id = $1")
+        .bind(new_loan)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/transactions/{pid}/unsplit"))
+        .insert_header(auth.clone())
+        .insert_header(("If-Match", "4"))
+        .to_request();
+    assert_eq!(
+        test::call_service(&app, req).await.status(),
+        409,
+        "a settled loan blocks the unsplit"
+    );
+}
