@@ -155,10 +155,7 @@ pub async fn get_taqa_stats(
                 t.date,
                 t.tank_capacity,
                 COALESCE(fm.distance, 0.0) as distance,
-                (CASE 
-                    WHEN t.terminal IN ('Alex', 'Suez') THEN COALESCE(fm.distance, 0.0) * 50.5
-                    ELSE 0.0
-                END)::float8 as trip_revenue
+                (COALESCE(fm.distance, 0.0) * 50.5)::float8 as trip_revenue
             FROM trips t
             LEFT JOIN fee_mappings fm 
                 ON t.company = fm.company 
@@ -232,10 +229,7 @@ pub async fn get_taqa_stats(
             CASE WHEN $3 THEN a.base_revenue ELSE 0.0 END as base_revenue,
             CASE WHEN $3 THEN COALESCE(cr.total_car_rental, 0.0)::float8 ELSE NULL END as car_rental,
             CASE WHEN $3 THEN ((a.base_revenue + COALESCE(cr.total_car_rental, 0.0)) * 0.14)::float8 ELSE NULL END as vat,
-            CASE 
-                WHEN a.terminal IN ('Alex', 'Suez') THEN 50.5
-                ELSE 0.0
-            END as fee
+            50.5 as fee
         FROM aggregates a
         LEFT JOIN car_rentals cr ON a.terminal = cr.terminal
         ORDER BY a.terminal
@@ -669,10 +663,7 @@ async fn get_taqa_route_details(
                 t.date,
                 t.tank_capacity,
                 COALESCE(fm.distance, 0.0) as distance,
-                (CASE 
-                    WHEN t.terminal IN ('Alex', 'Suez') THEN COALESCE(fm.distance, 0.0) * 50.5
-                    ELSE 0.0
-                END)::float8 as trip_revenue
+                (COALESCE(fm.distance, 0.0) * 50.5)::float8 as trip_revenue
             FROM trips t
             LEFT JOIN fee_mappings fm 
                 ON t.company = fm.company 
@@ -1148,10 +1139,7 @@ pub async fn get_stats_by_date(
                                 ELSE 0.0
                             END / 1000.0)::float8
                     WHEN t.company = 'TAQA' THEN
-                        (CASE 
-                            WHEN t.terminal IN ('Alex', 'Suez') THEN COALESCE(fm.distance, 0.0) * 50.5
-                            ELSE 0.0
-                        END)::float8
+                        (COALESCE(fm.distance, 0.0) * 50.5)::float8
                     WHEN t.company = 'Petromin' THEN
                         (COALESCE(fm.distance, 0.0) * 42.5)::float8
                     WHEN t.company = 'Petrol Arrows' THEN
