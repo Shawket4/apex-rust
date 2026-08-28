@@ -119,6 +119,30 @@ fn days_in_month(year: i32, month: u32) -> u32 {
         .day()
 }
 
+/// An explicit `from..=to` window beats the month parameter. The previous
+/// window is the same number of days ending the day before `from`, so the
+/// delta stays like-for-like at any span length.
+fn resolve_window(q: &DashboardQuery) -> Window {
+    let parse = |s: &Option<String>| {
+        s.as_deref()
+            .and_then(|v| chrono::NaiveDate::parse_from_str(v, "%Y-%m-%d").ok())
+    };
+    if let (Some(from), Some(to)) = (parse(&q.from), parse(&q.to)) {
+        if from <= to {
+            let len = (to - from).num_days();
+            let prev_to = from - chrono::Duration::days(1);
+            let prev_from = prev_to - chrono::Duration::days(len);
+            return Window {
+                from: from.format("%Y-%m-%d").to_string(),
+                to: to.format("%Y-%m-%d").to_string(),
+                prev_from: prev_from.format("%Y-%m-%d").to_string(),
+                prev_to: prev_to.format("%Y-%m-%d").to_string(),
+            };
+        }
+    }
+    month_window(q.month.as_deref())
+}
+
 fn month_window(month: Option<&str>) -> Window {
     let today = Utc::now().with_timezone(&Cairo).date_naive();
 
@@ -179,6 +203,10 @@ fn money_str(v: f64) -> String {
 #[derive(Deserialize)]
 pub struct DashboardQuery {
     pub month: Option<String>,
+    /// Explicit window (YYYY-MM-DD, inclusive). When both are valid they
+    /// override `month`.
+    pub from: Option<String>,
+    pub to: Option<String>,
     pub format: Option<String>,
 }
 
@@ -213,7 +241,7 @@ pub async fn get_dashboard(
 ) -> Result<HttpResponse, actix_web::Error> {
     let financial = permission(&req) >= FINANCIAL_PERMISSION;
     let use_msgpack = query.format.as_deref() == Some("msgpack");
-    let w = month_window(query.month.as_deref());
+    let w = resolve_window(&query);
     let p = pool.get_ref();
 
     // Everything the page needs, in flight together. The money queries only
@@ -340,7 +368,7 @@ pub async fn get_revenue_drawer(
 ) -> Result<HttpResponse, actix_web::Error> {
     require_financial(&req)?;
     let use_msgpack = query.format.as_deref() == Some("msgpack");
-    let w = month_window(query.month.as_deref());
+    let w = resolve_window(&query);
 
     let (companies, daily) = tokio::try_join!(
         q::revenue_by_company(pool.get_ref(), &w.from, &w.to),
@@ -387,7 +415,7 @@ pub async fn get_cash_out_drawer(
 ) -> Result<HttpResponse, actix_web::Error> {
     require_financial(&req)?;
     let use_msgpack = query.format.as_deref() == Some("msgpack");
-    let w = month_window(query.month.as_deref());
+    let w = resolve_window(&query);
     let p = pool.get_ref();
 
     let (categories, largest) = tokio::try_join!(
@@ -436,7 +464,7 @@ pub async fn get_trips_drawer(
     _req: HttpRequest,
 ) -> Result<HttpResponse, actix_web::Error> {
     let use_msgpack = query.format.as_deref() == Some("msgpack");
-    let w = month_window(query.month.as_deref());
+    let w = resolve_window(&query);
     let p = pool.get_ref();
 
     let (companies, daily) = tokio::try_join!(
@@ -531,5 +559,36 @@ mod tests {
         // entry point.
         let w = month_window(Some("not-a-month"));
         assert_eq!(&w.from[8..], "01");
+    }
+
+    #[test]
+    fn explicit_window_beats_month_and_mirrors_backwards() {
+        let q = |from: &str, to: &str| DashboardQuery {
+            month: Some("2026-01".into()),
+            from: Some(from.into()),
+            to: Some(to.into()),
+            format: None,
+        };
+
+        // A 7-day scope compares against the 7 days right before it.
+        let w = resolve_window(&q("2026-08-22", "2026-08-28"));
+        assert_eq!((w.from.as_str(), w.to.as_str()), ("2026-08-22", "2026-08-28"));
+        assert_eq!(
+            (w.prev_from.as_str(), w.prev_to.as_str()),
+            ("2026-08-15", "2026-08-21")
+        );
+
+        // A single day compares against yesterday, across a month boundary.
+        let w = resolve_window(&q("2026-09-01", "2026-09-01"));
+        assert_eq!(
+            (w.prev_from.as_str(), w.prev_to.as_str()),
+            ("2026-08-31", "2026-08-31")
+        );
+
+        // Inverted or malformed ranges fall back to the month parameter.
+        let w = resolve_window(&q("2026-08-28", "2026-08-22"));
+        assert_eq!(w.from, "2026-01-01");
+        let w = resolve_window(&q("garbage", "2026-08-28"));
+        assert_eq!(w.from, "2026-01-01");
     }
 }
