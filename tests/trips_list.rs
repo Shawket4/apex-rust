@@ -676,3 +676,90 @@ async fn the_route_resolves_alongside_the_banksms_scopes() {
     let resp = test::call_service(&app, req).await;
     assert_ne!(resp.status(), 404, "the banksms routes stopped resolving");
 }
+
+/// A day's rental is shared only by the trips on THAT day.
+///
+/// It used to be the month's rental divided by the month's trips, so one busy
+/// day diluted every other trip the car made — a trip on a day it had the truck
+/// to itself still carried less because of what happened a fortnight later.
+///
+/// The daily rate is also a constant: the tapered monthly figure divided by
+/// days worked is 43000/28 exactly for any month under 28 days, which is why a
+/// trip's share does not move when the caller changes the date range.
+#[tokio::test]
+async fn a_days_rental_is_split_only_between_that_days_trips() {
+    use apex::db::revenue::TAQA_RENTAL_PER_DAY;
+    use apex::db::stats_queries::get_taqa_stats;
+
+    let pool = support::fresh_db("apex_taqa_day_share").await;
+    sqlx::raw_sql(
+        "INSERT INTO fee_mappings (company, terminal, drop_off_point, distance, fee)
+         VALUES ('TAQA','Suez','Site',100.0,0);
+         -- Ten working days. On the tenth the car runs TWICE; every other day once.
+         INSERT INTO trips (company, terminal, drop_off_point, car_no_plate,
+                            tank_capacity, date, receipt_no)
+         SELECT 'TAQA','Suez','Site','DAY-1', 30000,
+                to_char(DATE '2025-05-01' + (n || ' days')::interval, 'YYYY-MM-DD'),
+                'D' || n
+         FROM generate_series(0, 9) AS n;
+         INSERT INTO trips (company, terminal, drop_off_point, car_no_plate,
+                            tank_capacity, date, receipt_no)
+         VALUES ('TAQA','Suez','Site','DAY-1', 30000, '2025-05-10', 'D9b');",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let filters = TripListFilters {
+        page: 1,
+        limit: MAX_LIMIT,
+        company: Some("TAQA".into()),
+        from: Some("2025-05-01".into()),
+        to: Some("2025-05-31".into()),
+        ..Default::default()
+    }
+    .normalized();
+    let (rows, _) = list_trips(&pool, &filters, true).await.unwrap();
+    assert_eq!(rows.len(), 11, "expected ten days, one of them doubled");
+
+    let share = |receipt: &str| {
+        rows.iter()
+            .find(|r| r.receipt_no == receipt)
+            .unwrap_or_else(|| panic!("{receipt} missing"))
+            .allocated_rental
+            .unwrap()
+    };
+
+    // A day the car had to itself: the whole day's rental, which is the flat
+    // 43000/28 -- NOT reduced by what happened on the 10th.
+    for receipt in ["D0", "D5", "D8"] {
+        assert!(
+            (share(receipt) - TAQA_RENTAL_PER_DAY).abs() < 0.01,
+            "{receipt} carries {} but had the truck to itself",
+            share(receipt)
+        );
+    }
+
+    // The shared day: half each, and only these two are affected.
+    let half = TAQA_RENTAL_PER_DAY / 2.0;
+    for receipt in ["D9", "D9b"] {
+        assert!(
+            (share(receipt) - half).abs() < 0.01,
+            "{receipt} carries {} but shared its day with one other trip",
+            share(receipt)
+        );
+    }
+
+    // And it still adds up to the month's rental.
+    let stats_rental: f64 = get_taqa_stats(&pool, "2025-05-01", "2025-05-31", true)
+        .await
+        .unwrap()
+        .iter()
+        .filter_map(|d| d.car_rental)
+        .sum();
+    let allocated: f64 = rows.iter().filter_map(|r| r.allocated_rental).sum();
+    assert!(
+        (allocated - stats_rental).abs() < 0.01,
+        "allocated {allocated} != statistics {stats_rental}"
+    );
+}
