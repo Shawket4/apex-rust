@@ -1413,3 +1413,46 @@ pub fn calculate_car_totals(statistics: &[TripStatistics]) -> Vec<CarTotal> {
 
     car_totals_map.into_values().collect()
 }
+
+/// Count logical trips and receipts for a company over a date range.
+///
+/// Two numbers that are easy to conflate and are both wanted:
+///
+///   * `trips`    -- a multi-container trip is ONE trip, however many receipts
+///                   it carries. Standalone rows count as themselves.
+///   * `receipts` -- individual rows, one per physical receipt.
+///
+/// This must be a single pass over the whole filtered set. The company total was
+/// previously built by summing the per-drop-off-point counts, which counts a
+/// trip once per group its containers touch -- so a trip delivering to two
+/// points was counted twice. Over Jul-Aug 2026 that reported 1,468 against a
+/// true 1,307.
+pub async fn get_trip_counts(
+    pool: &PgPool,
+    company: &str,
+    start_date: &str,
+    end_date: &str,
+) -> Result<(i64, i64), sqlx::Error> {
+    let row = sqlx::query(
+        r#"
+        SELECT
+            COALESCE(COUNT(DISTINCT parent_trip_id)
+                     FILTER (WHERE parent_trip_id IS NOT NULL AND parent_trip_id != 0), 0)
+          + COALESCE(COUNT(*)
+                     FILTER (WHERE parent_trip_id IS NULL OR parent_trip_id = 0), 0)
+                AS trips,
+            COUNT(*) AS receipts
+        FROM trips
+        WHERE company = $1
+          AND deleted_at IS NULL
+          AND date BETWEEN $2 AND $3
+        "#,
+    )
+    .bind(company)
+    .bind(start_date)
+    .bind(end_date)
+    .fetch_one(pool)
+    .await?;
+
+    Ok((row.get::<i64, _>("trips"), row.get::<i64, _>("receipts")))
+}
