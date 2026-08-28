@@ -1397,7 +1397,7 @@ pub async fn get_trip_counts(
     start_date: &str,
     end_date: &str,
 ) -> Result<(i64, i64), sqlx::Error> {
-    let row = sqlx::query(
+    let row = sqlx::query(&render(
         r#"
         SELECT
             {trip_count}
@@ -1408,7 +1408,7 @@ pub async fn get_trip_counts(
           AND deleted_at IS NULL
           AND date BETWEEN $2 AND $3
         "#,
-    )
+    ))
     .bind(company)
     .bind(start_date)
     .bind(end_date)
