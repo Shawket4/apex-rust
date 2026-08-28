@@ -27,16 +27,18 @@ fn configure_routes(cfg: &mut web::ServiceConfig) {
                     required_permission: Some(3),
                 }),
             )
-            // Permission 4, not the 3 that opens statistics: this endpoint puts
-            // a revenue figure against one driver's one trip, which is a
-            // different disclosure from the same money shown in aggregate.
             .route(
-                "/trips",
-                web::get().to(apex::handlers::trips::get_trips).wrap(JwtAuth {
-                    required_permission: Some(4),
+                "/trip-statistics/route-days",
+                web::get().to(get_route_days).wrap(JwtAuth {
+                    required_permission: Some(3),
                 }),
             ),
     );
+    // Permission 1 to SEE the list, matching the FalconGo route this replaces --
+    // gating the whole list higher would lock every dispatcher out of the trips
+    // page. The revenue columns are the level-4 feature, withheld by the
+    // handler itself. Registered from the lib so tests mount the same gate.
+    apex::handlers::trips::configure(cfg);
 }
 
 #[actix_web::main]

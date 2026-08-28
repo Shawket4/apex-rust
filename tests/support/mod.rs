@@ -338,7 +338,14 @@ pub async fn apply_legacy_schema(pool: &PgPool) {
 
 /// Forge an admin JWT the way FalconGo issues them (HS256, user_id number,
 /// iss = the id as a string, no sub).
+/// A FalconGo-shaped admin token at permission 4.
 pub fn admin_token(user_id: i64) -> String {
+    token_with_permission(user_id, 4)
+}
+
+/// The same, at an arbitrary permission level — for testing the gates rather
+/// than passing through them.
+pub fn token_with_permission(user_id: i64, permission: i32) -> String {
     use jsonwebtoken::{encode, EncodingKey, Header};
     #[derive(serde::Serialize)]
     struct FalconGoClaims {
@@ -355,7 +362,7 @@ pub fn admin_token(user_id: i64) -> String {
             user_type: "admin_user".into(),
             user_id,
             driver_id: 0,
-            permission: 4,
+            permission,
             exp: (Utc::now() + chrono::Duration::hours(1)).timestamp(),
             iss: user_id.to_string(),
         },

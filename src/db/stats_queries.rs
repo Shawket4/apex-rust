@@ -1417,3 +1417,100 @@ pub async fn get_trip_counts(
 
     Ok((row.get::<i64, _>("trips"), row.get::<i64, _>("receipts")))
 }
+
+/* ------------------------------------------------------------------------ */
+/* Per-route daily breakdown                                                 */
+/* ------------------------------------------------------------------------ */
+
+/// One day of a single route's activity.
+#[derive(Debug, serde::Serialize)]
+pub struct RouteDayRow {
+    pub date: String,
+    /// Logical trips: a multi-container trip counts once.
+    pub trips: i64,
+    pub volume: f64,
+    pub distance: f64,
+    /// Base revenue — what the trips themselves earned, so the days sum to the
+    /// route's revenue in the parent row.
+    pub revenue: f64,
+    /// Base plus this day's share of car rental and VAT. Sums to the company
+    /// total in the statistics header.
+    pub revenue_total: f64,
+    pub car_count: i64,
+}
+
+/// The daily breakdown behind one route row on the statistics page.
+///
+/// This used to be done in the browser: the dashboard downloaded up to ten
+/// thousand raw trips and grouped them in JavaScript. Two things were wrong
+/// with that beyond the payload size. The row count silently truncated at the
+/// limit, and the revenue it summed was `trip.revenue || trip.fee` — the trips
+/// table's `revenue` column is not maintained, so it fell through to `fee`,
+/// which for Watanya is a fee BAND NUMBER between 1 and 15 rather than money.
+///
+/// Route matching mirrors the precedence the client used: terminal plus
+/// drop-off point if both are known, then terminal alone, then fee band, and
+/// finally a name that may be either.
+pub async fn get_route_day_breakdown(
+    pool: &PgPool,
+    company: &str,
+    start_date: &str,
+    end_date: &str,
+    terminal: Option<&str>,
+    drop_off_point: Option<&str>,
+    fee: Option<f64>,
+    route_name: Option<&str>,
+) -> Result<Vec<RouteDayRow>> {
+    use crate::db::revenue::allocation::per_row_revenue_cte;
+
+    let cte = per_row_revenue_cte("t.company = $1 AND t.date BETWEEN $2 AND $3");
+    let sql = render(&format!(
+        r#"
+        WITH {cte}
+        SELECT
+            r.date,
+            {{trip_count}}::bigint                            AS trips,
+            COALESCE(SUM(r.tank_capacity), 0)::float8         AS volume,
+            COALESCE(SUM(r.fee_distance), 0.0)::float8        AS distance,
+            COALESCE(SUM(r.base_revenue), 0.0)::float8        AS revenue,
+            COALESCE(SUM(r.allocated_total), 0.0)::float8     AS revenue_total,
+            COUNT(DISTINCT r.car_no_plate)::bigint            AS car_count
+        FROM revenue r
+        WHERE CASE
+                WHEN $4::text IS NOT NULL AND $5::text IS NOT NULL
+                    THEN r.terminal = $4 AND r.drop_off_point = $5
+                WHEN $4::text IS NOT NULL THEN r.terminal = $4
+                WHEN $6::float8 IS NOT NULL THEN r.fee_value = $6
+                WHEN $7::text IS NOT NULL
+                    THEN r.drop_off_point = $7 OR r.terminal = $7
+                ELSE TRUE
+              END
+        GROUP BY r.date
+        ORDER BY r.date DESC
+        "#
+    ));
+
+    let rows = sqlx::query(&sql)
+        .bind(company)
+        .bind(start_date)
+        .bind(end_date)
+        .bind(terminal)
+        .bind(drop_off_point)
+        .bind(fee)
+        .bind(route_name)
+        .fetch_all(pool)
+        .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(|r| RouteDayRow {
+            date: r.get("date"),
+            trips: r.get("trips"),
+            volume: r.get("volume"),
+            distance: r.get("distance"),
+            revenue: r.get("revenue"),
+            revenue_total: r.get("revenue_total"),
+            car_count: r.get("car_count"),
+        })
+        .collect())
+}

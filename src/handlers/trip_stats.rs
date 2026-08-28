@@ -183,3 +183,71 @@ pub async fn health_check() -> HttpResponse {
         "service": "trip-stats-rust"
     }))
 }
+
+/* ------------------------------------------------------------------------ */
+/* Per-route daily breakdown                                                 */
+/* ------------------------------------------------------------------------ */
+
+#[derive(serde::Deserialize)]
+pub struct RouteDaysQuery {
+    pub company: String,
+    pub start_date: String,
+    pub end_date: String,
+    pub terminal: Option<String>,
+    pub drop_off_point: Option<String>,
+    pub fee: Option<f64>,
+    pub route_name: Option<String>,
+}
+
+/// `GET /api/v1/trip-statistics/route-days`
+///
+/// The day-by-day panel behind a route row. Permission 3, matching the
+/// statistics endpoint it belongs to — it is the same aggregate at a finer
+/// grain, not a per-trip disclosure.
+///
+/// Replaces a client-side grouping that pulled up to ten thousand raw trips
+/// into the browser, truncated silently at that limit, and summed fee band
+/// numbers as though they were money.
+pub async fn get_route_days(
+    pool: web::Data<PgPool>,
+    query: web::Query<RouteDaysQuery>,
+    req: HttpRequest,
+) -> Result<HttpResponse, actix_web::Error> {
+    let has_financial_access = req
+        .extensions()
+        .get::<Claims>()
+        .and_then(|c| c.permission)
+        .map(|p| p >= 3)
+        .unwrap_or(false);
+
+    let q = query.into_inner();
+    let blank_is_none = |v: Option<String>| v.filter(|s| !s.trim().is_empty());
+
+    let mut days = get_route_day_breakdown(
+        pool.get_ref(),
+        &q.company,
+        &q.start_date,
+        &q.end_date,
+        blank_is_none(q.terminal).as_deref(),
+        blank_is_none(q.drop_off_point).as_deref(),
+        q.fee,
+        blank_is_none(q.route_name).as_deref(),
+    )
+    .await
+    .map_err(|e| {
+        log::error!("route day breakdown failed: {e:#}");
+        actix_web::error::ErrorInternalServerError("failed to fetch route days")
+    })?;
+
+    // Volume, distance and trip counts are operational and stay; the money is
+    // zeroed for callers below the financial threshold, matching how the
+    // statistics endpoint next door treats the same figures.
+    if !has_financial_access {
+        for day in &mut days {
+            day.revenue = 0.0;
+            day.revenue_total = 0.0;
+        }
+    }
+
+    Ok(HttpResponse::Ok().json(serde_json::json!({ "data": days })))
+}
