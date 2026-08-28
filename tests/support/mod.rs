@@ -191,6 +191,9 @@ pub async fn fresh_db(name: &str) -> PgPool {
         r#"
         CREATE TABLE public.cars (
             id SERIAL PRIMARY KEY, car_no_plate TEXT,
+            -- Empty string, not NULL, on untracked vehicles — mirroring what
+            -- production actually stores; the dashboard normalises it.
+            etit_car_id TEXT DEFAULT '',
             created_at TIMESTAMPTZ DEFAULT now(), updated_at TIMESTAMPTZ DEFAULT now(),
             deleted_at TIMESTAMPTZ
         );
