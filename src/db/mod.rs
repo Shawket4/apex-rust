@@ -1,4 +1,5 @@
 pub mod revenue;
+pub mod trip_queries;
 pub mod stats_queries;
 pub use stats_queries::*;
 

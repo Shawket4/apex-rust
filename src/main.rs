@@ -26,6 +26,15 @@ fn configure_routes(cfg: &mut web::ServiceConfig) {
                 web::get().to(get_trip_statistics).wrap(JwtAuth {
                     required_permission: Some(3),
                 }),
+            )
+            // Permission 4, not the 3 that opens statistics: this endpoint puts
+            // a revenue figure against one driver's one trip, which is a
+            // different disclosure from the same money shown in aggregate.
+            .route(
+                "/trips",
+                web::get().to(apex::handlers::trips::get_trips).wrap(JwtAuth {
+                    required_permission: Some(4),
+                }),
             ),
     );
 }

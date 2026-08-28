@@ -28,7 +28,7 @@ mod support;
 
 use apex::db::stats_queries;
 use apex::models::trip::TripStatisticsDetails;
-use sqlx::{PgPool, Row};
+use sqlx::Row;
 
 /// The window every assertion runs over. Wide enough to contain the whole
 /// fixture; the per-month rental logic is exercised inside it, not by clipping.
@@ -39,87 +39,10 @@ const TO: &str = "2025-06-30";
 /* Fixture                                                                   */
 /* ------------------------------------------------------------------------ */
 
-async fn seed(pool: &PgPool) {
-    sqlx::raw_sql(
-        r#"
-        -- Fee mappings. `fee` means something different per company: a rate in
-        -- EGP/1000L for Petrol Arrows, a BAND NUMBER for Watanya, and nothing
-        -- at all for TAQA/Petromin (which bill on distance).
-        INSERT INTO fee_mappings (company, terminal, drop_off_point, distance, fee) VALUES
-            ('Petrol Arrows', 'PA-T1', 'PA-Near',  120.0, 30.5),
-            ('Petrol Arrows', 'PA-T1', 'PA-Far',   340.0, 44.25),
-            ('Watanya',       'WA-T1', 'WA-B1',    100.0, 1),
-            ('Watanya',       'WA-T1', 'WA-B2',    150.0, 2),
-            ('Watanya',       'WA-T1', 'WA-B15',   900.0, 15),
-            ('TAQA',          'TQ-T1', 'TQ-Site',  210.0, 0),
-            ('Petromin',      'PM-T1', 'PM-Site',  180.0, 0);
-        -- Deliberately NOT mapped: ('Petrol Arrows','PA-T1','PA-Unmapped') and
-        -- ('Watanya','WA-T1','WA-Unmapped'). Both must yield 0.0 revenue via
-        -- COALESCE/ELSE, not a NULL that poisons the SUM.
+/// The fixture lives in `support` because the trips-list suite asserts against
+/// the very same rows — that is the point of it, since the two must agree.
+use support::seed_trip_fixture as seed;
 
-        /* ---- Petrol Arrows: tank_capacity * fee / 1000 ---- */
-        INSERT INTO trips (company, terminal, drop_off_point, car_no_plate, tank_capacity, date, receipt_no) VALUES
-            ('Petrol Arrows','PA-T1','PA-Near',     'PA-A', 40000, '2025-05-05', 'PA1'),
-            ('Petrol Arrows','PA-T1','PA-Near',     'PA-A', 36000, '2025-05-06', 'PA2'),
-            ('Petrol Arrows','PA-T1','PA-Far',      'PA-B', 50000, '2025-05-07', 'PA3'),
-            ('Petrol Arrows','PA-T1','PA-Unmapped', 'PA-B', 45000, '2025-05-08', 'PA4');
-
-        /* ---- Watanya: tank_capacity * band_rate / 1000 ---- */
-        INSERT INTO trips (company, terminal, drop_off_point, car_no_plate, tank_capacity, date, receipt_no) VALUES
-            ('Watanya','WA-T1','WA-B1',       'WA-A', 40000, '2025-05-05', 'WA1'),
-            ('Watanya','WA-T1','WA-B2',       'WA-A', 40000, '2025-05-06', 'WA2'),
-            ('Watanya','WA-T1','WA-B15',      'WA-B', 30000, '2025-05-07', 'WA3'),
-            ('Watanya','WA-T1','WA-Unmapped', 'WA-B', 30000, '2025-05-08', 'WA4');
-
-        /* ---- Watanya multi-container: one logical trip, three receipts ----
-           Counted ONCE by total_trips but its volume/revenue all count. */
-        INSERT INTO trips (company, terminal, drop_off_point, car_no_plate, tank_capacity, date, receipt_no, parent_trip_id) VALUES
-            ('Watanya','WA-T1','WA-B1','WA-C', 10000, '2025-05-09', 'WAC1', 9001),
-            ('Watanya','WA-T1','WA-B1','WA-C', 10000, '2025-05-09', 'WAC2', 9001),
-            ('Watanya','WA-T1','WA-B1','WA-C', 10000, '2025-05-09', 'WAC3', 9001);
-
-        /* ---- TAQA: distance * 50.5, plus a per-car per-MONTH rental ----
-           TQ-A works 28 days in May  -> full 43000.
-           TQ-B works 10 days in May  -> 43000 - 18 * (43000/28).
-           TQ-A also works  3 days in June -> a SECOND, separately tapered
-           monthly rental. Summing days across the range instead of per month
-           would give one wrong number here, which is the point. */
-        INSERT INTO trips (company, terminal, drop_off_point, car_no_plate, tank_capacity, date, receipt_no)
-        SELECT 'TAQA','TQ-T1','TQ-Site','TQ-A', 30000,
-               to_char(DATE '2025-05-01' + (n || ' days')::interval, 'YYYY-MM-DD'),
-               'TQA' || n
-        FROM generate_series(0, 27) AS n;
-
-        INSERT INTO trips (company, terminal, drop_off_point, car_no_plate, tank_capacity, date, receipt_no)
-        SELECT 'TAQA','TQ-T1','TQ-Site','TQ-B', 25000,
-               to_char(DATE '2025-05-01' + (n || ' days')::interval, 'YYYY-MM-DD'),
-               'TQB' || n
-        FROM generate_series(0, 9) AS n;
-
-        INSERT INTO trips (company, terminal, drop_off_point, car_no_plate, tank_capacity, date, receipt_no)
-        SELECT 'TAQA','TQ-T1','TQ-Site','TQ-A', 30000,
-               to_char(DATE '2025-06-01' + (n || ' days')::interval, 'YYYY-MM-DD'),
-               'TQAJ' || n
-        FROM generate_series(0, 2) AS n;
-
-        /* ---- Petromin: distance * 42.5, plus 2000 per CAR-DAY ----
-           PM-A runs twice on 05-18 (ONE car-day, not two) and once on 05-19.
-           PM-B runs once on 05-18. Three car-days total => 6000. */
-        INSERT INTO trips (company, terminal, drop_off_point, car_no_plate, tank_capacity, date, receipt_no) VALUES
-            ('Petromin','PM-T1','PM-Site','PM-A', 20000, '2025-05-18', 'PM1'),
-            ('Petromin','PM-T1','PM-Site','PM-A', 20000, '2025-05-18', 'PM2'),
-            ('Petromin','PM-T1','PM-Site','PM-A', 20000, '2025-05-19', 'PM3'),
-            ('Petromin','PM-T1','PM-Site','PM-B', 20000, '2025-05-18', 'PM4');
-
-        /* ---- Soft-deleted row: must be invisible to every formula ---- */
-        INSERT INTO trips (company, terminal, drop_off_point, car_no_plate, tank_capacity, date, receipt_no, deleted_at) VALUES
-            ('Watanya','WA-T1','WA-B15','WA-Z', 99000, '2025-05-10', 'DEL1', now());
-        "#,
-    )
-    .execute(pool)
-    .await
-    .expect("seed revenue fixture");
-}
 
 /* ------------------------------------------------------------------------ */
 /* Snapshot formatting                                                       */
