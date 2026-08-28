@@ -124,7 +124,8 @@ fn row_predicate() -> String {
                 ELSE TRUE END) \
          AND ({RECEIPT_STATUS}::text IS NULL OR CASE {RECEIPT_STATUS} \
                 WHEN 'pending'   THEN NOT EXISTS ( \
-                    SELECT 1 FROM receipt_steps rs WHERE rs.trip_id = r.id) \
+                    SELECT 1 FROM receipt_steps rs \
+                    WHERE rs.trip_id = r.id AND rs.deleted_at IS NULL) \
                 WHEN 'in_garage' THEN {latest_garage} \
                 WHEN 'in_office' THEN {latest_office} \
                 ELSE TRUE END)",
@@ -145,11 +146,17 @@ const UNSET_MARKER: &str = "غير مسجل";
 /// ORDER BY ... LIMIT 1 comparison, which is how FalconGo phrased it and is
 /// also what lets the index on `trip_id` do the work.
 fn latest_step_is(location: &str) -> String {
+    // deleted_at IS NULL in BOTH subqueries: a soft-deleted step is a
+    // correction, and letting it count as "the latest" resurrects the very
+    // state someone deleted (observed: a deleted Garage step later than the
+    // live Office step made an office-received trip filter as in_garage).
     format!(
         "EXISTS (SELECT 1 FROM receipt_steps rs1 \
-          WHERE rs1.trip_id = r.id AND rs1.location = '{location}' \
+          WHERE rs1.trip_id = r.id AND rs1.deleted_at IS NULL \
+            AND rs1.location = '{location}' \
             AND NOT EXISTS (SELECT 1 FROM receipt_steps rs2 \
-                 WHERE rs2.trip_id = r.id AND rs2.received_at > rs1.received_at))"
+                 WHERE rs2.trip_id = r.id AND rs2.deleted_at IS NULL \
+                   AND rs2.received_at > rs1.received_at))"
     )
 }
 
