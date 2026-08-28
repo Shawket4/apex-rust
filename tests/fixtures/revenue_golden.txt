@@ -4,7 +4,7 @@ PA-Near | trips=2 vol=76000.00 dist=240.00 fee=30.50 rev=2318.00 rental=- vat=- 
 PA-Unmapped | trips=1 vol=45000.00 dist=0.00 fee=0.00 rev=0.00 rental=- vat=- with_vat=- cars=- days=- car_days=-
 == Watanya ==
 Unmapped | trips=1 vol=30000.00 dist=0.00 fee=0.00 rev=0.00 rental=- vat=0.00 with_vat=0.00 cars=- days=- car_days=-
-Fee 1 | trips=2 vol=70000.00 dist=400.00 fee=1.00 rev=7315.00 rental=- vat=1024.10 with_vat=8339.10 cars=- days=- car_days=-
+Fee 1 | trips=2 vol=70000.00 dist=200.00 fee=1.00 rev=7315.00 rental=- vat=1024.10 with_vat=8339.10 cars=- days=- car_days=-
 Fee 2 | trips=1 vol=40000.00 dist=150.00 fee=2.00 rev=4884.00 rental=- vat=683.76 with_vat=5567.76 cars=- days=- car_days=-
 Fee 15 | trips=1 vol=30000.00 dist=900.00 fee=15.00 rev=12606.00 rental=- vat=1764.84 with_vat=14370.84 cars=- days=- car_days=-
 == TAQA ==
