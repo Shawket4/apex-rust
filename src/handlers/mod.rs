@@ -1,3 +1,4 @@
+pub mod dashboard;
 pub mod trip_stats;
 pub mod trips;
 
@@ -31,6 +32,33 @@ pub fn configure_api_v1(cfg: &mut web::ServiceConfig) {
 
     cfg.service(
         web::scope("/api/v1")
+            // The entry point. The list itself is permission 1; the handler
+            // withholds the money block below 4 on its own.
+            .route(
+                "/dashboard",
+                web::get().to(dashboard::get_dashboard).wrap(at(1)),
+            )
+            // Drawers behind the money cards are pure money — 4 only,
+            // enforced INSIDE the handlers: JwtAuth's required_permission is
+            // not checked by the middleware (handlers own the ladder, so pages
+            // can serve reduced data to lower levels). The trips drawer
+            // carries counts, not money, and is open to any admin token.
+            .route(
+                "/dashboard/revenue",
+                web::get().to(dashboard::get_revenue_drawer).wrap(at(4)),
+            )
+            .route(
+                "/dashboard/cash-out",
+                web::get().to(dashboard::get_cash_out_drawer).wrap(at(4)),
+            )
+            .route(
+                "/dashboard/advances",
+                web::get().to(dashboard::get_advances_drawer).wrap(at(4)),
+            )
+            .route(
+                "/dashboard/trips",
+                web::get().to(dashboard::get_trips_drawer).wrap(at(1)),
+            )
             .service(web::scope("/sessions").route(
                 "/{id}/location-pings",
                 web::get().to(session::get_session_location_pings).wrap(at(1)),

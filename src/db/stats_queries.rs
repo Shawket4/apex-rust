@@ -18,7 +18,7 @@ use crate::models::*;
 /// escape is a silent query corruption. A placeholder that no longer exists in
 /// `revenue` simply survives into the SQL and fails loudly at the database,
 /// which is the failure mode worth having.
-fn render(sql: &str) -> String {
+pub(crate) fn render(sql: &str) -> String {
     use crate::db::revenue::*;
     sql.replace("{trip_count}", &logical_trip_count_sql("parent_trip_id"))
         .replace("{trip_distance}", &trip_distance_sql("t", "fm"))
