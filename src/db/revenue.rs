@@ -329,10 +329,22 @@ pub mod allocation {
         // the share is that whole amount divided by however many rows sit in
         // the same bucket. COUNT(*) OVER a partition containing the row is
         // never zero, so this cannot divide by zero.
-        let taqa_share = share_sql(
-            &taqa_monthly_rental_sql("COALESCE(tm.working_days, 0)"),
-            "s.company, s.car_no_plate, DATE_TRUNC('month', s.date::date)",
+        // A DAY of rental, then that day split between the trips that used it.
+        //
+        // Not the month split across the month's trips: that spread one busy
+        // day's dilution across every other trip the car made, so a trip on a
+        // day it had the truck to itself still carried less because of what
+        // happened a fortnight later. A day is shared only by the trips on it.
+        //
+        // The daily rate falls out as a constant for any month under 28 days:
+        // monthly is days * (43000/28), so monthly / days is 43000/28 exactly.
+        // That is why this figure does not move with the caller's date range,
+        // and the sum still comes back to the month's rental — d days at M/d.
+        let taqa_day_rate = format!(
+            "(COALESCE({}, 0.0) / NULLIF(COALESCE(tm.working_days, 0), 0))",
+            taqa_monthly_rental_sql("COALESCE(tm.working_days, 0)")
         );
+        let taqa_share = share_sql(&taqa_day_rate, "s.company, s.car_no_plate, s.date");
         let petromin_share = share_sql(
             &format!("{PETROMIN_RENTAL_PER_CAR_DAY:?}"),
             "s.company, s.car_no_plate, s.date",
