@@ -24,6 +24,7 @@ use sqlx::PgPool;
 use crate::auth::Claims;
 use crate::db::trip_queries::{list_trips, TripListFilters, DEFAULT_LIMIT};
 use crate::models::trip_list::{TripListMeta, TripListResponse};
+use crate::utils::response;
 
 /// The permission that may see per-trip revenue.
 const FINANCIAL_PERMISSION: i32 = 4;
@@ -40,6 +41,11 @@ pub struct TripListQuery {
     /// [`crate::db::revenue::allocation`].
     pub from: Option<String>,
     pub to: Option<String>,
+    /// `msgpack` to get MessagePack instead of JSON. The dashboard always asks
+    /// for it: these payloads nest receipt steps, parent headers and scanned
+    /// receipts under every row, and the map-keyed encoding is several times
+    /// smaller on the wire for that shape.
+    pub format: Option<String>,
 }
 
 /// Empty query strings arrive as `Some("")` from the dashboard's form state.
@@ -61,6 +67,7 @@ pub async fn get_trips(
     let financial = permission >= FINANCIAL_PERMISSION;
 
     let query = query.into_inner();
+    let use_msgpack = query.format.as_deref() == Some("msgpack");
     let filters = TripListFilters {
         page: query.page.unwrap_or(1),
         limit: query.limit.unwrap_or(DEFAULT_LIMIT),
@@ -80,7 +87,7 @@ pub async fn get_trips(
             actix_web::error::ErrorInternalServerError("failed to fetch trips")
         })?;
 
-    Ok(HttpResponse::Ok().json(TripListResponse {
+    let payload = TripListResponse {
         message: "Trips retrieved successfully",
         data,
         meta: TripListMeta {
@@ -91,7 +98,9 @@ pub async fn get_trips(
             // `normalized`, so this cannot divide by zero.
             pages: (total + filters.limit - 1) / filters.limit,
         },
-    }))
+    };
+
+    response(&payload, use_msgpack).map_err(actix_web::error::ErrorInternalServerError)
 }
 
 /// Mounts `GET /api/v1/trips`.
