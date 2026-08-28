@@ -199,22 +199,50 @@ pub async fn get_taqa_stats(
                 AND t.date BETWEEN $1 AND $2
         ),
         car_monthly_working_days AS (
+            -- Days the car actually worked that month, across every terminal.
+            -- A car cannot work two days in one day, so a date it served two
+            -- terminals on counts ONCE. Grouping this by terminal, as it used
+            -- to, credited such a day to each terminal and billed the fleet a
+            -- day it had not earned.
             SELECT 
-                terminal,
                 car_no_plate,
                 DATE_TRUNC('month', date::date) as month,
                 COUNT(DISTINCT date)::int as working_days_in_month
             FROM trip_data
-            GROUP BY terminal, car_no_plate, DATE_TRUNC('month', date::date)
+            GROUP BY car_no_plate, DATE_TRUNC('month', date::date)
         ),
-        car_monthly_rentals AS (
+        car_monthly_terminal_days AS (
+            -- The same month split by terminal. Used only to attribute the one
+            -- rental to the terminals that earned it, never to size it.
             SELECT 
                 terminal,
                 car_no_plate,
-                month,
-                working_days_in_month,
-                {taqa_monthly_rental} as monthly_rental
-            FROM car_monthly_working_days
+                DATE_TRUNC('month', date::date) as month,
+                COUNT(DISTINCT date)::int as terminal_days
+            FROM trip_data
+            GROUP BY terminal, car_no_plate, DATE_TRUNC('month', date::date)
+        ),
+        car_monthly_rentals AS (
+            -- One rental per car-month, divided between terminals in proportion
+            -- to the days each saw. The shares sum back to that single rental
+            -- exactly, so per-terminal reporting survives without inventing a
+            -- second rental. Column shape is unchanged for everything below.
+            SELECT 
+                td.terminal,
+                td.car_no_plate,
+                td.month,
+                td.terminal_days as working_days_in_month,
+                (m.monthly_rental * td.terminal_days::float8
+                   / SUM(td.terminal_days) OVER (PARTITION BY td.car_no_plate, td.month)
+                )::float8 as monthly_rental
+            FROM car_monthly_terminal_days td
+            JOIN (
+                SELECT 
+                    car_no_plate,
+                    month,
+                    {taqa_monthly_rental} as monthly_rental
+                FROM car_monthly_working_days
+            ) m ON m.car_no_plate = td.car_no_plate AND m.month = td.month
         ),
         car_total_rentals AS (
             SELECT 
@@ -328,11 +356,28 @@ pub async fn get_petromin_stats(
                 AND t.deleted_at IS NULL
                 AND t.date BETWEEN $1 AND $2
         ),
+        car_day_shares AS (
+            -- Each (car, date) is ONE car-day. When a car served several
+            -- terminals on the same date, that day is SPLIT between them rather
+            -- than charged to each -- a car cannot be rented twice for one day.
+            SELECT 
+                terminal,
+                car_no_plate,
+                date,
+                1.0::float8 / COUNT(*) OVER (PARTITION BY car_no_plate, date)
+                    as day_share
+            FROM (SELECT DISTINCT terminal, car_no_plate, date FROM trip_data) d
+        ),
         car_days AS (
             SELECT 
                 terminal,
-                COUNT(DISTINCT car_no_plate || '-' || date)::bigint as total_car_days
-            FROM trip_data
+                -- What this terminal is billed for: whole days it had the car
+                -- to itself, fractions of days it shared.
+                SUM(day_share)::float8 as chargeable_car_days,
+                -- What it saw. Kept whole for display; summing this across
+                -- terminals can exceed the fleet's real days, and should.
+                COUNT(*)::bigint as total_car_days
+            FROM car_day_shares
             GROUP BY terminal
         ),
         aggregates AS (
@@ -356,8 +401,8 @@ pub async fn get_petromin_stats(
             a.distinct_days,
             COALESCE(cd.total_car_days, 0)::bigint as car_days,
             CASE WHEN $3 THEN a.base_revenue ELSE 0.0 END as base_revenue,
-            CASE WHEN $3 THEN (COALESCE(cd.total_car_days, 0) * {petromin_rental_per_car_day})::float8 ELSE NULL END as car_rental,
-            CASE WHEN $3 THEN ((a.base_revenue + COALESCE(cd.total_car_days, 0) * {petromin_rental_per_car_day}) * {vat_rate})::float8 ELSE NULL END as vat,
+            CASE WHEN $3 THEN (COALESCE(cd.chargeable_car_days, 0.0) * {petromin_rental_per_car_day})::float8 ELSE NULL END as car_rental,
+            CASE WHEN $3 THEN ((a.base_revenue + COALESCE(cd.chargeable_car_days, 0.0) * {petromin_rental_per_car_day}) * {vat_rate})::float8 ELSE NULL END as vat,
             {petromin_rate} as fee
         FROM aggregates a
         LEFT JOIN car_days cd ON a.terminal = cd.terminal
@@ -665,22 +710,50 @@ async fn get_taqa_route_details(
                 AND t.date BETWEEN $1 AND $2
         ),
         car_monthly_working_days AS (
+            -- Days the car actually worked that month, across every terminal.
+            -- A car cannot work two days in one day, so a date it served two
+            -- terminals on counts ONCE. Grouping this by terminal, as it used
+            -- to, credited such a day to each terminal and billed the fleet a
+            -- day it had not earned.
             SELECT 
-                terminal,
                 car_no_plate,
                 DATE_TRUNC('month', date::date) as month,
                 COUNT(DISTINCT date)::int as working_days_in_month
             FROM trip_data
-            GROUP BY terminal, car_no_plate, DATE_TRUNC('month', date::date)
+            GROUP BY car_no_plate, DATE_TRUNC('month', date::date)
         ),
-        car_monthly_rentals AS (
+        car_monthly_terminal_days AS (
+            -- The same month split by terminal. Used only to attribute the one
+            -- rental to the terminals that earned it, never to size it.
             SELECT 
                 terminal,
                 car_no_plate,
-                month,
-                working_days_in_month,
-                {taqa_monthly_rental} as monthly_rental
-            FROM car_monthly_working_days
+                DATE_TRUNC('month', date::date) as month,
+                COUNT(DISTINCT date)::int as terminal_days
+            FROM trip_data
+            GROUP BY terminal, car_no_plate, DATE_TRUNC('month', date::date)
+        ),
+        car_monthly_rentals AS (
+            -- One rental per car-month, divided between terminals in proportion
+            -- to the days each saw. The shares sum back to that single rental
+            -- exactly, so per-terminal reporting survives without inventing a
+            -- second rental. Column shape is unchanged for everything below.
+            SELECT 
+                td.terminal,
+                td.car_no_plate,
+                td.month,
+                td.terminal_days as working_days_in_month,
+                (m.monthly_rental * td.terminal_days::float8
+                   / SUM(td.terminal_days) OVER (PARTITION BY td.car_no_plate, td.month)
+                )::float8 as monthly_rental
+            FROM car_monthly_terminal_days td
+            JOIN (
+                SELECT 
+                    car_no_plate,
+                    month,
+                    {taqa_monthly_rental} as monthly_rental
+                FROM car_monthly_working_days
+            ) m ON m.car_no_plate = td.car_no_plate AND m.month = td.month
         ),
         car_rental_totals AS (
             SELECT 
@@ -829,11 +902,21 @@ async fn get_petromin_route_details(
                 AND t.date BETWEEN $1 AND $2
         ),
         car_working_days AS (
+            -- A date the car served two terminals is one day of rental, split
+            -- between them, not a day charged to each.
             SELECT 
                 terminal,
                 car_no_plate,
-                COUNT(DISTINCT date)::int as working_days
-            FROM trip_data
+                COUNT(*)::int as working_days,
+                SUM(day_share)::float8 as chargeable_days
+            FROM (
+                SELECT 
+                    terminal,
+                    car_no_plate,
+                    1.0::float8 / COUNT(*) OVER (PARTITION BY car_no_plate, date)
+                        as day_share
+                FROM (SELECT DISTINCT terminal, car_no_plate, date FROM trip_data) d
+            ) shares
             GROUP BY terminal, car_no_plate
         ),
         car_trip_stats AS (
@@ -856,7 +939,7 @@ async fn get_petromin_route_details(
                 cts.total_distance,
                 cts.base_revenue,
                 COALESCE(cwd.working_days, 0)::bigint as working_days,
-                (COALESCE(cwd.working_days, 0) * {petromin_rental_per_car_day})::float8 as car_rental
+                (COALESCE(cwd.chargeable_days, 0.0) * {petromin_rental_per_car_day})::float8 as car_rental
             FROM car_trip_stats cts
             LEFT JOIN car_working_days cwd 
                 ON cts.terminal = cwd.terminal 
