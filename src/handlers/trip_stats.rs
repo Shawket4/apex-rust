@@ -197,6 +197,9 @@ pub struct RouteDaysQuery {
     pub drop_off_point: Option<String>,
     pub fee: Option<f64>,
     pub route_name: Option<String>,
+    /// `msgpack` for MessagePack, matching the statistics endpoint this panel
+    /// sits inside.
+    pub format: Option<String>,
 }
 
 /// `GET /api/v1/trip-statistics/route-days`
@@ -221,6 +224,7 @@ pub async fn get_route_days(
         .unwrap_or(false);
 
     let q = query.into_inner();
+    let use_msgpack = q.format.as_deref() == Some("msgpack");
     let blank_is_none = |v: Option<String>| v.filter(|s| !s.trim().is_empty());
 
     let mut days = get_route_day_breakdown(
@@ -249,5 +253,6 @@ pub async fn get_route_days(
         }
     }
 
-    Ok(HttpResponse::Ok().json(serde_json::json!({ "data": days })))
+    response(&serde_json::json!({ "data": days }), use_msgpack)
+        .map_err(actix_web::error::ErrorInternalServerError)
 }

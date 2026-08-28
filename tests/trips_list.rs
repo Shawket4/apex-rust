@@ -506,3 +506,121 @@ async fn the_endpoint_gates_the_list_and_the_money_separately() {
         );
     }
 }
+
+/// The dashboard asks for MessagePack. The encoding must carry exactly what
+/// JSON does — including the ABSENCE of the money fields, which is the whole
+/// mechanism the permission gate relies on. A codec that turned a skipped
+/// field into a null would quietly turn "not allowed to see" into
+/// "earned nothing".
+#[actix_web::test]
+async fn msgpack_carries_the_same_payload_as_json() {
+    use actix_web::{test, web, App};
+
+    support::init();
+    let pool = db("apex_trips_msgpack").await;
+    let app = test::init_service(
+        App::new()
+            .app_data(web::Data::new(pool.clone()))
+            .configure(apex::handlers::trips::configure),
+    )
+    .await;
+
+    let fetch = |permission: i32, format: &str| {
+        let token = support::token_with_permission(20, permission);
+        test::TestRequest::get()
+            .uri(&format!(
+                "/api/v1/trips?limit=50&from=2025-05-01&to=2025-06-30&format={format}"
+            ))
+            .insert_header(("Authorization", format!("Bearer {token}")))
+            .to_request()
+    };
+
+    for permission in [1, 4] {
+        let json: serde_json::Value =
+            test::call_and_read_body_json(&app, fetch(permission, "json")).await;
+
+        let resp = test::call_service(&app, fetch(permission, "msgpack")).await;
+        assert_eq!(
+            resp.headers().get("content-type").unwrap(),
+            "application/msgpack"
+        );
+        let bytes = test::read_body(resp).await;
+        let packed: serde_json::Value =
+            rmp_serde::from_slice(&bytes).expect("decode msgpack");
+
+        assert!(
+            same_payload(&packed, &json, "$"),
+            "msgpack and json disagree at permission {permission}"
+        );
+
+        // And the gate survived the encoding, not just the comparison.
+        let rows = packed["data"].as_array().unwrap();
+        assert!(!rows.is_empty());
+        let has_money = rows.iter().any(|r| r.get("revenue").is_some());
+        assert_eq!(
+            has_money,
+            permission >= 4,
+            "money visibility wrong in msgpack at permission {permission}"
+        );
+        // Absent, never null.
+        for row in rows {
+            assert!(
+                !row.get("revenue").is_some_and(|v| v.is_null()),
+                "a skipped money field encoded as null"
+            );
+        }
+    }
+}
+
+/// Structural equality, with floats compared to within a rounding step.
+///
+/// The two encodings genuinely differ in the last bit of an f64, and MessagePack
+/// is the accurate one: JSON round-trips a float through decimal text, so
+/// 13840.414285714285 comes back as 13840.414285714283. Asserting exact equality
+/// would be asserting that JSON does not lose precision, which it does.
+fn same_payload(a: &serde_json::Value, b: &serde_json::Value, path: &str) -> bool {
+    use serde_json::Value;
+    match (a, b) {
+        (Value::Number(x), Value::Number(y)) => {
+            match (x.as_f64(), y.as_f64()) {
+                (Some(x), Some(y)) => {
+                    let ok = (x - y).abs() <= 1e-9 * x.abs().max(y.abs()).max(1.0);
+                    if !ok {
+                        eprintln!("{path}: {x} != {y}");
+                    }
+                    ok
+                }
+                _ => x == y,
+            }
+        }
+        (Value::Array(x), Value::Array(y)) => {
+            x.len() == y.len()
+                && x.iter()
+                    .zip(y)
+                    .enumerate()
+                    .all(|(i, (a, b))| same_payload(a, b, &format!("{path}[{i}]")))
+        }
+        (Value::Object(x), Value::Object(y)) => {
+            // Key sets must match exactly — an omitted field appearing in one
+            // encoding and not the other is the failure this test exists for.
+            if x.len() != y.len() {
+                eprintln!("{path}: key counts differ ({} vs {})", x.len(), y.len());
+                return false;
+            }
+            x.iter().all(|(k, v)| match y.get(k) {
+                Some(other) => same_payload(v, other, &format!("{path}.{k}")),
+                None => {
+                    eprintln!("{path}.{k}: missing on one side");
+                    false
+                }
+            })
+        }
+        _ => {
+            let ok = a == b;
+            if !ok {
+                eprintln!("{path}: {a} != {b}");
+            }
+            ok
+        }
+    }
+}
