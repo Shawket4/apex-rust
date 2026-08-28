@@ -8,37 +8,15 @@ use apex::config::CONFIG;
 use apex::handlers::*;
 use apex::{api, boot, cutover, ingest, ops, parser};
 
-/// Non-banksms routes: sessions and trip statistics. The legacy
-/// /fleet-expenses stack is gone — the dashboard has called the banksms
-/// routes exclusively since the migration, and the old handlers kept a
-/// weaker (level 3) gate on financial data.
+/// Non-banksms routes: sessions, trip statistics and the trips list.
+///
+/// The scope itself is built in the lib so the integration suite mounts the
+/// same wiring the binary serves. The legacy /fleet-expenses stack is gone --
+/// the dashboard has called the banksms routes exclusively since the
+/// migration, and the old handlers kept a weaker (level 3) gate on financial
+/// data.
 fn configure_routes(cfg: &mut web::ServiceConfig) {
-    cfg.service(
-        web::scope("/api/v1")
-            .service(web::scope("/sessions").route(
-                "/{id}/location-pings",
-                web::get().to(get_session_location_pings).wrap(JwtAuth {
-                    required_permission: Some(1),
-                }),
-            ))
-            .route(
-                "/trip-statistics",
-                web::get().to(get_trip_statistics).wrap(JwtAuth {
-                    required_permission: Some(3),
-                }),
-            )
-            .route(
-                "/trip-statistics/route-days",
-                web::get().to(get_route_days).wrap(JwtAuth {
-                    required_permission: Some(3),
-                }),
-            ),
-    );
-    // Permission 1 to SEE the list, matching the FalconGo route this replaces --
-    // gating the whole list higher would lock every dispatcher out of the trips
-    // page. The revenue columns are the level-4 feature, withheld by the
-    // handler itself. Registered from the lib so tests mount the same gate.
-    apex::handlers::trips::configure(cfg);
+    apex::handlers::configure_api_v1(cfg);
 }
 
 #[actix_web::main]

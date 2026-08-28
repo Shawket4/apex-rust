@@ -17,7 +17,6 @@
 //! some layer above was trusted to strip.
 
 use actix_web::{web, HttpMessage, HttpRequest, HttpResponse};
-use crate::auth::JwtAuth;
 use serde::Deserialize;
 use sqlx::PgPool;
 
@@ -103,21 +102,6 @@ pub async fn get_trips(
     response(&payload, use_msgpack).map_err(actix_web::error::ErrorInternalServerError)
 }
 
-/// Mounts `GET /api/v1/trips`.
-///
-/// Lives here rather than in `main.rs` so the integration suite mounts the
-/// route the binary actually serves — including its permission gate. A gate
-/// that is only wired up in `main` is a gate no test can check.
-pub fn configure(cfg: &mut web::ServiceConfig) {
-    cfg.service(
-        web::scope("/api/v1").route(
-            "/trips",
-            web::get().to(get_trips).wrap(JwtAuth {
-                required_permission: Some(VIEW_PERMISSION),
-            }),
-        ),
-    );
-}
 
 /// The permission needed to see the list at all, matching the FalconGo route
 /// this replaces. Money is gated separately at [`FINANCIAL_PERMISSION`].

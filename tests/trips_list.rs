@@ -451,7 +451,7 @@ async fn the_endpoint_gates_the_list_and_the_money_separately() {
     let app = test::init_service(
         App::new()
             .app_data(web::Data::new(pool.clone()))
-            .configure(apex::handlers::trips::configure),
+            .configure(apex::handlers::configure_api_v1),
     )
     .await;
 
@@ -521,7 +521,7 @@ async fn msgpack_carries_the_same_payload_as_json() {
     let app = test::init_service(
         App::new()
             .app_data(web::Data::new(pool.clone()))
-            .configure(apex::handlers::trips::configure),
+            .configure(apex::handlers::configure_api_v1),
     )
     .await;
 
@@ -623,4 +623,49 @@ fn same_payload(a: &serde_json::Value, b: &serde_json::Value, path: &str) -> boo
             ok
         }
     }
+}
+
+/// The route must still resolve when the banksms scopes are mounted alongside
+/// it, in the order the binary mounts them.
+///
+/// This is the outage this test exists for. `/api/v1/trips` was registered in
+/// its own `web::scope("/api/v1")` next to the existing one. actix matches the
+/// first service whose prefix matches and does not fall through, so every
+/// `/api/v1/...` request went to whichever scope came first and the trips route
+/// was unreachable — 404 in production, green in CI, because the test mounted
+/// its scope alone.
+#[actix_web::test]
+async fn the_route_resolves_alongside_the_banksms_scopes() {
+    use actix_web::{test, web, App};
+
+    support::init();
+    let pool = db("apex_trips_scopes").await;
+    let app = test::init_service(
+        App::new()
+            .app_data(web::Data::new(pool.clone()))
+            // Same order as main.rs: banksms first, then the /api/v1 surface.
+            .configure(apex::api::configure)
+            .configure(apex::handlers::configure_api_v1),
+    )
+    .await;
+
+    let token = support::token_with_permission(30, 4);
+    let req = test::TestRequest::get()
+        .uri("/api/v1/trips?limit=5&from=2025-05-01&to=2025-06-30")
+        .insert_header(("Authorization", format!("Bearer {token}")))
+        .to_request();
+    let resp = test::call_service(&app, req).await;
+    assert_eq!(
+        resp.status(),
+        200,
+        "the trips route was shadowed by another /api/v1 scope"
+    );
+
+    // And the neighbours still answer, so the fix did not shadow them instead.
+    let req = test::TestRequest::get()
+        .uri("/api/v1/categories")
+        .insert_header(("Authorization", format!("Bearer {}", support::token_with_permission(31, 4))))
+        .to_request();
+    let resp = test::call_service(&app, req).await;
+    assert_ne!(resp.status(), 404, "the banksms routes stopped resolving");
 }

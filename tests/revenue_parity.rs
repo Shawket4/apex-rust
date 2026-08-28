@@ -409,3 +409,68 @@ async fn route_days_filter_and_count_logical_trips() {
     assert!(days.iter().all(|d| d.date.starts_with("2025-05")));
     assert_eq!(days.len(), 2, "expected the standalone day and the container day");
 }
+
+/// Execute every statistics query there is, against real tables.
+///
+/// This exists because of a production outage. Centralizing the formulas
+/// replaced inline SQL with `{placeholder}` tokens that `render()` substitutes,
+/// and `get_trip_counts` was left calling `sqlx::query` directly — so a literal
+/// `{trip_count}` went to Postgres and every call to /api/v1/trip-statistics
+/// answered 500 with `syntax error at or near "{"`.
+///
+/// Nothing caught it. The parity suite called the four `get_*_stats` functions
+/// by name and the handler's other queries were never executed by anything. A
+/// query that is never run is a query whose SQL was never checked, so this runs
+/// all of them and asserts no placeholder survives into the database.
+///
+/// If you add a statistics query, add it here.
+#[tokio::test]
+async fn every_statistics_query_executes() {
+    // calculate_car_totals is deliberately absent: it is pure Rust over
+    // already-fetched rows, and this test is about SQL reaching the database
+    // intact.
+    use apex::db::stats_queries::{
+        get_companies, get_route_details, get_stats_by_date, get_trip_counts,
+    };
+
+    let pool = support::fresh_db("apex_all_queries").await;
+    seed(&pool).await;
+
+    let companies = get_companies(&pool, FROM, TO, None).await.expect("companies");
+    assert_eq!(companies.len(), 4, "fixture should cover all four companies");
+
+    for company in &companies {
+        // Both permission states: the financial flag changes the SELECT list.
+        for financial in [true, false] {
+            get_route_details(&pool, company, FROM, TO, financial)
+                .await
+                .unwrap_or_else(|e| panic!("route details {company} (financial={financial}): {e}"));
+        }
+
+        let (trips, receipts) = get_trip_counts(&pool, company, FROM, TO)
+            .await
+            .unwrap_or_else(|e| panic!("trip counts {company}: {e}"));
+        assert!(
+            receipts >= trips,
+            "{company}: {receipts} receipts cannot be fewer than {trips} trips"
+        );
+    }
+
+    // Watanya's three containers are one trip but three receipts — the case the
+    // counts exist to tell apart.
+    let (trips, receipts) = get_trip_counts(&pool, "Watanya", FROM, TO).await.unwrap();
+    assert!(
+        receipts > trips,
+        "the container fixture should make receipts exceed trips, got {receipts} vs {trips}"
+    );
+
+    for financial in [true, false] {
+        get_stats_by_date(&pool, FROM, TO, None, financial)
+            .await
+            .unwrap_or_else(|e| panic!("stats by date (financial={financial}): {e}"));
+        get_stats_by_date(&pool, FROM, TO, Some("Watanya"), financial)
+            .await
+            .unwrap_or_else(|e| panic!("stats by date, filtered (financial={financial}): {e}"));
+    }
+
+}
