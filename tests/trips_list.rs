@@ -350,3 +350,87 @@ async fn page_size_is_capped() {
     assert_eq!(filters.limit, MAX_LIMIT);
     assert_eq!(filters.page, 1, "page 0 is clamped to the first page");
 }
+
+/* ------------------------------------------------------------------------ */
+/* A known quirk, pinned                                                     */
+/* ------------------------------------------------------------------------ */
+
+/// A TAQA car that serves two terminals on the same day is credited a working
+/// day in each terminal's group — one day of work counted twice — so the fleet
+/// rental comes out one day's taper high.
+///
+/// This is not something the allocation introduced. It is how the statistics
+/// queries have always grouped their working-day counts, and it is live: car
+/// "ف ع ص 4381" ran Alex and Suez on 2025-06-05, worth 1535.71. Counting the
+/// day once is almost certainly the right reading of the rental contract, but
+/// changing it changes what TAQA is billed, so the behaviour is pinned here
+/// rather than quietly corrected.
+///
+/// What this test actually guards is that the list and statistics stay in
+/// agreement about it. Whichever way the question is settled, they must move
+/// together.
+#[tokio::test]
+async fn a_car_at_two_terminals_in_one_day_is_billed_twice_for_it() {
+    use apex::db::revenue::TAQA_RENTAL_PER_DAY;
+    use apex::db::stats_queries::get_taqa_stats;
+
+    let pool = support::fresh_db("apex_trips_two_terminals").await;
+    sqlx::raw_sql(
+        "INSERT INTO fee_mappings (company, terminal, drop_off_point, distance, fee) VALUES
+            ('TAQA','Alex','Site',100.0,0), ('TAQA','Suez','Site',100.0,0);
+         -- One car, ten days at Alex. The tenth day it also runs from Suez.
+         INSERT INTO trips (company, terminal, drop_off_point, car_no_plate,
+                            tank_capacity, date, receipt_no)
+         SELECT 'TAQA','Alex','Site','SPLIT-1', 30000,
+                to_char(DATE '2025-05-01' + (n || ' days')::interval, 'YYYY-MM-DD'),
+                'A' || n
+         FROM generate_series(0, 9) AS n;
+         INSERT INTO trips (company, terminal, drop_off_point, car_no_plate,
+                            tank_capacity, date, receipt_no)
+         VALUES ('TAQA','Suez','Site','SPLIT-1', 30000, '2025-05-10', 'S1');",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let stats = get_taqa_stats(&pool, "2025-05-01", "2025-05-31", true)
+        .await
+        .unwrap();
+    let stats_rental: f64 = stats.iter().filter_map(|d| d.car_rental).sum();
+
+    let filters = TripListFilters {
+        page: 1,
+        limit: MAX_LIMIT,
+        company: Some("TAQA".into()),
+        from: Some("2025-05-01".into()),
+        to: Some("2025-05-31".into()),
+        ..Default::default()
+    }
+    .normalized();
+    let (rows, _) = list_trips(&pool, &filters, true).await.unwrap();
+    let list_rental: f64 = rows.iter().filter_map(|r| r.allocated_rental).sum();
+
+    // The two must agree. That is the contract.
+    assert!(
+        (list_rental - stats_rental).abs() < 0.01,
+        "list rental {list_rental} != statistics {stats_rental}"
+    );
+
+    // And they agree on the double-count: Alex sees 10 working days, Suez sees
+    // 1, for 11 days of credit against 10 days of actual work.
+    let alex = 43_000.0 - (28.0 - 10.0) * TAQA_RENTAL_PER_DAY;
+    let suez = 43_000.0 - (28.0 - 1.0) * TAQA_RENTAL_PER_DAY;
+    assert!(
+        (stats_rental - (alex + suez)).abs() < 0.01,
+        "expected {} (Alex {alex} + Suez {suez}), got {stats_rental}",
+        alex + suez
+    );
+
+    // Stated the other way: counting 2025-05-10 once would bill exactly one
+    // day's taper less. This is the figure a decision here would move.
+    let counted_once = 43_000.0 - (28.0 - 10.0) * TAQA_RENTAL_PER_DAY;
+    assert!(
+        (stats_rental - counted_once - suez).abs() < 0.01,
+        "the gap should be exactly Suez's separate taper"
+    );
+}
