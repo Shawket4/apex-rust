@@ -59,11 +59,34 @@ pub struct MoneyBlock {
     /// The same span of the previous month, so the delta compares like with
     /// like — 1–28 August against 1–28 July, never against July's full total.
     pub revenue_prev: String,
+    /// Everything that left in the window: bank ledger + cash fuel +
+    /// advances/loans issued. The components are also broken out so the card
+    /// can show where the money went at a glance.
     pub cash_out: String,
-    pub advances_outstanding: String,
-    pub advances_count: i64,
-    /// Top five categories; everything smaller folds into "Other".
+    pub cash_out_bank: String,
+    pub cash_out_fuel: String,
+    pub cash_out_advances: String,
+    /// Outstanding debt as of now — deliberately NOT window-scoped: unpaid
+    /// money does not stop being owed because the filter moved.
+    pub owed: OwedBlock,
+    /// Top five categories (bank + the synthetic fuel/advances lines);
+    /// everything smaller folds into "Other".
     pub by_category: Vec<CategoryOut>,
+}
+
+/// Who owes us money and in what form. `salary`-kind rows are excluded —
+/// they are payroll visibility entries, not debt.
+#[derive(Serialize, Default)]
+pub struct OwedBlock {
+    pub driver_advances: String,
+    pub driver_advances_count: i64,
+    pub driver_loans: String,
+    pub driver_loans_count: i64,
+    pub employee_advances: String,
+    pub employee_advances_count: i64,
+    pub employee_loans: String,
+    pub employee_loans_count: i64,
+    pub total: String,
 }
 
 #[derive(Serialize)]
@@ -82,6 +105,12 @@ pub struct FleetEntry {
     pub plate_ar: String,
     pub last_trip_date: Option<String>,
     pub days_idle: Option<i64>,
+    /// Revenue earned today / yesterday (Cairo days), company-filtered like
+    /// the headline revenue. Absent below the financial permission.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub revenue_today: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub revenue_yesterday: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -207,6 +236,9 @@ pub struct DashboardQuery {
     /// override `month`.
     pub from: Option<String>,
     pub to: Option<String>,
+    /// Scopes the trips dimension (revenue, counts, fleet revenue). Cash-out
+    /// and owed money have no company dimension and ignore it.
+    pub company: Option<String>,
     pub format: Option<String>,
 }
 
@@ -242,53 +274,108 @@ pub async fn get_dashboard(
     let financial = permission(&req) >= FINANCIAL_PERMISSION;
     let use_msgpack = query.format.as_deref() == Some("msgpack");
     let w = resolve_window(&query);
+    let company = query.company.as_deref().filter(|c| !c.trim().is_empty());
     let p = pool.get_ref();
+
+    let today = Utc::now().with_timezone(&Cairo).date_naive();
+    let today_s = today.format("%Y-%m-%d").to_string();
+    let yesterday_s = (today - chrono::Duration::days(1)).format("%Y-%m-%d").to_string();
 
     // Everything the page needs, in flight together. The money queries only
     // join the party when the caller may see the results.
     let (totals, fleet, zero_trips, unreviewed) = tokio::try_join!(
-        q::month_totals(p, &w.from, &w.to),
+        q::month_totals(p, &w.from, &w.to, company),
         q::fleet(p),
-        q::trips_earning_zero(p, &w.from, &w.to),
+        q::trips_earning_zero(p, &w.from, &w.to, company),
         q::transactions_unreviewed(p),
     )
     .map_err(internal)?;
 
-    let money = if financial {
-        let (revenue, revenue_prev, cash_out, categories, advances) = tokio::try_join!(
-            q::revenue_total(p, &w.from, &w.to),
-            q::revenue_total(p, &w.prev_from, &w.prev_to),
-            q::cash_out_total(p, &w.from, &w.to),
-            q::cash_out_by_category(p, &w.from, &w.to),
-            q::advances_outstanding(p),
-        )
-        .map_err(internal)?;
+    let mut tile_revenue: std::collections::HashMap<(String, bool), f64> =
+        std::collections::HashMap::new();
 
-        // Top five categories; the tail folds into Other so the panel has a
-        // fixed height whatever the ledger holds.
-        let mut by_category: Vec<CategoryOut> = categories
-            .iter()
-            .take(5)
-            .map(|(k, v)| CategoryOut { key: k.clone(), out: v.to_string() })
-            .collect();
-        let tail: rust_decimal::Decimal = categories.iter().skip(5).map(|(_, v)| *v).sum();
-        if tail > rust_decimal::Decimal::ZERO {
-            by_category.push(CategoryOut { key: "Other".into(), out: tail.to_string() });
+    let money = if financial {
+        let (revenue, revenue_prev, cash_bank, fuel_out, advances_out, categories, owed, per_car) =
+            tokio::try_join!(
+                q::revenue_total(p, &w.from, &w.to, company),
+                q::revenue_total(p, &w.prev_from, &w.prev_to, company),
+                q::cash_out_total(p, &w.from, &w.to),
+                q::fuel_cash_out(p, &w.from, &w.to),
+                q::advances_issued(p, &w.from, &w.to),
+                q::cash_out_by_category(p, &w.from, &w.to),
+                q::money_owed(p),
+                q::fleet_revenue(p, &yesterday_s, &today_s, company),
+            )
+            .map_err(internal)?;
+
+        for (plate, date, v) in per_car {
+            tile_revenue.insert((plate, date == today_s), v);
         }
 
+        // Bank categories plus the two flows the ledger never sees, ranked
+        // together; the tail folds into Other so the panel has a fixed
+        // height whatever the window holds.
+        let mut all_cats: Vec<(String, f64)> = categories
+            .iter()
+            .map(|(k, v)| (k.clone(), v.to_string().parse::<f64>().unwrap_or(0.0)))
+            .collect();
+        if fuel_out > 0.0 {
+            all_cats.push(("Fuel (cash)".into(), fuel_out));
+        }
+        if advances_out > 0.0 {
+            all_cats.push(("Advances & loans".into(), advances_out));
+        }
+        all_cats.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        let mut by_category: Vec<CategoryOut> = all_cats
+            .iter()
+            .take(5)
+            .map(|(k, v)| CategoryOut { key: k.clone(), out: money_str(*v) })
+            .collect();
+        let tail: f64 = all_cats.iter().skip(5).map(|(_, v)| *v).sum();
+        if tail > 0.0 {
+            by_category.push(CategoryOut { key: "Other".into(), out: money_str(tail) });
+        }
+
+        let mut owed_block = OwedBlock::default();
+        let mut owed_total = 0.0;
+        for b in owed {
+            owed_total += b.total;
+            let (amount, count) = match (b.is_driver, b.kind.as_str()) {
+                (true, "advance") => (&mut owed_block.driver_advances, &mut owed_block.driver_advances_count),
+                (true, _)         => (&mut owed_block.driver_loans, &mut owed_block.driver_loans_count),
+                (false, "advance") => (&mut owed_block.employee_advances, &mut owed_block.employee_advances_count),
+                (false, _)        => (&mut owed_block.employee_loans, &mut owed_block.employee_loans_count),
+            };
+            *amount = money_str(b.total);
+            *count = b.count;
+        }
+        for f in [
+            &mut owed_block.driver_advances,
+            &mut owed_block.driver_loans,
+            &mut owed_block.employee_advances,
+            &mut owed_block.employee_loans,
+        ] {
+            if f.is_empty() {
+                *f = money_str(0.0);
+            }
+        }
+        owed_block.total = money_str(owed_total);
+
+        let cash_bank_f = cash_bank.to_string().parse::<f64>().unwrap_or(0.0);
         Some(MoneyBlock {
             revenue: money_str(revenue),
             revenue_prev: money_str(revenue_prev),
-            cash_out: cash_out.to_string(),
-            advances_outstanding: money_str(advances.total),
-            advances_count: advances.count,
+            cash_out: money_str(cash_bank_f + fuel_out + advances_out),
+            cash_out_bank: money_str(cash_bank_f),
+            cash_out_fuel: money_str(fuel_out),
+            cash_out_advances: money_str(advances_out),
+            owed: owed_block,
             by_category,
         })
     } else {
         None
     };
 
-    let today = Utc::now().with_timezone(&Cairo).date_naive();
     let fleet = fleet
         .into_iter()
         .map(|c| {
@@ -298,8 +385,15 @@ pub async fn get_dashboard(
                     .ok()
                     .map(|last| (today - last).num_days().max(0))
             });
+            let rev = |is_today: bool| {
+                financial
+                    .then(|| tile_revenue.get(&(c.plate.clone(), is_today)).copied().unwrap_or(0.0))
+                    .map(money_str)
+            };
             FleetEntry {
                 etit_id: c.etit_id,
+                revenue_today: rev(true),
+                revenue_yesterday: rev(false),
                 plate_no,
                 plate_ar,
                 last_trip_date: c.last_trip_date,
@@ -370,10 +464,11 @@ pub async fn get_revenue_drawer(
     let use_msgpack = query.format.as_deref() == Some("msgpack");
     let w = resolve_window(&query);
 
+    let company = query.company.as_deref().filter(|c| !c.trim().is_empty());
     let (companies, daily) = tokio::try_join!(
-        q::revenue_by_company(pool.get_ref(), &w.from, &w.to),
+        q::revenue_by_company(pool.get_ref(), &w.from, &w.to, company),
         async {
-            get_stats_by_date(pool.get_ref(), &w.from, &w.to, None, true).await
+            get_stats_by_date(pool.get_ref(), &w.from, &w.to, company, true).await
         },
     )
     .map_err(internal)?;
@@ -418,17 +513,35 @@ pub async fn get_cash_out_drawer(
     let w = resolve_window(&query);
     let p = pool.get_ref();
 
-    let (categories, largest) = tokio::try_join!(
+    let (categories, largest, fuel_out, advances_out) = tokio::try_join!(
         q::cash_out_by_category(p, &w.from, &w.to),
         q::largest_payments(p, &w.from, &w.to),
+        q::fuel_cash_out(p, &w.from, &w.to),
+        q::advances_issued(p, &w.from, &w.to),
     )
     .map_err(internal)?;
 
+    let mut by_category: Vec<NamedAmount> = categories
+        .into_iter()
+        .map(|(name, v)| NamedAmount { name, amount: v.to_string() })
+        .collect();
+    if fuel_out > 0.0 {
+        by_category.push(NamedAmount { name: "Fuel (cash)".into(), amount: money_str(fuel_out) });
+    }
+    if advances_out > 0.0 {
+        by_category.push(NamedAmount {
+            name: "Advances & loans".into(),
+            amount: money_str(advances_out),
+        });
+    }
+    by_category.sort_by(|a, b| {
+        let av = a.amount.parse::<f64>().unwrap_or(0.0);
+        let bv = b.amount.parse::<f64>().unwrap_or(0.0);
+        bv.partial_cmp(&av).unwrap_or(std::cmp::Ordering::Equal)
+    });
+
     let payload = CashOutDrawer {
-        by_category: categories
-            .into_iter()
-            .map(|(name, v)| NamedAmount { name, amount: v.to_string() })
-            .collect(),
+        by_category,
         largest: largest
             .into_iter()
             .map(|x| PaymentRow {
@@ -467,9 +580,10 @@ pub async fn get_trips_drawer(
     let w = resolve_window(&query);
     let p = pool.get_ref();
 
+    let company = query.company.as_deref().filter(|c| !c.trim().is_empty());
     let (companies, daily) = tokio::try_join!(
-        q::trips_by_company(p, &w.from, &w.to),
-        q::trips_by_day(p, &w.from, &w.to),
+        q::trips_by_company(p, &w.from, &w.to, company),
+        q::trips_by_day(p, &w.from, &w.to, company),
     )
     .map_err(internal)?;
 
@@ -495,6 +609,8 @@ struct PartyRow {
     name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     kind: Option<String>,
+    /// "driver" or "employee" — who owes this line.
+    audience: &'static str,
     total: String,
     count: i64,
 }
@@ -514,6 +630,7 @@ pub async fn get_advances_drawer(
             .map(|x| PartyRow {
                 name: x.name,
                 kind: x.kind,
+                audience: if x.is_driver { "driver" } else { "employee" },
                 total: money_str(x.total),
                 count: x.count,
             })
@@ -567,6 +684,7 @@ mod tests {
             month: Some("2026-01".into()),
             from: Some(from.into()),
             to: Some(to.into()),
+            company: None,
             format: None,
         };
 

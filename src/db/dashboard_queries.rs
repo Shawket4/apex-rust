@@ -28,19 +28,30 @@ pub struct MonthTotals {
     pub litres: i64,
 }
 
-pub async fn month_totals(pool: &PgPool, from: &str, to: &str) -> Result<MonthTotals> {
-    let row = sqlx::query(&render(
+/// The trips-side company scope. `$3 IS NULL` means "all companies", so one
+/// prepared statement serves both shapes — cash-out and owed money have no
+/// company dimension and never take this.
+const COMPANY_SCOPE: &str = "($3::text IS NULL OR company = $3)";
+
+pub async fn month_totals(
+    pool: &PgPool,
+    from: &str,
+    to: &str,
+    company: Option<&str>,
+) -> Result<MonthTotals> {
+    let row = sqlx::query(&render(&format!(
         r#"
         SELECT
-            ({trip_count})::bigint                 AS trips,
+            ({{trip_count}})::bigint                 AS trips,
             COUNT(DISTINCT car_no_plate)::bigint   AS trucks,
             COALESCE(SUM(tank_capacity), 0)::bigint AS litres
         FROM trips
-        WHERE deleted_at IS NULL AND date BETWEEN $1 AND $2
+        WHERE deleted_at IS NULL AND date BETWEEN $1 AND $2 AND {COMPANY_SCOPE}
         "#,
-    ))
+    )))
     .bind(from)
     .bind(to)
+    .bind(company)
     .fetch_one(pool)
     .await?;
     Ok(MonthTotals {
@@ -59,26 +70,68 @@ pub async fn month_totals(pool: &PgPool, from: &str, to: &str) -> Result<MonthTo
 /// Sums `allocated_total` from the shared per-row CTE, so this is exactly the
 /// figure the trips list's rows add up to and the statistics page reports —
 /// one source, three surfaces.
-pub async fn revenue_total(pool: &PgPool, from: &str, to: &str) -> Result<f64> {
+/// The same scope for queries built on the per-row revenue CTE, where trips
+/// is aliased `t`.
+const CTE_WINDOW: &str = "t.date BETWEEN $1 AND $2 AND ($3::text IS NULL OR t.company = $3)";
+
+pub async fn revenue_total(
+    pool: &PgPool,
+    from: &str,
+    to: &str,
+    company: Option<&str>,
+) -> Result<f64> {
     let sql = format!(
         "WITH {} SELECT COALESCE(SUM(allocated_total), 0.0)::float8 AS v FROM revenue",
-        per_row_revenue_cte("t.date BETWEEN $1 AND $2")
+        per_row_revenue_cte(CTE_WINDOW)
     );
-    let row = sqlx::query(&sql).bind(from).bind(to).fetch_one(pool).await?;
+    let row = sqlx::query(&sql).bind(from).bind(to).bind(company).fetch_one(pool).await?;
     Ok(row.get("v"))
 }
 
 /// Revenue per company for the window, for the revenue drawer.
-pub async fn revenue_by_company(pool: &PgPool, from: &str, to: &str) -> Result<Vec<(String, f64)>> {
+pub async fn revenue_by_company(
+    pool: &PgPool,
+    from: &str,
+    to: &str,
+    company: Option<&str>,
+) -> Result<Vec<(String, f64)>> {
     let sql = format!(
         "WITH {} SELECT company, COALESCE(SUM(allocated_total), 0.0)::float8 AS v \
          FROM revenue GROUP BY company ORDER BY v DESC",
-        per_row_revenue_cte("t.date BETWEEN $1 AND $2")
+        per_row_revenue_cte(CTE_WINDOW)
     );
-    let rows = sqlx::query(&sql).bind(from).bind(to).fetch_all(pool).await?;
+    let rows = sqlx::query(&sql).bind(from).bind(to).bind(company).fetch_all(pool).await?;
     Ok(rows
         .into_iter()
         .map(|r| (r.get::<Option<String>, _>("company").unwrap_or_default(), r.get("v")))
+        .collect())
+}
+
+/// Revenue per car for two specific days (today and yesterday on the fleet
+/// tiles). Company-scoped like the headline revenue; keyed by plate, which is
+/// how the fleet query identifies cars too.
+pub async fn fleet_revenue(
+    pool: &PgPool,
+    from: &str,
+    to: &str,
+    company: Option<&str>,
+) -> Result<Vec<(String, String, f64)>> {
+    let sql = format!(
+        "WITH {} SELECT car_no_plate, date, \
+                COALESCE(SUM(allocated_total), 0.0)::float8 AS v \
+         FROM revenue GROUP BY car_no_plate, date",
+        per_row_revenue_cte(CTE_WINDOW)
+    );
+    let rows = sqlx::query(&sql).bind(from).bind(to).bind(company).fetch_all(pool).await?;
+    Ok(rows
+        .into_iter()
+        .map(|r| {
+            (
+                r.get::<Option<String>, _>("car_no_plate").unwrap_or_default(),
+                r.get::<Option<String>, _>("date").unwrap_or_default(),
+                r.get("v"),
+            )
+        })
         .collect())
 }
 
@@ -173,45 +226,91 @@ pub async fn transactions_unreviewed(pool: &PgPool) -> Result<i64> {
 /* Advances                                                                  */
 /* ------------------------------------------------------------------------ */
 
-pub struct AdvancesOutstanding {
+/// Outstanding debt split by who owes it and what it is. `salary`-kind rows
+/// are excluded everywhere: they are salary visibility entries, not debt.
+pub struct OwedBucket {
+    pub is_driver: bool,
+    pub kind: String,
     pub total: f64,
     pub count: i64,
 }
 
-pub async fn advances_outstanding(pool: &PgPool) -> Result<AdvancesOutstanding> {
-    let row = sqlx::query(
-        "SELECT COALESCE(SUM(amount), 0.0)::float8 AS total, COUNT(*) AS n \
-         FROM loans WHERE deleted_at IS NULL AND is_paid = false",
+pub async fn money_owed(pool: &PgPool) -> Result<Vec<OwedBucket>> {
+    let rows = sqlx::query(
+        "SELECT (driver_id IS NOT NULL) AS is_driver, kind, \
+                COALESCE(SUM(amount), 0.0)::float8 AS total, COUNT(*) AS n \
+         FROM loans \
+         WHERE deleted_at IS NULL AND is_paid = false AND kind <> 'salary' \
+         GROUP BY 1, 2",
     )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|r| OwedBucket {
+            is_driver: r.get("is_driver"),
+            kind: r.get("kind"),
+            total: r.get("total"),
+            count: r.get("n"),
+        })
+        .collect())
+}
+
+/// Cash spent on fuel in the window. PetroApp events are excluded: that is
+/// prepaid platform credit, and the credit top-up itself reaches the bank
+/// ledger when it happens — counting the events too would double-charge.
+pub async fn fuel_cash_out(pool: &PgPool, from: &str, to: &str) -> Result<f64> {
+    let row = sqlx::query(
+        "SELECT COALESCE(SUM(price), 0.0)::float8 AS v FROM fuel_events \
+         WHERE deleted_at IS NULL AND date BETWEEN $1 AND $2 \
+           AND COALESCE(method, '') <> 'PetroApp'",
+    )
+    .bind(from)
+    .bind(to)
     .fetch_one(pool)
     .await?;
-    Ok(AdvancesOutstanding {
-        total: row.get("total"),
-        count: row.get("n"),
-    })
+    Ok(row.get("v"))
+}
+
+/// Advances and loans issued (paid out) in the window — money that left the
+/// till, whatever its repayment status today.
+pub async fn advances_issued(pool: &PgPool, from: &str, to: &str) -> Result<f64> {
+    let row = sqlx::query(
+        "SELECT COALESCE(SUM(amount), 0.0)::float8 AS v FROM loans \
+         WHERE deleted_at IS NULL AND kind <> 'salary' AND date BETWEEN $1 AND $2",
+    )
+    .bind(from)
+    .bind(to)
+    .fetch_one(pool)
+    .await?;
+    Ok(row.get("v"))
 }
 
 pub struct AdvanceParty {
     pub name: String,
     pub kind: Option<String>,
+    pub is_driver: bool,
     pub total: f64,
     pub count: i64,
 }
 
 /// Who owes what, largest first, for the advances drawer. Capped at 25 —
 /// a drawer is a summary, and the loans page is where the full list lives.
+/// One row per (person, kind) so a driver holding both an advance and a loan
+/// shows both lines rather than a muddled MAX(kind).
 pub async fn advances_by_party(pool: &PgPool) -> Result<Vec<AdvanceParty>> {
     let rows = sqlx::query(
         r#"
-        SELECT COALESCE(d.name, e.name, '—') AS name,
-               MAX(l.kind)                   AS kind,
-               SUM(l.amount)::float8         AS total,
-               COUNT(*)                      AS n
+        SELECT COALESCE(d.name, e.name, '—')  AS name,
+               l.kind                         AS kind,
+               (l.driver_id IS NOT NULL)      AS is_driver,
+               SUM(l.amount)::float8          AS total,
+               COUNT(*)                       AS n
         FROM loans l
         LEFT JOIN drivers d   ON d.id = l.driver_id
         LEFT JOIN employees e ON e.id = l.employee_id
-        WHERE l.deleted_at IS NULL AND l.is_paid = false
-        GROUP BY COALESCE(d.name, e.name, '—')
+        WHERE l.deleted_at IS NULL AND l.is_paid = false AND l.kind <> 'salary'
+        GROUP BY COALESCE(d.name, e.name, '—'), l.kind, (l.driver_id IS NOT NULL)
         ORDER BY total DESC
         LIMIT 25
         "#,
@@ -223,6 +322,7 @@ pub async fn advances_by_party(pool: &PgPool) -> Result<Vec<AdvanceParty>> {
         .map(|r| AdvanceParty {
             name: r.get("name"),
             kind: r.get("kind"),
+            is_driver: r.get("is_driver"),
             total: r.get("total"),
             count: r.get("n"),
         })
@@ -284,7 +384,12 @@ pub async fn fleet(pool: &PgPool) -> Result<Vec<FleetCar>> {
 /// Trips in the window that earn nothing: no fee mapping for their route, or a
 /// driver / drop-off still carrying the «غير مسجل» sentinel. They bill zero and
 /// say nothing, which is why they are a dashboard item and not just a filter.
-pub async fn trips_earning_zero(pool: &PgPool, from: &str, to: &str) -> Result<i64> {
+pub async fn trips_earning_zero(
+    pool: &PgPool,
+    from: &str,
+    to: &str,
+    company: Option<&str>,
+) -> Result<i64> {
     let row = sqlx::query(
         r#"
         SELECT COUNT(*) AS n
@@ -293,11 +398,13 @@ pub async fn trips_earning_zero(pool: &PgPool, from: &str, to: &str) -> Result<i
             ON  fm.company = t.company AND fm.terminal = t.terminal
             AND fm.drop_off_point = t.drop_off_point AND fm.deleted_at IS NULL
         WHERE t.deleted_at IS NULL AND t.date BETWEEN $1 AND $2
+          AND ($3::text IS NULL OR t.company = $3)
           AND (fm.id IS NULL OR t.driver_name = 'غير مسجل' OR t.drop_off_point = 'غير مسجل')
         "#,
     )
     .bind(from)
     .bind(to)
+    .bind(company)
     .fetch_one(pool)
     .await?;
     Ok(row.get("n"))
@@ -312,16 +419,22 @@ pub struct DayCount {
     pub trips: i64,
 }
 
-pub async fn trips_by_day(pool: &PgPool, from: &str, to: &str) -> Result<Vec<DayCount>> {
-    let rows = sqlx::query(&render(
+pub async fn trips_by_day(
+    pool: &PgPool,
+    from: &str,
+    to: &str,
+    company: Option<&str>,
+) -> Result<Vec<DayCount>> {
+    let rows = sqlx::query(&render(&format!(
         r#"
-        SELECT date, ({trip_count})::bigint AS trips
-        FROM trips WHERE deleted_at IS NULL AND date BETWEEN $1 AND $2
+        SELECT date, ({{trip_count}})::bigint AS trips
+        FROM trips WHERE deleted_at IS NULL AND date BETWEEN $1 AND $2 AND {COMPANY_SCOPE}
         GROUP BY date ORDER BY date
         "#,
-    ))
+    )))
     .bind(from)
     .bind(to)
+    .bind(company)
     .fetch_all(pool)
     .await?;
     Ok(rows
@@ -333,16 +446,22 @@ pub async fn trips_by_day(pool: &PgPool, from: &str, to: &str) -> Result<Vec<Day
         .collect())
 }
 
-pub async fn trips_by_company(pool: &PgPool, from: &str, to: &str) -> Result<Vec<(String, i64)>> {
-    let rows = sqlx::query(&render(
+pub async fn trips_by_company(
+    pool: &PgPool,
+    from: &str,
+    to: &str,
+    company: Option<&str>,
+) -> Result<Vec<(String, i64)>> {
+    let rows = sqlx::query(&render(&format!(
         r#"
-        SELECT company, ({trip_count})::bigint AS trips
-        FROM trips WHERE deleted_at IS NULL AND date BETWEEN $1 AND $2
+        SELECT company, ({{trip_count}})::bigint AS trips
+        FROM trips WHERE deleted_at IS NULL AND date BETWEEN $1 AND $2 AND {COMPANY_SCOPE}
         GROUP BY company ORDER BY trips DESC
         "#,
-    ))
+    )))
     .bind(from)
     .bind(to)
+    .bind(company)
     .fetch_all(pool)
     .await?;
     Ok(rows.into_iter().map(|r| (r.get("company"), r.get("trips"))).collect())
