@@ -318,3 +318,94 @@ async fn per_row_revenue_sums_to_the_statistics_aggregate() {
         );
     }
 }
+
+/// The per-route daily panel must add up to the company totals above it.
+///
+/// The client-side version this replaced could not: it summed
+/// `trip.revenue || trip.fee`, and since the trips table's `revenue` column is
+/// not maintained it fell through to `fee` — a fee BAND NUMBER for Watanya, so
+/// a day of band-15 work reported a revenue of 15.
+#[tokio::test]
+async fn route_days_sum_to_the_company_totals() {
+    use apex::db::stats_queries::get_route_day_breakdown;
+
+    let pool = support::fresh_db("apex_route_days").await;
+    seed(&pool).await;
+
+    for company in ["Petrol Arrows", "Watanya", "TAQA", "Petromin"] {
+        // No route filter: every day of every route for the company.
+        let days = get_route_day_breakdown(&pool, company, FROM, TO, None, None, None, None)
+            .await
+            .unwrap_or_else(|e| panic!("{company}: {e}"));
+
+        let stats = match company {
+            "Petrol Arrows" => stats_queries::get_petrol_arrows_stats(&pool, FROM, TO, true).await,
+            "Watanya" => stats_queries::get_watanya_stats(&pool, FROM, TO, true).await,
+            "TAQA" => stats_queries::get_taqa_stats(&pool, FROM, TO, true).await,
+            _ => stats_queries::get_petromin_stats(&pool, FROM, TO, true).await,
+        }
+        .unwrap();
+
+        let stat_base: f64 = stats.iter().map(|d| d.total_revenue).sum();
+        let stat_all: f64 = stat_base
+            + stats.iter().filter_map(|d| d.car_rental).sum::<f64>()
+            + stats.iter().filter_map(|d| d.vat).sum::<f64>();
+
+        let day_base: f64 = days.iter().map(|d| d.revenue).sum();
+        let day_all: f64 = days.iter().map(|d| d.revenue_total).sum();
+
+        assert!(
+            (day_base - stat_base).abs() < 0.01,
+            "{company}: daily base {day_base} != statistics {stat_base}"
+        );
+        assert!(
+            (day_all - stat_all).abs() < 0.01,
+            "{company}: daily total {day_all} != statistics {stat_all}"
+        );
+
+        // Days are distinct and descending, the order the panel renders in.
+        let dates: Vec<&str> = days.iter().map(|d| d.date.as_str()).collect();
+        let mut sorted = dates.clone();
+        sorted.sort_unstable();
+        sorted.reverse();
+        assert_eq!(dates, sorted, "{company}: days are not newest-first");
+        sorted.dedup();
+        assert_eq!(sorted.len(), dates.len(), "{company}: a date appeared twice");
+    }
+}
+
+/// Filtering to one route returns only that route's days, and a
+/// multi-container trip still counts as one trip on its day.
+#[tokio::test]
+async fn route_days_filter_and_count_logical_trips() {
+    use apex::db::stats_queries::get_route_day_breakdown;
+
+    let pool = support::fresh_db("apex_route_days_filter").await;
+    seed(&pool).await;
+
+    // WA-B1 on 2025-05-09 is the three-container trip; 05-05 is a standalone.
+    let days = get_route_day_breakdown(
+        &pool, "Watanya", FROM, TO, Some("WA-T1"), Some("WA-B1"), None, None,
+    )
+    .await
+    .unwrap();
+
+    let container_day = days
+        .iter()
+        .find(|d| d.date == "2025-05-09")
+        .expect("the container day is missing");
+    assert_eq!(
+        container_day.trips, 1,
+        "three containers of one trip counted as {} trips",
+        container_day.trips
+    );
+    // All three containers' volume still counts: 3 x 10000.
+    assert_eq!(container_day.volume, 30_000.0);
+    assert_eq!(container_day.car_count, 1);
+    // 30000 L at band 1 (104.5 per 1000 L).
+    assert!((container_day.revenue - 3135.0).abs() < 0.01);
+
+    // Nothing from another route leaked in.
+    assert!(days.iter().all(|d| d.date.starts_with("2025-05")));
+    assert_eq!(days.len(), 2, "expected the standalone day and the container day");
+}

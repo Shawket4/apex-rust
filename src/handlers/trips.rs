@@ -1,18 +1,23 @@
 //! `GET /api/v1/trips` — the trips list, with revenue.
 //!
-//! Gated at permission 4. That is stricter than the statistics endpoint next to
-//! it, which opens financial columns at 3, and the difference is deliberate:
-//! statistics show revenue in aggregate, while this endpoint puts a figure
-//! against an individual driver's individual trip. Those are different
-//! disclosures and the stricter one wins.
+//! Two permission levels are in play, and conflating them breaks something
+//! either way:
 //!
-//! Permission is enforced twice on purpose. The route's `JwtAuth` refuses the
-//! request outright, and [`crate::db::trip_queries::list_trips`] independently
-//! decides whether to read the money columns at all — so if this endpoint is
-//! ever remounted at a lower level, the failure is a missing field rather than
-//! a silent leak of every driver's earnings.
+//! * **Level 1 sees the list.** That is what FalconGo's route required, and
+//!   dispatchers live on this page. Gating the whole endpoint higher would take
+//!   the trips page away from everyone who does the work.
+//! * **Level 4 sees the money.** Stricter than the statistics endpoint next
+//!   door, which opens financial columns at 3, and deliberately so: statistics
+//!   show revenue in aggregate, while this puts a figure against one driver's
+//!   one trip. Those are different disclosures and the stricter one wins.
+//!
+//! The money gate is enforced here rather than in the router, and
+//! [`crate::db::trip_queries::list_trips`] decides independently whether to
+//! read the columns at all. So a caller below 4 does not receive figures that
+//! some layer above was trusted to strip.
 
 use actix_web::{web, HttpMessage, HttpRequest, HttpResponse};
+use crate::auth::JwtAuth;
 use serde::Deserialize;
 use sqlx::PgPool;
 
@@ -88,3 +93,23 @@ pub async fn get_trips(
         },
     }))
 }
+
+/// Mounts `GET /api/v1/trips`.
+///
+/// Lives here rather than in `main.rs` so the integration suite mounts the
+/// route the binary actually serves — including its permission gate. A gate
+/// that is only wired up in `main` is a gate no test can check.
+pub fn configure(cfg: &mut web::ServiceConfig) {
+    cfg.service(
+        web::scope("/api/v1").route(
+            "/trips",
+            web::get().to(get_trips).wrap(JwtAuth {
+                required_permission: Some(VIEW_PERMISSION),
+            }),
+        ),
+    );
+}
+
+/// The permission needed to see the list at all, matching the FalconGo route
+/// this replaces. Money is gated separately at [`FINANCIAL_PERMISSION`].
+pub const VIEW_PERMISSION: i32 = 1;
