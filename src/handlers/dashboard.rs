@@ -222,7 +222,7 @@ pub async fn get_dashboard(
         q::month_totals(p, &w.from, &w.to),
         q::fleet(p),
         q::trips_earning_zero(p, &w.from, &w.to),
-        q::transfers_unreviewed(p),
+        q::transactions_unreviewed(p),
     )
     .map_err(internal)?;
 
@@ -293,7 +293,7 @@ pub async fn get_dashboard(
     }
     if unreviewed > 0 {
         exceptions.push(Exception {
-            key: "transfers_unreviewed",
+            key: "transactions_unreviewed",
             severity: "warning",
             count: unreviewed,
             href: "/fleet-expenses",
