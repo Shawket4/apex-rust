@@ -263,10 +263,26 @@ pub fn logical_trip_count_sql(parent_col: &str) -> String {
 /// day, and revenue-weighting would hand its rental to its neighbours.
 pub mod allocation {
     /// Window definition for TAQA: rental is per car per calendar month.
-    pub const TAQA_PARTITION: &str = "car_no_plate, DATE_TRUNC('month', date::date)";
+    ///
+    /// TERMINAL is part of the grouping, which is not physically obvious — a car
+    /// is rented, not a car-at-a-terminal. It is here because the statistics
+    /// queries group their working-day counts by `(terminal, car, month)` and
+    /// the list must reconcile with what statistics report.
+    ///
+    /// That grouping has a consequence worth knowing: a car that serves two
+    /// terminals on the SAME DAY is credited a working day in each group, so one
+    /// day of work counts as two and the fleet's rental comes out one day's
+    /// taper high. This is real in production — car "ف ع ص 4381" did exactly
+    /// that at Alex and Suez on 2025-06-05, worth 1535.71. Counting the day once
+    /// is almost certainly the correct reading of the contract, but changing it
+    /// changes what TAQA is billed, so it is pinned here rather than quietly
+    /// fixed. See `a_car_at_two_terminals_in_one_day` in tests/trips_list.rs.
+    pub const TAQA_PARTITION: &str =
+        "terminal, car_no_plate, DATE_TRUNC('month', date::date)";
 
-    /// Window definition for Petromin: rental is per car per day.
-    pub const PETROMIN_PARTITION: &str = "car_no_plate, date";
+    /// Window definition for Petromin: rental is per car per day, grouped by
+    /// terminal for the same reason TAQA is.
+    pub const PETROMIN_PARTITION: &str = "terminal, car_no_plate, date";
 
     /// Divides `total_expr` equally across every row in `partition`.
     ///
@@ -320,11 +336,11 @@ pub mod allocation {
         // never zero, so this cannot divide by zero.
         let taqa_share = share_sql(
             &taqa_monthly_rental_sql("COALESCE(tm.working_days, 0)"),
-            "s.company, s.car_no_plate, DATE_TRUNC('month', s.date::date)",
+            "s.company, s.terminal, s.car_no_plate, DATE_TRUNC('month', s.date::date)",
         );
         let petromin_share = share_sql(
             &format!("{PETROMIN_RENTAL_PER_CAR_DAY:?}"),
-            "s.company, s.car_no_plate, s.date",
+            "s.company, s.terminal, s.car_no_plate, s.date",
         );
 
         // VAT is linear, so taxing each row's own allocated subtotal sums to
@@ -349,12 +365,13 @@ pub mod allocation {
         ),
         taqa_months AS (
             SELECT
+                terminal,
                 car_no_plate,
                 DATE_TRUNC('month', date::date) AS month,
                 COUNT(DISTINCT date)::float8    AS working_days
             FROM scoped
             WHERE company = '{taqa}'
-            GROUP BY car_no_plate, DATE_TRUNC('month', date::date)
+            GROUP BY terminal, car_no_plate, DATE_TRUNC('month', date::date)
         ),
         allocated AS (
             SELECT
@@ -366,7 +383,8 @@ pub mod allocation {
                 END::float8 AS allocated_rental
             FROM scoped s
             LEFT JOIN taqa_months tm
-                ON  s.company      = '{taqa}'
+                ON  s.company       = '{taqa}'
+                AND tm.terminal     = s.terminal
                 AND tm.car_no_plate = s.car_no_plate
                 AND tm.month        = DATE_TRUNC('month', s.date::date)
         ),
