@@ -66,8 +66,10 @@ pub struct MoneyBlock {
     pub cash_out_bank: String,
     pub cash_out_fuel: String,
     pub cash_out_advances: String,
-    /// Outstanding debt as of now — deliberately NOT window-scoped: unpaid
-    /// money does not stop being owed because the filter moved.
+    /// Advances/loans issued in the window. Payroll recovers them against
+    /// salaries outside this system, so the period view IS the useful
+    /// figure (all-time `is_paid = false` is 19 months of already-recovered
+    /// history).
     pub owed: OwedBlock,
     /// Top five categories (bank + the synthetic fuel/advances lines);
     /// everything smaller folds into "Other".
@@ -303,7 +305,7 @@ pub async fn get_dashboard(
                 q::fuel_cash_out(p, &w.from, &w.to),
                 q::advances_issued(p, &w.from, &w.to),
                 q::cash_out_by_category(p, &w.from, &w.to),
-                q::money_owed(p),
+                q::money_owed(p, &w.from, &w.to),
                 q::fleet_revenue(p, &yesterday_s, &today_s, company),
             )
             .map_err(internal)?;
@@ -410,7 +412,7 @@ pub async fn get_dashboard(
             key: "trips_earning_zero",
             severity: "warning",
             count: zero_trips,
-            href: "/trips?missing_data=any",
+            href: "/trips?md=a",
         });
     }
     if unreviewed > 0 {
@@ -418,7 +420,7 @@ pub async fn get_dashboard(
             key: "transactions_unreviewed",
             severity: "warning",
             count: unreviewed,
-            href: "/fleet-expenses",
+            href: "/fleet-expenses?uncat=1",
         });
     }
 
@@ -622,7 +624,10 @@ pub async fn get_advances_drawer(
 ) -> Result<HttpResponse, actix_web::Error> {
     require_financial(&req)?;
     let use_msgpack = query.format.as_deref() == Some("msgpack");
-    let parties = q::advances_by_party(pool.get_ref()).await.map_err(internal)?;
+    let w = resolve_window(&query);
+    let parties = q::advances_by_party(pool.get_ref(), &w.from, &w.to)
+        .await
+        .map_err(internal)?;
 
     let payload = AdvancesDrawer {
         parties: parties

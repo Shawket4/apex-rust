@@ -226,8 +226,16 @@ pub async fn transactions_unreviewed(pool: &PgPool) -> Result<i64> {
 /* Advances                                                                  */
 /* ------------------------------------------------------------------------ */
 
-/// Outstanding debt split by who owes it and what it is. `salary`-kind rows
-/// are excluded everywhere: they are salary visibility entries, not debt.
+/// Advances/loans issued in the window, split by who took them and what
+/// they are.
+///
+/// Window-scoped, NOT `is_paid`-scoped: payroll recovers advances against
+/// the month's salary outside this system (pay_slips is empty in production
+/// and only 23 loan rows were ever flipped), so "outstanding" in any useful
+/// sense means "issued in the period being looked at". `salary`-kind rows
+/// are excluded everywhere: they are payroll visibility entries, not debt.
+/// `method = 'banksms'` rows are excluded like the fleet-expenses union —
+/// the bank transaction row already represents that money.
 pub struct OwedBucket {
     pub is_driver: bool,
     pub kind: String,
@@ -235,14 +243,17 @@ pub struct OwedBucket {
     pub count: i64,
 }
 
-pub async fn money_owed(pool: &PgPool) -> Result<Vec<OwedBucket>> {
+pub async fn money_owed(pool: &PgPool, from: &str, to: &str) -> Result<Vec<OwedBucket>> {
     let rows = sqlx::query(
         "SELECT (driver_id IS NOT NULL) AS is_driver, kind, \
                 COALESCE(SUM(amount), 0.0)::float8 AS total, COUNT(*) AS n \
          FROM loans \
-         WHERE deleted_at IS NULL AND is_paid = false AND kind <> 'salary' \
+         WHERE deleted_at IS NULL AND kind <> 'salary' AND date BETWEEN $1 AND $2 \
+           AND COALESCE(method, '') <> 'banksms' \
          GROUP BY 1, 2",
     )
+    .bind(from)
+    .bind(to)
     .fetch_all(pool)
     .await?;
     Ok(rows
@@ -256,14 +267,16 @@ pub async fn money_owed(pool: &PgPool) -> Result<Vec<OwedBucket>> {
         .collect())
 }
 
-/// Cash spent on fuel in the window. PetroApp events are excluded: that is
-/// prepaid platform credit, and the credit top-up itself reaches the bank
-/// ledger when it happens — counting the events too would double-charge.
+/// Fuel spend in the window that the bank ledger cannot see. Same convention
+/// as the fleet-expenses union (api/transactions.rs): PetroApp-synced rows
+/// ONLY — a manually entered fuel event is paid through the bank, so its
+/// money already arrives as a bank SMS; blending both would count the same
+/// money twice.
 pub async fn fuel_cash_out(pool: &PgPool, from: &str, to: &str) -> Result<f64> {
     let row = sqlx::query(
         "SELECT COALESCE(SUM(price), 0.0)::float8 AS v FROM fuel_events \
          WHERE deleted_at IS NULL AND date BETWEEN $1 AND $2 \
-           AND COALESCE(method, '') <> 'PetroApp'",
+           AND petroapp_bill_id IS NOT NULL",
     )
     .bind(from)
     .bind(to)
@@ -273,11 +286,14 @@ pub async fn fuel_cash_out(pool: &PgPool, from: &str, to: &str) -> Result<f64> {
 }
 
 /// Advances and loans issued (paid out) in the window — money that left the
-/// till, whatever its repayment status today.
+/// till, whatever its repayment status today. Rows registered by banksms
+/// itself are excluded, mirroring the fleet-expenses union: the bank
+/// transaction row already represents that money.
 pub async fn advances_issued(pool: &PgPool, from: &str, to: &str) -> Result<f64> {
     let row = sqlx::query(
         "SELECT COALESCE(SUM(amount), 0.0)::float8 AS v FROM loans \
-         WHERE deleted_at IS NULL AND kind <> 'salary' AND date BETWEEN $1 AND $2",
+         WHERE deleted_at IS NULL AND kind <> 'salary' AND date BETWEEN $1 AND $2 \
+           AND COALESCE(method, '') <> 'banksms'",
     )
     .bind(from)
     .bind(to)
@@ -298,7 +314,11 @@ pub struct AdvanceParty {
 /// a drawer is a summary, and the loans page is where the full list lives.
 /// One row per (person, kind) so a driver holding both an advance and a loan
 /// shows both lines rather than a muddled MAX(kind).
-pub async fn advances_by_party(pool: &PgPool) -> Result<Vec<AdvanceParty>> {
+pub async fn advances_by_party(
+    pool: &PgPool,
+    from: &str,
+    to: &str,
+) -> Result<Vec<AdvanceParty>> {
     let rows = sqlx::query(
         r#"
         SELECT COALESCE(d.name, e.name, '—')  AS name,
@@ -309,12 +329,16 @@ pub async fn advances_by_party(pool: &PgPool) -> Result<Vec<AdvanceParty>> {
         FROM loans l
         LEFT JOIN drivers d   ON d.id = l.driver_id
         LEFT JOIN employees e ON e.id = l.employee_id
-        WHERE l.deleted_at IS NULL AND l.is_paid = false AND l.kind <> 'salary'
+        WHERE l.deleted_at IS NULL AND l.kind <> 'salary'
+          AND l.date BETWEEN $1 AND $2
+          AND COALESCE(l.method, '') <> 'banksms'
         GROUP BY COALESCE(d.name, e.name, '—'), l.kind, (l.driver_id IS NOT NULL)
         ORDER BY total DESC
         LIMIT 25
         "#,
     )
+    .bind(from)
+    .bind(to)
     .fetch_all(pool)
     .await?;
     Ok(rows
