@@ -21,6 +21,7 @@ use crate::models::*;
 fn render(sql: &str) -> String {
     use crate::db::revenue::*;
     sql.replace("{trip_count}", &logical_trip_count_sql("parent_trip_id"))
+        .replace("{trip_distance}", &trip_distance_sql("t", "fm"))
         .replace("{wa_band_rate}", &watanya_band_rate_sql("fm.fee"))
         .replace(
             "{pa_fee_rate}",
@@ -110,6 +111,7 @@ pub async fn get_petrol_arrows_stats(
                 t.parent_trip_id,
                 t.tank_capacity,
                 COALESCE(fm.distance, 0.0) as distance,
+                {trip_distance} as trip_distance,
                 COALESCE(fm.fee::float8, 0.0) as fee,
                 (t.tank_capacity * {pa_fee_rate})::float8 as trip_revenue
             FROM trips t
@@ -127,7 +129,7 @@ pub async fn get_petrol_arrows_stats(
                 drop_off_point,
                 {trip_count} as total_trips,
                 COALESCE(SUM(tank_capacity), 0.0)::float8 as total_volume,
-                COALESCE(SUM(distance), 0.0)::float8 as total_distance,
+                COALESCE(SUM(trip_distance), 0.0)::float8 as total_distance,
                 COALESCE(MAX(fee), 0.0)::float8 as fee,
                 COALESCE(SUM(trip_revenue), 0.0)::float8 as total_revenue
             FROM trip_data
@@ -187,6 +189,7 @@ pub async fn get_taqa_stats(
                 t.date,
                 t.tank_capacity,
                 COALESCE(fm.distance, 0.0) as distance,
+                {trip_distance} as trip_distance,
                 (COALESCE(fm.distance, 0.0) * {taqa_rate})::float8 as trip_revenue
             FROM trips t
             LEFT JOIN fee_mappings fm 
@@ -266,7 +269,7 @@ pub async fn get_taqa_stats(
                 terminal,
                 {trip_count} as total_trips,
                 COALESCE(SUM(tank_capacity), 0.0)::float8 as total_volume,
-                COALESCE(SUM(distance), 0.0)::float8 as total_distance,
+                COALESCE(SUM(trip_distance), 0.0)::float8 as total_distance,
                 COUNT(DISTINCT car_no_plate)::bigint as distinct_cars,
                 COUNT(DISTINCT date)::bigint as distinct_days,
                 COALESCE(SUM(trip_revenue), 0.0)::float8 as base_revenue
@@ -345,6 +348,7 @@ pub async fn get_petromin_stats(
                 t.date,
                 t.tank_capacity,
                 COALESCE(fm.distance, 0.0) as distance,
+                {trip_distance} as trip_distance,
                 (COALESCE(fm.distance, 0.0) * {petromin_rate})::float8 as trip_revenue
             FROM trips t
             LEFT JOIN fee_mappings fm 
@@ -385,7 +389,7 @@ pub async fn get_petromin_stats(
                 terminal,
                 {trip_count} as total_trips,
                 COALESCE(SUM(tank_capacity), 0.0)::float8 as total_volume,
-                COALESCE(SUM(distance), 0.0)::float8 as total_distance,
+                COALESCE(SUM(trip_distance), 0.0)::float8 as total_distance,
                 COUNT(DISTINCT car_no_plate)::bigint as distinct_cars,
                 COUNT(DISTINCT date)::bigint as distinct_days,
                 COALESCE(SUM(trip_revenue), 0.0)::float8 as base_revenue
@@ -461,6 +465,7 @@ pub async fn get_watanya_stats(
                 t.parent_trip_id,
                 t.tank_capacity,
                 COALESCE(fm.distance, 0.0) as distance,
+                {trip_distance} as trip_distance,
                 COALESCE(fm.fee::float8, 0.0) as fee,
                 (t.tank_capacity * 
                     {wa_band_rate} / 1000.0)::float8 as trip_revenue
@@ -479,7 +484,7 @@ pub async fn get_watanya_stats(
                 COALESCE(fee, 0) as fee,
                 {trip_count} as total_trips,
                 COALESCE(SUM(tank_capacity), 0.0)::float8 as total_volume, 
-                COALESCE(SUM(distance), 0.0)::float8 as total_distance,
+                COALESCE(SUM(trip_distance), 0.0)::float8 as total_distance,
                 COALESCE(SUM(trip_revenue), 0.0)::float8 as base_revenue
             FROM trip_data
             GROUP BY fee
@@ -571,6 +576,7 @@ async fn get_watanya_route_details(
                 t.date,
                 t.tank_capacity,
                 COALESCE(fm.distance, 0.0) as distance,
+                {trip_distance} as trip_distance,
                 COALESCE(fm.fee::float8, 0.0) as fee,
                 (t.tank_capacity * 
                     {wa_band_rate} / 1000.0)::float8 as trip_revenue
@@ -590,7 +596,7 @@ async fn get_watanya_route_details(
                 car_no_plate,
                 {trip_count} as total_trips,
                 COALESCE(SUM(tank_capacity), 0.0)::float8 as total_volume,
-                COALESCE(SUM(distance), 0.0)::float8 as total_distance,
+                COALESCE(SUM(trip_distance), 0.0)::float8 as total_distance,
                 COUNT(DISTINCT date)::bigint as working_days,
                 COALESCE(SUM(trip_revenue), 0.0)::float8 as base_revenue
             FROM trip_data
@@ -698,6 +704,7 @@ async fn get_taqa_route_details(
                 t.date,
                 t.tank_capacity,
                 COALESCE(fm.distance, 0.0) as distance,
+                {trip_distance} as trip_distance,
                 (COALESCE(fm.distance, 0.0) * {taqa_rate})::float8 as trip_revenue
             FROM trips t
             LEFT JOIN fee_mappings fm 
@@ -770,7 +777,7 @@ async fn get_taqa_route_details(
                 car_no_plate,
                 {trip_count} as total_trips,
                 COALESCE(SUM(tank_capacity), 0.0)::float8 as total_volume,
-                COALESCE(SUM(distance), 0.0)::float8 as total_distance,
+                COALESCE(SUM(trip_distance), 0.0)::float8 as total_distance,
                 COALESCE(SUM(trip_revenue), 0.0)::float8 as base_revenue
             FROM trip_data
             GROUP BY terminal, car_no_plate
@@ -890,6 +897,7 @@ async fn get_petromin_route_details(
                 t.date,
                 t.tank_capacity,
                 COALESCE(fm.distance, 0.0) as distance,
+                {trip_distance} as trip_distance,
                 (COALESCE(fm.distance, 0.0) * {petromin_rate})::float8 as trip_revenue
             FROM trips t
             LEFT JOIN fee_mappings fm 
@@ -925,7 +933,7 @@ async fn get_petromin_route_details(
                 car_no_plate,
                 {trip_count} as total_trips,
                 COALESCE(SUM(tank_capacity), 0.0)::float8 as total_volume,
-                COALESCE(SUM(distance), 0.0)::float8 as total_distance,
+                COALESCE(SUM(trip_distance), 0.0)::float8 as total_distance,
                 COALESCE(SUM(trip_revenue), 0.0)::float8 as base_revenue
             FROM trip_data
             GROUP BY terminal, car_no_plate
@@ -1046,6 +1054,7 @@ async fn get_petrol_arrows_route_details(
                 t.date,
                 t.tank_capacity,
                 COALESCE(fm.distance, 0.0) as distance,
+                {trip_distance} as trip_distance,
                 COALESCE(fm.fee::float8, 0.0) as fee,
                 (t.tank_capacity * {pa_fee_rate})::float8 as trip_revenue
             FROM trips t
@@ -1066,7 +1075,7 @@ async fn get_petrol_arrows_route_details(
                 car_no_plate,
                 {trip_count} as total_trips,
                 COALESCE(SUM(tank_capacity), 0.0)::float8 as total_volume,
-                COALESCE(SUM(distance), 0.0)::float8 as total_distance,
+                COALESCE(SUM(trip_distance), 0.0)::float8 as total_distance,
                 COUNT(DISTINCT date)::bigint as working_days,
                 COALESCE(SUM(trip_revenue), 0.0)::float8 as base_revenue
             FROM trip_data
@@ -1182,6 +1191,7 @@ pub async fn get_stats_by_date(
                 t.terminal,
                 t.drop_off_point,
                 COALESCE(fm.distance, 0.0) as distance,
+                {trip_distance} as trip_distance,
                 COALESCE(fm.fee::float8, 0.0) as fee,
                 CASE 
                     WHEN t.company = 'Watanya' THEN
@@ -1263,7 +1273,7 @@ pub async fn get_stats_by_date(
                 company,
                 {trip_count} as total_trips,
                 COALESCE(SUM(tank_capacity), 0.0)::float8 as total_volume,
-                COALESCE(SUM(distance), 0.0)::float8 as total_distance,
+                COALESCE(SUM(trip_distance), 0.0)::float8 as total_distance,
                 COALESCE(SUM(trip_revenue), 0.0)::float8 as base_revenue
             FROM trip_data
             GROUP BY date, company
@@ -1554,7 +1564,7 @@ pub async fn get_route_day_breakdown(
             r.date,
             {{trip_count}}::bigint                            AS trips,
             COALESCE(SUM(r.tank_capacity), 0)::float8         AS volume,
-            COALESCE(SUM(r.fee_distance), 0.0)::float8        AS distance,
+            COALESCE(SUM(r.trip_distance), 0.0)::float8      AS distance,
             COALESCE(SUM(r.base_revenue), 0.0)::float8        AS revenue,
             COALESCE(SUM(r.allocated_total), 0.0)::float8     AS revenue_total,
             COUNT(DISTINCT r.car_no_plate)::bigint            AS car_count

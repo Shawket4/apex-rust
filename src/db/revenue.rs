@@ -218,6 +218,32 @@ pub fn vat_sql(taxable_expr: &str) -> String {
 }
 
 /* ------------------------------------------------------------------------ */
+/* Distance                                                                  */
+/* ------------------------------------------------------------------------ */
+
+/// A logical trip's distance, attributed to exactly one of its rows.
+///
+/// One truck makes ONE journey however many containers it carries, so adding
+/// each container's mapped distance counts the same road several times. Every
+/// multi-container TAQA group in 2026 is two containers bound for the same
+/// place, and summing simply doubled it.
+///
+/// This yields the furthest drop's distance on the row that holds it and zero
+/// on that trip's other rows, so `SUM()` over any grouping counts each journey
+/// once. Attributing it to the furthest container also means a trip whose drops
+/// span two groups lands wholly in the group it travelled furthest for, rather
+/// than being counted by both.
+///
+/// `parent_trip_id` is 0 rather than NULL on some standalone rows, so a
+/// standalone trip keys on its own negated id — always negative, and therefore
+/// never colliding with a real parent id.
+pub fn trip_distance_sql(trips: &str, fees: &str) -> String {
+    format!(
+        "CASE WHEN ROW_NUMBER() OVER (              PARTITION BY COALESCE(NULLIF({trips}.parent_trip_id, 0), -{trips}.id)              ORDER BY COALESCE({fees}.distance, 0.0) DESC, {trips}.id            ) = 1          THEN COALESCE({fees}.distance, 0.0) ELSE 0.0 END::float8"
+    )
+}
+
+/* ------------------------------------------------------------------------ */
 /* Trip counting                                                             */
 /* ------------------------------------------------------------------------ */
 
@@ -360,6 +386,7 @@ pub mod allocation {
             SELECT
                 t.*,
                 COALESCE(fm.distance, 0.0)::float8 AS fee_distance,
+                {trip_distance} AS trip_distance,
                 COALESCE(fm.fee::float8, 0.0)      AS fee_value,
                 {base_case} AS base_revenue
             FROM trips t
@@ -407,6 +434,7 @@ pub mod allocation {
                     AS allocated_total
             FROM priced p
         )"#,
+            trip_distance = trip_distance_sql("t", "fm"),
             taqa = Company::Taqa.as_str(),
             petromin = Company::Petromin.as_str(),
             petrol_arrows = Company::PetrolArrows.as_str(),

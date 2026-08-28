@@ -92,6 +92,12 @@ fn render(company: &str, rows: &[TripStatisticsDetails]) -> String {
 /// What the statistics endpoints produce from the fixture. Centralizing the
 /// formulas must not change a single figure below.
 ///
+/// Distance is the furthest drop per logical trip, not the sum of a trip's
+/// drops: one truck makes one journey however many containers it carries. On
+/// this fixture that shows up as Watanya band 1 at 200 km rather than 400 --
+/// the standalone trip's 100 plus the three-container trip's 100, not four
+/// rows of 100. Revenue is untouched, because Watanya bills on volume.
+///
 /// One figure DID move when the formulas were centralized, deliberately and
 /// exactly once: TAQA's taper was a typed 1535.71, and is now the exact
 /// 43000/28 it was always meant to approximate. That shifted TAQA's rental by

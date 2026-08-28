@@ -763,3 +763,67 @@ async fn a_days_rental_is_split_only_between_that_days_trips() {
         "allocated {allocated} != statistics {stats_rental}"
     );
 }
+
+/// A multi-drop trip travels its furthest drop, not the sum of its drops.
+///
+/// One truck makes one journey however many containers it carries, so adding
+/// each container's mapped distance counts the same road several times. This
+/// is not hypothetical: every multi-container TAQA group in 2026 is two
+/// containers bound for the same place, so the old sum simply doubled it.
+///
+/// The distance is attributed to the FURTHEST container, so a trip whose drops
+/// span two groups lands wholly in the group it travelled furthest for rather
+/// than being counted by both — which is what keeps group distances summing to
+/// the company's.
+#[tokio::test]
+async fn a_trips_distance_is_its_furthest_drop() {
+    use apex::db::stats_queries::get_watanya_stats;
+
+    let pool = support::fresh_db("apex_trip_distance").await;
+    sqlx::raw_sql(
+        "INSERT INTO fee_mappings (company, terminal, drop_off_point, distance, fee) VALUES
+            ('Watanya','T','Near', 40.0, 1),
+            ('Watanya','T','Far',  300.0, 1);
+         -- One trip, two containers: 40 km out and 300 km out is ONE 300 km run.
+         INSERT INTO trips (company, terminal, drop_off_point, car_no_plate,
+                            tank_capacity, date, receipt_no, parent_trip_id) VALUES
+            ('Watanya','T','Near','C-1', 10000, '2025-05-01', 'M1', 7001),
+            ('Watanya','T','Far', 'C-1', 10000, '2025-05-01', 'M2', 7001);
+         -- And a standalone 40 km trip, which contributes its own distance.
+         INSERT INTO trips (company, terminal, drop_off_point, car_no_plate,
+                            tank_capacity, date, receipt_no) VALUES
+            ('Watanya','T','Near','C-2', 10000, '2025-05-02', 'S1');",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let stats = get_watanya_stats(&pool, "2025-05-01", "2025-05-31", true)
+        .await
+        .unwrap();
+    let total: f64 = stats.iter().map(|d| d.total_distance).sum();
+
+    // 300 for the two-drop trip (not 340), plus 40 for the standalone.
+    assert!(
+        (total - 340.0).abs() < 0.01,
+        "expected 340 km (300 furthest + 40 standalone), got {total}"
+    );
+    assert!(
+        (total - 380.0).abs() > 1.0,
+        "the two drops are being added together again"
+    );
+
+    // The list agrees, and flags the multi-drop row as a maximum.
+    let filters = TripListFilters {
+        page: 1,
+        limit: MAX_LIMIT,
+        company: Some("Watanya".into()),
+        from: Some("2025-05-01".into()),
+        to: Some("2025-05-31".into()),
+        ..Default::default()
+    }
+    .normalized();
+    let (rows, _) = list_trips(&pool, &filters, true).await.unwrap();
+    let m2 = rows.iter().find(|r| r.receipt_no == "M2").unwrap();
+    assert_eq!(m2.distance, 300.0, "the furthest container keeps its distance");
+}
