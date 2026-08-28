@@ -1,4 +1,5 @@
 pub mod trip;
+pub mod trip_list;
 
 pub use trip::*;
 
