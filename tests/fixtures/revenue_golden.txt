@@ -1,0 +1,13 @@
+== Petrol Arrows ==
+PA-Far | trips=1 vol=50000.00 dist=340.00 fee=44.25 rev=2212.50 rental=- vat=- with_vat=- cars=- days=- car_days=-
+PA-Near | trips=2 vol=76000.00 dist=240.00 fee=30.50 rev=2318.00 rental=- vat=- with_vat=- cars=- days=- car_days=-
+PA-Unmapped | trips=1 vol=45000.00 dist=0.00 fee=0.00 rev=0.00 rental=- vat=- with_vat=- cars=- days=- car_days=-
+== Watanya ==
+Unmapped | trips=1 vol=30000.00 dist=0.00 fee=0.00 rev=0.00 rental=- vat=0.00 with_vat=0.00 cars=- days=- car_days=-
+Fee 1 | trips=2 vol=70000.00 dist=400.00 fee=1.00 rev=7315.00 rental=- vat=1024.10 with_vat=8339.10 cars=- days=- car_days=-
+Fee 2 | trips=1 vol=40000.00 dist=150.00 fee=2.00 rev=4884.00 rental=- vat=683.76 with_vat=5567.76 cars=- days=- car_days=-
+Fee 15 | trips=1 vol=30000.00 dist=900.00 fee=15.00 rev=12606.00 rental=- vat=1764.84 with_vat=14370.84 cars=- days=- car_days=-
+== TAQA ==
+TQ-T1 | trips=41 vol=1180000.00 dist=8610.00 fee=- rev=434805.00 rental=62964.47 vat=69687.73 with_vat=567457.20 cars=2 days=31 car_days=41
+== Petromin ==
+PM-T1 | trips=4 vol=80000.00 dist=720.00 fee=- rev=30600.00 rental=6000.00 vat=5124.00 with_vat=41724.00 cars=2 days=2 car_days=3

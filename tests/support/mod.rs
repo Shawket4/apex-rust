@@ -231,6 +231,32 @@ pub async fn fresh_db(name: &str) -> PgPool {
             created_by INTEGER, created_at TIMESTAMPTZ DEFAULT now(),
             updated_at TIMESTAMPTZ DEFAULT now(), deleted_at TIMESTAMPTZ
         );
+        -- Trips and their fee mappings are FalconGo-owned. Column types mirror
+        -- production exactly: `date` really is TEXT ('YYYY-MM-DD'), `id` really
+        -- is INT4, and both `distance` and `fee` are NUMERIC -- the revenue SQL
+        -- casts them, and a mismatch here would hide a cast bug.
+        CREATE TABLE public.trips (
+            id SERIAL PRIMARY KEY,
+            created_at TIMESTAMP DEFAULT now(), updated_at TIMESTAMP DEFAULT now(),
+            deleted_at TIMESTAMP,
+            car_id BIGINT, driver_id BIGINT,
+            car_no_plate TEXT, driver_name TEXT, transporter TEXT,
+            tank_capacity BIGINT,
+            company TEXT, terminal TEXT, drop_off_point TEXT, location_name TEXT,
+            capacity BIGINT, gas_type TEXT,
+            date TEXT,
+            revenue NUMERIC, mileage NUMERIC,
+            receipt_no TEXT, parent_trip_id BIGINT
+        );
+        CREATE TABLE public.fee_mappings (
+            id SERIAL PRIMARY KEY,
+            created_at TIMESTAMP DEFAULT now(), updated_at TIMESTAMP DEFAULT now(),
+            deleted_at TIMESTAMP,
+            company TEXT, terminal TEXT, drop_off_point TEXT,
+            distance NUMERIC, fee NUMERIC,
+            latitude NUMERIC, longitude NUMERIC,
+            osrm_distance NUMERIC, osrm_duration NUMERIC
+        );
         "#,
     )
     .execute(&pool)
