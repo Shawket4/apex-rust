@@ -190,7 +190,7 @@ pub async fn get_taqa_stats(
                 t.tank_capacity,
                 COALESCE(fm.distance, 0.0) as distance,
                 {trip_distance} as trip_distance,
-                (COALESCE(fm.distance, 0.0) * {taqa_rate})::float8 as trip_revenue
+                ({trip_distance} * {taqa_rate})::float8 as trip_revenue
             FROM trips t
             LEFT JOIN fee_mappings fm 
                 ON t.company = fm.company 
@@ -349,7 +349,7 @@ pub async fn get_petromin_stats(
                 t.tank_capacity,
                 COALESCE(fm.distance, 0.0) as distance,
                 {trip_distance} as trip_distance,
-                (COALESCE(fm.distance, 0.0) * {petromin_rate})::float8 as trip_revenue
+                ({trip_distance} * {petromin_rate})::float8 as trip_revenue
             FROM trips t
             LEFT JOIN fee_mappings fm 
                 ON t.company = fm.company 
@@ -705,7 +705,7 @@ async fn get_taqa_route_details(
                 t.tank_capacity,
                 COALESCE(fm.distance, 0.0) as distance,
                 {trip_distance} as trip_distance,
-                (COALESCE(fm.distance, 0.0) * {taqa_rate})::float8 as trip_revenue
+                ({trip_distance} * {taqa_rate})::float8 as trip_revenue
             FROM trips t
             LEFT JOIN fee_mappings fm 
                 ON t.company = fm.company 
@@ -898,7 +898,7 @@ async fn get_petromin_route_details(
                 t.tank_capacity,
                 COALESCE(fm.distance, 0.0) as distance,
                 {trip_distance} as trip_distance,
-                (COALESCE(fm.distance, 0.0) * {petromin_rate})::float8 as trip_revenue
+                ({trip_distance} * {petromin_rate})::float8 as trip_revenue
             FROM trips t
             LEFT JOIN fee_mappings fm 
                 ON t.company = fm.company 
@@ -1198,9 +1198,9 @@ pub async fn get_stats_by_date(
                         (t.tank_capacity * 
                             {wa_band_rate} / 1000.0)::float8
                     WHEN t.company = 'TAQA' THEN
-                        (COALESCE(fm.distance, 0.0) * {taqa_rate})::float8
+                        ({trip_distance} * {taqa_rate})::float8
                     WHEN t.company = 'Petromin' THEN
-                        (COALESCE(fm.distance, 0.0) * {petromin_rate})::float8
+                        ({trip_distance} * {petromin_rate})::float8
                     WHEN t.company = 'Petrol Arrows' THEN
                         (t.tank_capacity * {pa_fee_rate})::float8
                     ELSE 0.0

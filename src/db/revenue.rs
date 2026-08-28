@@ -166,11 +166,17 @@ pub fn base_revenue_sql(company: Company, trips: &str, fees: &str) -> String {
             "({trips}.tank_capacity * {} / {LITRES_PER_FEE_UNIT:?})::float8",
             watanya_band_rate_sql(&format!("{fees}.fee"))
         ),
+        // Billed on the journey, not on the paperwork. A trip that drops at two
+        // points made ONE run to the furthest of them, so the receipt for that
+        // furthest drop carries the whole distance and its siblings carry none.
+        // Summing each container's mapped distance charged the same road twice.
         Company::Taqa => format!(
-            "(COALESCE({fees}.distance, 0.0) * {TAQA_RATE_PER_KM})::float8"
+            "({} * {TAQA_RATE_PER_KM})::float8",
+            trip_distance_sql(trips, fees)
         ),
         Company::Petromin => format!(
-            "(COALESCE({fees}.distance, 0.0) * {PETROMIN_RATE_PER_KM})::float8"
+            "({} * {PETROMIN_RATE_PER_KM})::float8",
+            trip_distance_sql(trips, fees)
         ),
     }
 }
