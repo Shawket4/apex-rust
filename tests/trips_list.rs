@@ -827,3 +827,74 @@ async fn a_trips_distance_is_its_furthest_drop() {
     let m2 = rows.iter().find(|r| r.receipt_no == "M2").unwrap();
     assert_eq!(m2.distance, 300.0, "the furthest container keeps its distance");
 }
+
+/// TAQA is billed for the journey it made, not for each receipt it carried.
+///
+/// A trip dropping at two points made ONE run to the furthest of them, so the
+/// receipt for that furthest drop carries the whole distance and its siblings
+/// carry none. Summing each container's mapped distance charged the same road
+/// twice — worth about 53,000 EGP across 2026 before this changed.
+#[tokio::test]
+async fn taqa_bills_the_furthest_receipt_only() {
+    use apex::db::revenue::TAQA_RATE_PER_KM;
+    use apex::db::stats_queries::get_taqa_stats;
+
+    let pool = support::fresh_db("apex_taqa_furthest_billing").await;
+    sqlx::raw_sql(
+        "INSERT INTO fee_mappings (company, terminal, drop_off_point, distance, fee) VALUES
+            ('TAQA','Suez','Near', 140.0, 0),
+            ('TAQA','Suez','Far',  374.0, 0);
+         -- One trip, two drops. One run of 374 km, not 514.
+         INSERT INTO trips (company, terminal, drop_off_point, car_no_plate,
+                            tank_capacity, date, receipt_no, parent_trip_id) VALUES
+            ('TAQA','Suez','Near','B-1', 30000, '2025-05-01', 'NEAR', 8001),
+            ('TAQA','Suez','Far', 'B-1', 30000, '2025-05-01', 'FAR',  8001);",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let stats = get_taqa_stats(&pool, "2025-05-01", "2025-05-31", true)
+        .await
+        .unwrap();
+    let base: f64 = stats.iter().map(|d| d.total_revenue).sum();
+
+    let expected = 374.0 * TAQA_RATE_PER_KM;
+    assert!(
+        (base - expected).abs() < 0.01,
+        "expected the furthest drop only ({expected}), got {base}"
+    );
+    let both_summed = (374.0 + 140.0) * TAQA_RATE_PER_KM;
+    assert!(
+        (base - both_summed).abs() > 1.0,
+        "both receipts are being billed again"
+    );
+
+    // The list agrees, and puts the earnings on the receipt that earned them.
+    let filters = TripListFilters {
+        page: 1,
+        limit: MAX_LIMIT,
+        company: Some("TAQA".into()),
+        from: Some("2025-05-01".into()),
+        to: Some("2025-05-31".into()),
+        ..Default::default()
+    }
+    .normalized();
+    let (rows, _) = list_trips(&pool, &filters, true).await.unwrap();
+
+    let far = rows.iter().find(|r| r.receipt_no == "FAR").unwrap();
+    let near = rows.iter().find(|r| r.receipt_no == "NEAR").unwrap();
+    assert!(
+        (far.revenue.unwrap() - expected).abs() < 0.01,
+        "the furthest receipt should carry the journey's earnings"
+    );
+    assert_eq!(
+        near.revenue,
+        Some(0.0),
+        "the nearer receipt rode along and earned nothing of its own"
+    );
+
+    // And the list still reconciles with statistics.
+    let listed: f64 = rows.iter().filter_map(|r| r.revenue).sum();
+    assert!((listed - base).abs() < 0.01, "list {listed} != statistics {base}");
+}
