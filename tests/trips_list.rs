@@ -434,3 +434,75 @@ async fn a_car_at_two_terminals_in_one_day_is_billed_twice_for_it() {
         "the gap should be exactly Suez's separate taper"
     );
 }
+
+/* ------------------------------------------------------------------------ */
+/* The HTTP surface                                                          */
+/* ------------------------------------------------------------------------ */
+
+/// The two gates, exercised through the real route rather than the query layer:
+/// level 1 gets the list, level 4 gets the money, and an unauthenticated caller
+/// gets neither.
+#[actix_web::test]
+async fn the_endpoint_gates_the_list_and_the_money_separately() {
+    use actix_web::{test, web, App, ResponseError};
+
+    support::init();
+    let pool = db("apex_trips_http").await;
+    let app = test::init_service(
+        App::new()
+            .app_data(web::Data::new(pool.clone()))
+            .configure(apex::handlers::trips::configure),
+    )
+    .await;
+
+    let get = |token: Option<String>| {
+        let mut req = test::TestRequest::get().uri("/api/v1/trips?limit=50&from=2025-05-01&to=2025-06-30");
+        if let Some(t) = token {
+            req = req.insert_header(("Authorization", format!("Bearer {t}")));
+        }
+        req.to_request()
+    };
+
+    // No credentials at all. JwtAuth rejects by returning an Error rather than
+    // a response, so this has to go through the fallible call.
+    let err = test::try_call_service(&app, get(None))
+        .await
+        .expect_err("an anonymous caller got the trips list");
+    assert_eq!(err.error_response().status(), 401);
+
+    // A dispatcher: sees the list, not the money.
+    let viewer = support::token_with_permission(11, 1);
+    let body: serde_json::Value =
+        test::call_and_read_body_json(&app, get(Some(viewer))).await;
+    let rows = body["data"].as_array().expect("data array");
+    assert!(!rows.is_empty(), "level 1 got an empty list");
+    assert!(body["meta"]["total"].as_i64().unwrap() > 0);
+    for row in rows {
+        assert!(row.get("revenue").is_none(), "revenue reached level 1");
+        assert!(row.get("allocated_total").is_none());
+    }
+    // The rest of the row is intact — this is not a stripped-down payload.
+    assert!(rows[0].get("ID").is_some(), "gorm casing lost: {:?}", rows[0]);
+    assert!(rows[0].get("receipt_no").is_some());
+    assert!(rows[0].get("receipt_steps").is_some());
+
+    // An admin: same rows, with the money.
+    let admin = support::token_with_permission(12, 4);
+    let body: serde_json::Value =
+        test::call_and_read_body_json(&app, get(Some(admin))).await;
+    let rows = body["data"].as_array().expect("data array");
+    assert!(rows.iter().any(|r| r.get("revenue").is_some()),
+            "level 4 got no revenue at all");
+    assert!(rows.iter().any(|r| r.get("allocated_total").is_some()));
+
+    // Level 3 is the statistics threshold and is deliberately NOT enough here.
+    let manager = support::token_with_permission(13, 3);
+    let body: serde_json::Value =
+        test::call_and_read_body_json(&app, get(Some(manager))).await;
+    for row in body["data"].as_array().unwrap() {
+        assert!(
+            row.get("revenue").is_none(),
+            "level 3 saw per-trip revenue; statistics access is not list access"
+        );
+    }
+}
