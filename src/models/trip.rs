@@ -73,7 +73,13 @@ pub struct RouteRevenueStats {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct TripStatistics {
     pub company: String,
+    /// Logical trips: a multi-container trip counts ONCE, however many receipts
+    /// it carries. Computed in one pass over the whole filtered set -- summing
+    /// per-group counts double-counts any trip whose containers span more than
+    /// one drop-off point, which is what this field used to do.
     pub total_trips: i64,
+    /// Individual receipt rows. Always >= total_trips.
+    pub total_receipts: i64,
     pub total_volume: f64,
     pub total_distance: f64,
     pub total_revenue: f64,

@@ -86,8 +86,18 @@ pub async fn get_trip_statistics(
             _ => vec![],
         };
 
-        // Calculate company totals from details (aggregating child data)
-        let total_trips: i64 = details.iter().map(|d| d.total_trips).sum();
+        // Trip counts come from one pass over the whole filtered set, NOT from
+        // summing the per-group figures below. A trip whose containers deliver
+        // to two drop-off points appears in two groups, so summing counted it
+        // twice -- reporting 1,468 for Jul-Aug 2026 against a true 1,307.
+        let (total_trips, total_receipts) = get_trip_counts(
+            pool.get_ref(),
+            &company,
+            &query.start_date,
+            &query.end_date,
+        )
+        .await
+        .map_err(actix_web::error::ErrorInternalServerError)?;
         let total_volume: f64 = details.iter().map(|d| d.total_volume).sum();
         let total_distance: f64 = details.iter().map(|d| d.total_distance).sum();
 
@@ -131,6 +141,7 @@ pub async fn get_trip_statistics(
         statistics.push(TripStatistics {
             company: company.clone(),
             total_trips,
+            total_receipts,
             total_volume,
             total_distance,
             total_revenue,
