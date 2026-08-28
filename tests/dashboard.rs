@@ -27,7 +27,7 @@ async fn db(name: &str) -> PgPool {
           WHERE car_no_plate IN ('PA-A','WA-C');
 
          -- Money out, in-window and out-of-window, plus a split parent that
-         -- must NOT double-count, plus an unreviewed incoming transfer.
+         -- must NOT double-count, plus an uncategorised (unreviewed) transfer.
          INSERT INTO banksms.transactions (source, direction, amount, currency, occurred_at, category)
          VALUES ('manual','out', 1000, 'EGP', '2025-05-10T09:00:00Z', 'Fuel'),
                 ('manual','out',  250, 'EGP', '2025-05-11T09:00:00Z', 'Parts'),
@@ -121,7 +121,7 @@ async fn the_payload_says_what_the_tables_say() {
     // unreviewed incoming transfer does too. Every exception carries a href.
     let exceptions = body["exceptions"].as_array().unwrap();
     assert!(exceptions.iter().any(|e| e["key"] == "trips_earning_zero"));
-    assert!(exceptions.iter().any(|e| e["key"] == "transfers_unreviewed"
+    assert!(exceptions.iter().any(|e| e["key"] == "transactions_unreviewed"
         && e["count"].as_i64() == Some(1)));
     assert!(exceptions.iter().all(|e| e["href"].as_str().is_some()));
 }

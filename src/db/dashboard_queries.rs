@@ -151,12 +151,18 @@ pub async fn largest_payments(pool: &PgPool, from: &str, to: &str) -> Result<Vec
         .collect())
 }
 
-/// Incoming transfers nobody has triaged. Not month-scoped: an unreviewed
-/// transfer from last month is still unreviewed.
-pub async fn transfers_unreviewed(pool: &PgPool) -> Result<i64> {
+/// Transactions nobody has reviewed — money that moved and carries no
+/// category, in either direction. That IS the review workflow here: a bank
+/// message lands as an uncategorised transaction, and reviewing it means
+/// saying what it was for. Counting only incoming transfers (the first cut of
+/// this metric) said 5 while the ledger held ~280 unexplained payments.
+///
+/// Not month-scoped: an unreviewed transaction from last month is still
+/// unreviewed.
+pub async fn transactions_unreviewed(pool: &PgPool) -> Result<i64> {
     let row = sqlx::query(
         "SELECT COUNT(*) AS n FROM banksms.transactions \
-         WHERE deleted_at IS NULL AND split_at IS NULL AND direction = 'in'",
+         WHERE deleted_at IS NULL AND split_at IS NULL AND category IS NULL",
     )
     .fetch_one(pool)
     .await?;
