@@ -6,6 +6,39 @@ use std::collections::HashMap;
 
 use crate::models::*;
 
+/// Substitutes the shared revenue fragments into a query template.
+///
+/// Every rate, band table and rental rule in these queries used to be typed out
+/// inline, once per query — which is exactly how FalconGo and this file ended up
+/// tapering TAQA's rental by two different numbers. The placeholders below are
+/// the only spelling of those rules now; `db::revenue` is the only definition.
+///
+/// Substitution is by name rather than `format!` because these templates are
+/// full of SQL braces that `format!` would demand be doubled, and a missed
+/// escape is a silent query corruption. A placeholder that no longer exists in
+/// `revenue` simply survives into the SQL and fails loudly at the database,
+/// which is the failure mode worth having.
+fn render(sql: &str) -> String {
+    use crate::db::revenue::*;
+    sql.replace("{trip_count}", &logical_trip_count_sql("parent_trip_id"))
+        .replace("{wa_band_rate}", &watanya_band_rate_sql("fm.fee"))
+        .replace(
+            "{pa_fee_rate}",
+            &format!("COALESCE(fm.fee::float8, 0.0) / {LITRES_PER_FEE_UNIT:?}"),
+        )
+        .replace(
+            "{taqa_monthly_rental}",
+            &taqa_monthly_rental_sql("working_days_in_month"),
+        )
+        .replace("{taqa_rate}", &format!("{TAQA_RATE_PER_KM:?}"))
+        .replace("{petromin_rate}", &format!("{PETROMIN_RATE_PER_KM:?}"))
+        .replace(
+            "{petromin_rental_per_car_day}",
+            &format!("{PETROMIN_RENTAL_PER_CAR_DAY:?}"),
+        )
+        .replace("{vat_rate}", &format!("{VAT_RATE:?}"))
+}
+
 pub async fn get_companies(
     pool: &PgPool,
     start_date: &str,
@@ -70,7 +103,7 @@ pub async fn get_petrol_arrows_stats(
     end_date: &str,
     has_financial_access: bool,
 ) -> Result<Vec<TripStatisticsDetails>> {
-    let query = r#"
+    let query = render(r#"
         WITH trip_data AS (
             SELECT 
                 t.drop_off_point,
@@ -78,7 +111,7 @@ pub async fn get_petrol_arrows_stats(
                 t.tank_capacity,
                 COALESCE(fm.distance, 0.0) as distance,
                 COALESCE(fm.fee::float8, 0.0) as fee,
-                (t.tank_capacity * COALESCE(fm.fee::float8, 0.0) / 1000.0)::float8 as trip_revenue
+                (t.tank_capacity * {pa_fee_rate})::float8 as trip_revenue
             FROM trips t
             LEFT JOIN fee_mappings fm 
                 ON t.company = fm.company 
@@ -92,8 +125,7 @@ pub async fn get_petrol_arrows_stats(
         aggregates AS (
             SELECT 
                 drop_off_point,
-                COALESCE(COUNT(DISTINCT parent_trip_id) FILTER (WHERE parent_trip_id IS NOT NULL AND parent_trip_id != 0), 0) +
-                COALESCE(COUNT(*) FILTER (WHERE parent_trip_id IS NULL OR parent_trip_id = 0), 0) as total_trips,
+                {trip_count} as total_trips,
                 COALESCE(SUM(tank_capacity), 0.0)::float8 as total_volume,
                 COALESCE(SUM(distance), 0.0)::float8 as total_distance,
                 COALESCE(MAX(fee), 0.0)::float8 as fee,
@@ -110,9 +142,9 @@ pub async fn get_petrol_arrows_stats(
             CASE WHEN $3 THEN total_revenue ELSE 0.0 END as total_revenue
         FROM aggregates
         ORDER BY drop_off_point
-    "#;
+    "#);
 
-    let rows = sqlx::query(query)
+    let rows = sqlx::query(&query)
         .bind(start_date)
         .bind(end_date)
         .bind(has_financial_access)
@@ -146,7 +178,7 @@ pub async fn get_taqa_stats(
     end_date: &str,
     has_financial_access: bool,
 ) -> Result<Vec<TripStatisticsDetails>> {
-    let query = r#"
+    let query = render(r#"
         WITH trip_data AS (
             SELECT 
                 t.terminal,
@@ -155,7 +187,7 @@ pub async fn get_taqa_stats(
                 t.date,
                 t.tank_capacity,
                 COALESCE(fm.distance, 0.0) as distance,
-                (COALESCE(fm.distance, 0.0) * 50.5)::float8 as trip_revenue
+                (COALESCE(fm.distance, 0.0) * {taqa_rate})::float8 as trip_revenue
             FROM trips t
             LEFT JOIN fee_mappings fm 
                 ON t.company = fm.company 
@@ -181,11 +213,7 @@ pub async fn get_taqa_stats(
                 car_no_plate,
                 month,
                 working_days_in_month,
-                CASE 
-                    WHEN working_days_in_month >= 28 THEN 43000.0
-                    WHEN working_days_in_month > 0 THEN GREATEST(0.0, 43000.0 - ((28 - working_days_in_month) * 1535.71))
-                    ELSE 0.0
-                END::float8 as monthly_rental
+                {taqa_monthly_rental} as monthly_rental
             FROM car_monthly_working_days
         ),
         car_total_rentals AS (
@@ -208,8 +236,7 @@ pub async fn get_taqa_stats(
         aggregates AS (
             SELECT 
                 terminal,
-                COALESCE(COUNT(DISTINCT parent_trip_id) FILTER (WHERE parent_trip_id IS NOT NULL AND parent_trip_id != 0), 0) +
-                COALESCE(COUNT(*) FILTER (WHERE parent_trip_id IS NULL OR parent_trip_id = 0), 0) as total_trips,
+                {trip_count} as total_trips,
                 COALESCE(SUM(tank_capacity), 0.0)::float8 as total_volume,
                 COALESCE(SUM(distance), 0.0)::float8 as total_distance,
                 COUNT(DISTINCT car_no_plate)::bigint as distinct_cars,
@@ -228,14 +255,14 @@ pub async fn get_taqa_stats(
             COALESCE(cr.total_car_days, 0)::bigint as car_days,
             CASE WHEN $3 THEN a.base_revenue ELSE 0.0 END as base_revenue,
             CASE WHEN $3 THEN COALESCE(cr.total_car_rental, 0.0)::float8 ELSE NULL END as car_rental,
-            CASE WHEN $3 THEN ((a.base_revenue + COALESCE(cr.total_car_rental, 0.0)) * 0.14)::float8 ELSE NULL END as vat,
-            50.5 as fee
+            CASE WHEN $3 THEN ((a.base_revenue + COALESCE(cr.total_car_rental, 0.0)) * {vat_rate})::float8 ELSE NULL END as vat,
+            {taqa_rate} as fee
         FROM aggregates a
         LEFT JOIN car_rentals cr ON a.terminal = cr.terminal
         ORDER BY a.terminal
-    "#;
+    "#);
 
-    let rows = sqlx::query(query)
+    let rows = sqlx::query(&query)
         .bind(start_date)
         .bind(end_date)
         .bind(has_financial_access)
@@ -281,7 +308,7 @@ pub async fn get_petromin_stats(
     end_date: &str,
     has_financial_access: bool,
 ) -> Result<Vec<TripStatisticsDetails>> {
-    let query = r#"
+    let query = render(r#"
         WITH trip_data AS (
             SELECT 
                 t.terminal,
@@ -290,7 +317,7 @@ pub async fn get_petromin_stats(
                 t.date,
                 t.tank_capacity,
                 COALESCE(fm.distance, 0.0) as distance,
-                (COALESCE(fm.distance, 0.0) * 42.5)::float8 as trip_revenue
+                (COALESCE(fm.distance, 0.0) * {petromin_rate})::float8 as trip_revenue
             FROM trips t
             LEFT JOIN fee_mappings fm 
                 ON t.company = fm.company 
@@ -311,8 +338,7 @@ pub async fn get_petromin_stats(
         aggregates AS (
             SELECT 
                 terminal,
-                COALESCE(COUNT(DISTINCT parent_trip_id) FILTER (WHERE parent_trip_id IS NOT NULL AND parent_trip_id != 0), 0) +
-                COALESCE(COUNT(*) FILTER (WHERE parent_trip_id IS NULL OR parent_trip_id = 0), 0) as total_trips,
+                {trip_count} as total_trips,
                 COALESCE(SUM(tank_capacity), 0.0)::float8 as total_volume,
                 COALESCE(SUM(distance), 0.0)::float8 as total_distance,
                 COUNT(DISTINCT car_no_plate)::bigint as distinct_cars,
@@ -330,15 +356,15 @@ pub async fn get_petromin_stats(
             a.distinct_days,
             COALESCE(cd.total_car_days, 0)::bigint as car_days,
             CASE WHEN $3 THEN a.base_revenue ELSE 0.0 END as base_revenue,
-            CASE WHEN $3 THEN (COALESCE(cd.total_car_days, 0) * 2000.0)::float8 ELSE NULL END as car_rental,
-            CASE WHEN $3 THEN ((a.base_revenue + COALESCE(cd.total_car_days, 0) * 2000.0) * 0.14)::float8 ELSE NULL END as vat,
-            42.5 as fee
+            CASE WHEN $3 THEN (COALESCE(cd.total_car_days, 0) * {petromin_rental_per_car_day})::float8 ELSE NULL END as car_rental,
+            CASE WHEN $3 THEN ((a.base_revenue + COALESCE(cd.total_car_days, 0) * {petromin_rental_per_car_day}) * {vat_rate})::float8 ELSE NULL END as vat,
+            {petromin_rate} as fee
         FROM aggregates a
         LEFT JOIN car_days cd ON a.terminal = cd.terminal
         ORDER BY a.terminal
-    "#;
+    "#);
 
-    let rows = sqlx::query(query)
+    let rows = sqlx::query(&query)
         .bind(start_date)
         .bind(end_date)
         .bind(has_financial_access)
@@ -384,7 +410,7 @@ pub async fn get_watanya_stats(
     end_date: &str,
     has_financial_access: bool,
 ) -> Result<Vec<TripStatisticsDetails>> {
-    let query = r#"
+    let query = render(r#"
         WITH trip_data AS (
             SELECT 
                 t.parent_trip_id,
@@ -392,24 +418,7 @@ pub async fn get_watanya_stats(
                 COALESCE(fm.distance, 0.0) as distance,
                 COALESCE(fm.fee::float8, 0.0) as fee,
                 (t.tank_capacity * 
-                    CASE COALESCE(fm.fee::int, 0)
-                        WHEN 1 THEN 104.5
-                        WHEN 2 THEN 122.1
-                        WHEN 3 THEN 129.8
-                        WHEN 4 THEN 156.2
-                        WHEN 5 THEN 183.7
-                        WHEN 6 THEN 196.9
-                        WHEN 7 THEN 210.1
-                        WHEN 8 THEN 235.4
-                        WHEN 9 THEN 261.8
-                        WHEN 10 THEN 288.2
-                        WHEN 11 THEN 314.6
-                        WHEN 12 THEN 341.0
-                        WHEN 13 THEN 367.4
-                        WHEN 14 THEN 393.8
-                        WHEN 15 THEN 420.2
-                        ELSE 0.0
-                    END / 1000.0)::float8 as trip_revenue
+                    {wa_band_rate} / 1000.0)::float8 as trip_revenue
             FROM trips t
             LEFT JOIN fee_mappings fm 
                 ON t.company = fm.company 
@@ -423,8 +432,7 @@ pub async fn get_watanya_stats(
         aggregates AS (
             SELECT 
                 COALESCE(fee, 0) as fee,
-                COALESCE(COUNT(DISTINCT parent_trip_id) FILTER (WHERE parent_trip_id IS NOT NULL AND parent_trip_id != 0), 0) +
-                COALESCE(COUNT(*) FILTER (WHERE parent_trip_id IS NULL OR parent_trip_id = 0), 0) as total_trips,
+                {trip_count} as total_trips,
                 COALESCE(SUM(tank_capacity), 0.0)::float8 as total_volume, 
                 COALESCE(SUM(distance), 0.0)::float8 as total_distance,
                 COALESCE(SUM(trip_revenue), 0.0)::float8 as base_revenue
@@ -438,12 +446,12 @@ pub async fn get_watanya_stats(
             a.total_distance,
             a.fee,
             CASE WHEN $3 THEN a.base_revenue ELSE 0.0 END as base_revenue,
-            CASE WHEN $3 THEN (a.base_revenue * 0.14)::float8 ELSE NULL END as vat
+            CASE WHEN $3 THEN (a.base_revenue * {vat_rate})::float8 ELSE NULL END as vat
         FROM aggregates a
         ORDER BY a.fee
-    "#;
+    "#);
 
-    let rows = sqlx::query(query)
+    let rows = sqlx::query(&query)
         .bind(start_date)
         .bind(end_date)
         .bind(has_financial_access)
@@ -510,7 +518,7 @@ async fn get_watanya_route_details(
     end_date: &str,
     has_financial_access: bool,
 ) -> Result<Vec<RouteRevenueStats>> {
-    let query = r#"
+    let query = render(r#"
         WITH trip_data AS (
             SELECT 
                 t.car_no_plate,
@@ -520,24 +528,7 @@ async fn get_watanya_route_details(
                 COALESCE(fm.distance, 0.0) as distance,
                 COALESCE(fm.fee::float8, 0.0) as fee,
                 (t.tank_capacity * 
-                    CASE COALESCE(fm.fee::int, 0)
-                        WHEN 1 THEN 104.5
-                        WHEN 2 THEN 122.1
-                        WHEN 3 THEN 129.8
-                        WHEN 4 THEN 156.2
-                        WHEN 5 THEN 183.7
-                        WHEN 6 THEN 196.9
-                        WHEN 7 THEN 210.1
-                        WHEN 8 THEN 235.4
-                        WHEN 9 THEN 261.8
-                        WHEN 10 THEN 288.2
-                        WHEN 11 THEN 314.6
-                        WHEN 12 THEN 341.0
-                        WHEN 13 THEN 367.4
-                        WHEN 14 THEN 393.8
-                        WHEN 15 THEN 420.2
-                        ELSE 0.0
-                    END / 1000.0)::float8 as trip_revenue
+                    {wa_band_rate} / 1000.0)::float8 as trip_revenue
             FROM trips t
             LEFT JOIN fee_mappings fm 
                 ON t.company = fm.company 
@@ -552,8 +543,7 @@ async fn get_watanya_route_details(
             SELECT 
                 COALESCE(fee, 0) as fee,
                 car_no_plate,
-                COALESCE(COUNT(DISTINCT parent_trip_id) FILTER (WHERE parent_trip_id IS NOT NULL AND parent_trip_id != 0), 0) +
-                COALESCE(COUNT(*) FILTER (WHERE parent_trip_id IS NULL OR parent_trip_id = 0), 0) as total_trips,
+                {trip_count} as total_trips,
                 COALESCE(SUM(tank_capacity), 0.0)::float8 as total_volume,
                 COALESCE(SUM(distance), 0.0)::float8 as total_distance,
                 COUNT(DISTINCT date)::bigint as working_days,
@@ -569,13 +559,13 @@ async fn get_watanya_route_details(
             total_distance,
             working_days,
             CASE WHEN $3 THEN base_revenue ELSE NULL END as total_revenue,
-            CASE WHEN $3 THEN (base_revenue * 0.14)::float8 ELSE NULL END as vat,
+            CASE WHEN $3 THEN (base_revenue * {vat_rate})::float8 ELSE NULL END as vat,
             CASE WHEN $3 THEN (base_revenue * 1.14)::float8 ELSE NULL END as total_with_vat
         FROM car_stats
         ORDER BY fee, car_no_plate
-    "#;
+    "#);
 
-    let rows = sqlx::query(query)
+    let rows = sqlx::query(&query)
         .bind(start_date)
         .bind(end_date)
         .bind(has_financial_access)
@@ -654,7 +644,7 @@ async fn get_taqa_route_details(
     end_date: &str,
     has_financial_access: bool,
 ) -> Result<Vec<RouteRevenueStats>> {
-    let query = r#"
+    let query = render(r#"
         WITH trip_data AS (
             SELECT 
                 t.terminal,
@@ -663,7 +653,7 @@ async fn get_taqa_route_details(
                 t.date,
                 t.tank_capacity,
                 COALESCE(fm.distance, 0.0) as distance,
-                (COALESCE(fm.distance, 0.0) * 50.5)::float8 as trip_revenue
+                (COALESCE(fm.distance, 0.0) * {taqa_rate})::float8 as trip_revenue
             FROM trips t
             LEFT JOIN fee_mappings fm 
                 ON t.company = fm.company 
@@ -689,11 +679,7 @@ async fn get_taqa_route_details(
                 car_no_plate,
                 month,
                 working_days_in_month,
-                CASE 
-                    WHEN working_days_in_month >= 28 THEN 43000.0
-                    WHEN working_days_in_month > 0 THEN GREATEST(0.0, 43000.0 - ((28 - working_days_in_month) * 1535.71))
-                    ELSE 0.0
-                END::float8 as monthly_rental
+                {taqa_monthly_rental} as monthly_rental
             FROM car_monthly_working_days
         ),
         car_rental_totals AS (
@@ -709,8 +695,7 @@ async fn get_taqa_route_details(
             SELECT 
                 terminal,
                 car_no_plate,
-                COALESCE(COUNT(DISTINCT parent_trip_id) FILTER (WHERE parent_trip_id IS NOT NULL AND parent_trip_id != 0), 0) +
-                COALESCE(COUNT(*) FILTER (WHERE parent_trip_id IS NULL OR parent_trip_id = 0), 0) as total_trips,
+                {trip_count} as total_trips,
                 COALESCE(SUM(tank_capacity), 0.0)::float8 as total_volume,
                 COALESCE(SUM(distance), 0.0)::float8 as total_distance,
                 COALESCE(SUM(trip_revenue), 0.0)::float8 as base_revenue
@@ -741,13 +726,13 @@ async fn get_taqa_route_details(
             working_days,
             CASE WHEN $3 THEN base_revenue ELSE NULL END as total_revenue,
             CASE WHEN $3 THEN car_rental ELSE NULL END as car_rental,
-            CASE WHEN $3 THEN ((base_revenue + car_rental) * 0.14)::float8 ELSE NULL END as vat,
-            CASE WHEN $3 THEN (base_revenue + car_rental + (base_revenue + car_rental) * 0.14)::float8 ELSE NULL END as total_with_vat
+            CASE WHEN $3 THEN ((base_revenue + car_rental) * {vat_rate})::float8 ELSE NULL END as vat,
+            CASE WHEN $3 THEN (base_revenue + car_rental + (base_revenue + car_rental) * {vat_rate})::float8 ELSE NULL END as total_with_vat
         FROM car_stats
         ORDER BY terminal, car_no_plate
-    "#;
+    "#);
 
-    let rows = sqlx::query(query)
+    let rows = sqlx::query(&query)
         .bind(start_date)
         .bind(end_date)
         .bind(has_financial_access)
@@ -804,7 +789,7 @@ async fn get_taqa_route_details(
             vat,
             car_rental,
             total_with_vat,
-            fee: Some(50.5),
+            fee: Some(crate::db::revenue::TAQA_RATE_PER_KM),
             route_type: "terminal".to_string(),
             terminal: Some(terminal),
             drop_off_point: None,
@@ -823,7 +808,7 @@ async fn get_petromin_route_details(
     end_date: &str,
     has_financial_access: bool,
 ) -> Result<Vec<RouteRevenueStats>> {
-    let query = r#"
+    let query = render(r#"
         WITH trip_data AS (
             SELECT 
                 t.terminal,
@@ -832,7 +817,7 @@ async fn get_petromin_route_details(
                 t.date,
                 t.tank_capacity,
                 COALESCE(fm.distance, 0.0) as distance,
-                (COALESCE(fm.distance, 0.0) * 42.5)::float8 as trip_revenue
+                (COALESCE(fm.distance, 0.0) * {petromin_rate})::float8 as trip_revenue
             FROM trips t
             LEFT JOIN fee_mappings fm 
                 ON t.company = fm.company 
@@ -855,8 +840,7 @@ async fn get_petromin_route_details(
             SELECT 
                 terminal,
                 car_no_plate,
-                COALESCE(COUNT(DISTINCT parent_trip_id) FILTER (WHERE parent_trip_id IS NOT NULL AND parent_trip_id != 0), 0) +
-                COALESCE(COUNT(*) FILTER (WHERE parent_trip_id IS NULL OR parent_trip_id = 0), 0) as total_trips,
+                {trip_count} as total_trips,
                 COALESCE(SUM(tank_capacity), 0.0)::float8 as total_volume,
                 COALESCE(SUM(distance), 0.0)::float8 as total_distance,
                 COALESCE(SUM(trip_revenue), 0.0)::float8 as base_revenue
@@ -872,7 +856,7 @@ async fn get_petromin_route_details(
                 cts.total_distance,
                 cts.base_revenue,
                 COALESCE(cwd.working_days, 0)::bigint as working_days,
-                (COALESCE(cwd.working_days, 0) * 2000.0)::float8 as car_rental
+                (COALESCE(cwd.working_days, 0) * {petromin_rental_per_car_day})::float8 as car_rental
             FROM car_trip_stats cts
             LEFT JOIN car_working_days cwd 
                 ON cts.terminal = cwd.terminal 
@@ -887,13 +871,13 @@ async fn get_petromin_route_details(
             working_days,
             CASE WHEN $3 THEN base_revenue ELSE NULL END as total_revenue,
             CASE WHEN $3 THEN car_rental ELSE NULL END as car_rental,
-            CASE WHEN $3 THEN ((base_revenue + car_rental) * 0.14)::float8 ELSE NULL END as vat,
-            CASE WHEN $3 THEN (base_revenue + car_rental + (base_revenue + car_rental) * 0.14)::float8 ELSE NULL END as total_with_vat
+            CASE WHEN $3 THEN ((base_revenue + car_rental) * {vat_rate})::float8 ELSE NULL END as vat,
+            CASE WHEN $3 THEN (base_revenue + car_rental + (base_revenue + car_rental) * {vat_rate})::float8 ELSE NULL END as total_with_vat
         FROM car_stats
         ORDER BY terminal, car_no_plate
-    "#;
+    "#);
 
-    let rows = sqlx::query(query)
+    let rows = sqlx::query(&query)
         .bind(start_date)
         .bind(end_date)
         .bind(has_financial_access)
@@ -950,7 +934,7 @@ async fn get_petromin_route_details(
             vat,
             car_rental,
             total_with_vat,
-            fee: Some(42.5),
+            fee: Some(crate::db::revenue::PETROMIN_RATE_PER_KM),
             route_type: "terminal".to_string(),
             terminal: Some(terminal),
             drop_off_point: None,
@@ -969,7 +953,7 @@ async fn get_petrol_arrows_route_details(
     end_date: &str,
     has_financial_access: bool,
 ) -> Result<Vec<RouteRevenueStats>> {
-    let query = r#"
+    let query = render(r#"
         WITH trip_data AS (
             SELECT 
                 t.terminal,
@@ -980,7 +964,7 @@ async fn get_petrol_arrows_route_details(
                 t.tank_capacity,
                 COALESCE(fm.distance, 0.0) as distance,
                 COALESCE(fm.fee::float8, 0.0) as fee,
-                (t.tank_capacity * COALESCE(fm.fee::float8, 0.0) / 1000.0)::float8 as trip_revenue
+                (t.tank_capacity * {pa_fee_rate})::float8 as trip_revenue
             FROM trips t
             LEFT JOIN fee_mappings fm 
                 ON t.company = fm.company 
@@ -997,8 +981,7 @@ async fn get_petrol_arrows_route_details(
                 drop_off_point,
                 MAX(fee) as fee,
                 car_no_plate,
-                COALESCE(COUNT(DISTINCT parent_trip_id) FILTER (WHERE parent_trip_id IS NOT NULL AND parent_trip_id != 0), 0) +
-                COALESCE(COUNT(*) FILTER (WHERE parent_trip_id IS NULL OR parent_trip_id = 0), 0) as total_trips,
+                {trip_count} as total_trips,
                 COALESCE(SUM(tank_capacity), 0.0)::float8 as total_volume,
                 COALESCE(SUM(distance), 0.0)::float8 as total_distance,
                 COUNT(DISTINCT date)::bigint as working_days,
@@ -1019,9 +1002,9 @@ async fn get_petrol_arrows_route_details(
             CASE WHEN $3 THEN base_revenue ELSE NULL END as total_with_vat
         FROM car_stats
         ORDER BY terminal, drop_off_point, car_no_plate
-    "#;
+    "#);
 
-    let rows = sqlx::query(query)
+    let rows = sqlx::query(&query)
         .bind(start_date)
         .bind(end_date)
         .bind(has_financial_access)
@@ -1120,30 +1103,13 @@ pub async fn get_stats_by_date(
                 CASE 
                     WHEN t.company = 'Watanya' THEN
                         (t.tank_capacity * 
-                            CASE COALESCE(fm.fee::int, 0)
-                                WHEN 1 THEN 104.5
-                                WHEN 2 THEN 122.1
-                                WHEN 3 THEN 129.8
-                                WHEN 4 THEN 156.2
-                                WHEN 5 THEN 183.7
-                                WHEN 6 THEN 196.9
-                                WHEN 7 THEN 210.1
-                                WHEN 8 THEN 235.4
-                                WHEN 9 THEN 261.8
-                                WHEN 10 THEN 288.2
-                                WHEN 11 THEN 314.6
-                                WHEN 12 THEN 341.0
-                                WHEN 13 THEN 367.4
-                                WHEN 14 THEN 393.8
-                                WHEN 15 THEN 420.2
-                                ELSE 0.0
-                            END / 1000.0)::float8
+                            {wa_band_rate} / 1000.0)::float8
                     WHEN t.company = 'TAQA' THEN
-                        (COALESCE(fm.distance, 0.0) * 50.5)::float8
+                        (COALESCE(fm.distance, 0.0) * {taqa_rate})::float8
                     WHEN t.company = 'Petromin' THEN
-                        (COALESCE(fm.distance, 0.0) * 42.5)::float8
+                        (COALESCE(fm.distance, 0.0) * {petromin_rate})::float8
                     WHEN t.company = 'Petrol Arrows' THEN
-                        (t.tank_capacity * COALESCE(fm.fee::float8, 0.0) / 1000.0)::float8
+                        (t.tank_capacity * {pa_fee_rate})::float8
                     ELSE 0.0
                 END as trip_revenue
             FROM trips t
@@ -1178,11 +1144,7 @@ pub async fn get_stats_by_date(
                 car_no_plate,
                 month,
                 working_days_in_month,
-                CASE 
-                    WHEN working_days_in_month >= 28 THEN 43000.0
-                    WHEN working_days_in_month > 0 THEN GREATEST(0.0, 43000.0 - ((28 - working_days_in_month) * 1535.71))
-                    ELSE 0.0
-                END::float8 as monthly_rental
+                {taqa_monthly_rental} as monthly_rental
             FROM taqa_car_monthly
         ),
         taqa_daily_allocation AS (
@@ -1216,8 +1178,7 @@ pub async fn get_stats_by_date(
             SELECT 
                 date,
                 company,
-                COALESCE(COUNT(DISTINCT parent_trip_id) FILTER (WHERE parent_trip_id IS NOT NULL AND parent_trip_id != 0), 0) +
-                COALESCE(COUNT(*) FILTER (WHERE parent_trip_id IS NULL OR parent_trip_id = 0), 0) as total_trips,
+                {trip_count} as total_trips,
                 COALESCE(SUM(tank_capacity), 0.0)::float8 as total_volume,
                 COALESCE(SUM(distance), 0.0)::float8 as total_distance,
                 COALESCE(SUM(trip_revenue), 0.0)::float8 as base_revenue
@@ -1234,7 +1195,7 @@ pub async fn get_stats_by_date(
                 cbs.base_revenue,
                 CASE 
                     WHEN cbs.company = 'TAQA' THEN COALESCE(tdr.daily_car_rental, 0.0)
-                    WHEN cbs.company = 'Petromin' THEN COALESCE(pdc.car_count * 2000.0, 0.0)
+                    WHEN cbs.company = 'Petromin' THEN COALESCE(pdc.car_count * {petromin_rental_per_car_day}, 0.0)
                     ELSE 0.0
                 END::float8 as car_rental
             FROM company_base_stats cbs
@@ -1252,12 +1213,12 @@ pub async fn get_stats_by_date(
                 car_rental,
                 CASE 
                     WHEN company IN ('Watanya', 'TAQA', 'Petromin') THEN 
-                        ((base_revenue + car_rental) * 0.14)::float8
+                        ((base_revenue + car_rental) * {vat_rate})::float8
                     ELSE 0.0
                 END as vat,
                 CASE 
                     WHEN company IN ('Watanya', 'TAQA', 'Petromin') THEN 
-                        (base_revenue + car_rental + (base_revenue + car_rental) * 0.14)::float8
+                        (base_revenue + car_rental + (base_revenue + car_rental) * {vat_rate})::float8
                     ELSE base_revenue
                 END as total_revenue
             FROM company_with_rental
@@ -1296,7 +1257,10 @@ pub async fn get_stats_by_date(
         ORDER BY dt.date ASC
     "#;
 
-    let full_query = format!("{}{}{}", base_query, company_filter_clause, rest_of_query);
+    let full_query = render(&format!(
+        "{}{}{}",
+        base_query, company_filter_clause, rest_of_query
+    ));
 
     let rows = if let Some(company) = company_filter {
         sqlx::query(&full_query)
@@ -1436,10 +1400,7 @@ pub async fn get_trip_counts(
     let row = sqlx::query(
         r#"
         SELECT
-            COALESCE(COUNT(DISTINCT parent_trip_id)
-                     FILTER (WHERE parent_trip_id IS NOT NULL AND parent_trip_id != 0), 0)
-          + COALESCE(COUNT(*)
-                     FILTER (WHERE parent_trip_id IS NULL OR parent_trip_id = 0), 0)
+            {trip_count}
                 AS trips,
             COUNT(*) AS receipts
         FROM trips

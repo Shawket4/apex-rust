@@ -166,8 +166,16 @@ fn render(company: &str, rows: &[TripStatisticsDetails]) -> String {
 /* The golden snapshot                                                       */
 /* ------------------------------------------------------------------------ */
 
-/// What the statistics endpoints produce from the fixture TODAY. Centralizing
-/// the formulas must not change a single figure below.
+/// What the statistics endpoints produce from the fixture. Centralizing the
+/// formulas must not change a single figure below.
+///
+/// One figure DID move when the formulas were centralized, deliberately and
+/// exactly once: TAQA's taper was a typed 1535.71, and is now the exact
+/// 43000/28 it was always meant to approximate. That shifted TAQA's rental by
+/// -0.18 on this fixture (62964.47 -> 62964.29) and nothing else, in any
+/// company or column -- which is the evidence that the refactor itself was
+/// behaviour-preserving. The typed value also never reached zero: a car that
+/// worked no days was credited 43000 - 28 * 1535.71 = 0.12 it had not earned.
 ///
 /// Spot-checks that were computed by hand rather than copied from the code, so
 /// this is a real oracle and not just a record of current behaviour:
@@ -178,8 +186,9 @@ fn render(company: &str, rows: &[TripStatisticsDetails]) -> String {
 ///                             (4 rows: 1 direct + 3 containers)
 ///   TAQA base               : 41 rows * 210 km * 50.5            = 434,805.00
 ///   TAQA rental             : 43000 (TQ-A May, 28 days)
-///                           + 43000 - 18 * (43000/28) = 15357.22 (TQ-B May)
-///                           + 43000 - 25 * (43000/28) =  4607.19 (TQ-A June)
+///                           + 43000 - 18 * (43000/28) = 15357.14 (TQ-B May)
+///                           + 43000 - 25 * (43000/28) =  4607.14 (TQ-A June)
+///                           = 62964.29
 ///   Petromin car-days       : 3 (PM-A 18th, PM-A 19th, PM-B 18th) -> 6000.00
 const GOLDEN: &str = include_str!("fixtures/revenue_golden.txt");
 
