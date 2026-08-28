@@ -275,6 +275,120 @@ pub mod allocation {
     pub fn share_sql(total_expr: &str, partition: &str) -> String {
         format!("(({total_expr}) / COUNT(*) OVER (PARTITION BY {partition}))::float8")
     }
+
+    /// The CTE chain that hangs a full revenue breakdown off every trip in a
+    /// window: the trip's own base revenue, its allocated share of car rental,
+    /// VAT on both, and the total.
+    ///
+    /// `window_sql` is a boolean SQL predicate over `t` scoping the window. It
+    /// must be the caller's DATE and COMPANY filter and nothing else — never
+    /// their text search or receipt-status filter. That line matters: the
+    /// allocation divides a shared cost by how many rows share it, so folding a
+    /// search into the window would make a trip's revenue change depending on
+    /// what someone typed into a search box. Scoping the window exactly the way
+    /// statistics scopes its aggregate is also what makes the two reconcile —
+    /// see `sums_reconcile_with_statistics` in tests/revenue_parity.rs.
+    ///
+    /// The chain ends in a CTE named `revenue`, which the caller selects from.
+    /// It yields `t.*` plus `fee_distance`, `fee_value`, `base_revenue`,
+    /// `allocated_rental`, `allocated_vat` and `allocated_total`.
+    pub fn per_row_revenue_cte(window_sql: &str) -> String {
+        use super::*;
+
+        // Petrol Arrows and Watanya bill on volume; TAQA and Petromin on
+        // distance. A company with no rule earns nothing rather than guessing.
+        let base_case = format!(
+            "CASE t.company \
+               WHEN '{pa}' THEN {pa_sql} \
+               WHEN '{wa}' THEN {wa_sql} \
+               WHEN '{tq}' THEN {tq_sql} \
+               WHEN '{pm}' THEN {pm_sql} \
+               ELSE 0.0 END::float8",
+            pa = Company::PetrolArrows.as_str(),
+            wa = Company::Watanya.as_str(),
+            tq = Company::Taqa.as_str(),
+            pm = Company::Petromin.as_str(),
+            pa_sql = base_revenue_sql(Company::PetrolArrows, "t", "fm"),
+            wa_sql = base_revenue_sql(Company::Watanya, "t", "fm"),
+            tq_sql = base_revenue_sql(Company::Taqa, "t", "fm"),
+            pm_sql = base_revenue_sql(Company::Petromin, "t", "fm"),
+        );
+
+        // A car's rental is earned per month (TAQA) or per day (Petromin), so
+        // the share is that whole amount divided by however many rows sit in
+        // the same bucket. COUNT(*) OVER a partition containing the row is
+        // never zero, so this cannot divide by zero.
+        let taqa_share = share_sql(
+            &taqa_monthly_rental_sql("COALESCE(tm.working_days, 0)"),
+            "s.company, s.car_no_plate, DATE_TRUNC('month', s.date::date)",
+        );
+        let petromin_share = share_sql(
+            &format!("{PETROMIN_RENTAL_PER_CAR_DAY:?}"),
+            "s.company, s.car_no_plate, s.date",
+        );
+
+        // VAT is linear, so taxing each row's own allocated subtotal sums to
+        // the same figure as taxing the aggregate. Petrol Arrows is VAT-free.
+        let vat = vat_sql("a.base_revenue + a.allocated_rental");
+
+        format!(
+            r#"
+        scoped AS (
+            SELECT
+                t.*,
+                COALESCE(fm.distance, 0.0)::float8 AS fee_distance,
+                COALESCE(fm.fee::float8, 0.0)      AS fee_value,
+                {base_case} AS base_revenue
+            FROM trips t
+            LEFT JOIN fee_mappings fm
+                ON  fm.company        = t.company
+                AND fm.terminal       = t.terminal
+                AND fm.drop_off_point = t.drop_off_point
+                AND fm.deleted_at IS NULL
+            WHERE t.deleted_at IS NULL AND ({window_sql})
+        ),
+        taqa_months AS (
+            SELECT
+                car_no_plate,
+                DATE_TRUNC('month', date::date) AS month,
+                COUNT(DISTINCT date)::float8    AS working_days
+            FROM scoped
+            WHERE company = '{taqa}'
+            GROUP BY car_no_plate, DATE_TRUNC('month', date::date)
+        ),
+        allocated AS (
+            SELECT
+                s.*,
+                CASE s.company
+                    WHEN '{taqa}'     THEN {taqa_share}
+                    WHEN '{petromin}' THEN {petromin_share}
+                    ELSE 0.0
+                END::float8 AS allocated_rental
+            FROM scoped s
+            LEFT JOIN taqa_months tm
+                ON  s.company      = '{taqa}'
+                AND tm.car_no_plate = s.car_no_plate
+                AND tm.month        = DATE_TRUNC('month', s.date::date)
+        ),
+        priced AS (
+            SELECT
+                a.*,
+                CASE WHEN a.company = '{petrol_arrows}' THEN 0.0
+                     ELSE {vat} END::float8 AS allocated_vat
+            FROM allocated a
+        ),
+        revenue AS (
+            SELECT
+                p.*,
+                (p.base_revenue + p.allocated_rental + p.allocated_vat)::float8
+                    AS allocated_total
+            FROM priced p
+        )"#,
+            taqa = Company::Taqa.as_str(),
+            petromin = Company::Petromin.as_str(),
+            petrol_arrows = Company::PetrolArrows.as_str(),
+        )
+    }
 }
 
 /* ------------------------------------------------------------------------ */

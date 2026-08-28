@@ -28,7 +28,7 @@ mod support;
 
 use apex::db::stats_queries;
 use apex::models::trip::TripStatisticsDetails;
-use sqlx::PgPool;
+use sqlx::{PgPool, Row};
 
 /// The window every assertion runs over. Wide enough to contain the whole
 /// fixture; the per-month rental logic is exercised inside it, not by clipping.
@@ -282,5 +282,116 @@ async fn revenue_is_withheld_without_financial_access() {
                 r.group_name
             );
         }
+    }
+}
+
+/* ------------------------------------------------------------------------ */
+/* Reconciliation                                                            */
+/*                                                                           */
+/* The property the whole allocation design rests on.                        */
+/* ------------------------------------------------------------------------ */
+
+/// Summing the per-row revenue over a window must equal what the statistics
+/// endpoints report for the same window — to the cent, for every component.
+///
+/// This is the claim that makes a per-trip revenue column defensible at all.
+/// Car rental is not a per-trip quantity: TAQA's is earned per car per month
+/// and Petromin's per car-day, shared by every trip that car ran. The list
+/// divides those costs across the rows that incurred them, and this test is
+/// what proves the division neither invents money nor loses it — that the
+/// column a user sees on the trips page adds up to the number the statistics
+/// page shows them.
+///
+/// It is also the regression that catches the tempting mistakes: charging a
+/// Petromin car twice for two trips on one day, collapsing TAQA's separate
+/// monthly rentals into one range-wide taper, or dropping the rows of an
+/// unmapped route that earn no base revenue but still consume a car-day.
+#[tokio::test]
+async fn per_row_revenue_sums_to_the_statistics_aggregate() {
+    use apex::db::revenue::allocation::per_row_revenue_cte;
+
+    let pool = support::fresh_db("apex_revenue_reconcile").await;
+    seed(&pool).await;
+
+    for (company, stats) in [
+        (
+            "Petrol Arrows",
+            stats_queries::get_petrol_arrows_stats(&pool, FROM, TO, true)
+                .await
+                .unwrap(),
+        ),
+        (
+            "Watanya",
+            stats_queries::get_watanya_stats(&pool, FROM, TO, true)
+                .await
+                .unwrap(),
+        ),
+        (
+            "TAQA",
+            stats_queries::get_taqa_stats(&pool, FROM, TO, true)
+                .await
+                .unwrap(),
+        ),
+        (
+            "Petromin",
+            stats_queries::get_petromin_stats(&pool, FROM, TO, true)
+                .await
+                .unwrap(),
+        ),
+    ] {
+        // The window is the same one statistics aggregates over: this company,
+        // this date range. Nothing else — see per_row_revenue_cte's contract.
+        let sql = format!(
+            "WITH {} SELECT \
+               COALESCE(SUM(base_revenue), 0.0)::float8     AS base, \
+               COALESCE(SUM(allocated_rental), 0.0)::float8 AS rental, \
+               COALESCE(SUM(allocated_vat), 0.0)::float8    AS vat, \
+               COALESCE(SUM(allocated_total), 0.0)::float8  AS total \
+             FROM revenue",
+            per_row_revenue_cte("t.company = $1 AND t.date BETWEEN $2 AND $3")
+        );
+        let row = sqlx::query(&sql)
+            .bind(company)
+            .bind(FROM)
+            .bind(TO)
+            .fetch_one(&pool)
+            .await
+            .unwrap_or_else(|e| panic!("per-row revenue for {company}: {e}"));
+
+        let (row_base, row_rental, row_vat, row_total) = (
+            row.get::<f64, _>("base"),
+            row.get::<f64, _>("rental"),
+            row.get::<f64, _>("vat"),
+            row.get::<f64, _>("total"),
+        );
+
+        // Statistics report per group (drop-off point, fee band or terminal);
+        // the list has no grouping, so compare against the company total.
+        let stat_base: f64 = stats.iter().map(|d| d.total_revenue).sum();
+        let stat_rental: f64 = stats.iter().filter_map(|d| d.car_rental).sum();
+        let stat_vat: f64 = stats.iter().filter_map(|d| d.vat).sum();
+
+        // A cent. These are f64 sums taken in different orders, so exact
+        // equality would be testing float associativity rather than the rule.
+        const EPS: f64 = 0.01;
+        let close = |a: f64, b: f64| (a - b).abs() < EPS;
+
+        assert!(
+            close(row_base, stat_base),
+            "{company}: base revenue {row_base} != statistics {stat_base}"
+        );
+        assert!(
+            close(row_rental, stat_rental),
+            "{company}: allocated rental {row_rental} != statistics {stat_rental}"
+        );
+        assert!(
+            close(row_vat, stat_vat),
+            "{company}: allocated VAT {row_vat} != statistics {stat_vat}"
+        );
+        assert!(
+            close(row_total, stat_base + stat_rental + stat_vat),
+            "{company}: allocated total {row_total} != {}",
+            stat_base + stat_rental + stat_vat
+        );
     }
 }
