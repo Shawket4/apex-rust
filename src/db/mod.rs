@@ -1,3 +1,4 @@
+pub mod revenue;
 pub mod stats_queries;
 pub use stats_queries::*;
 
