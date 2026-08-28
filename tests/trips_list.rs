@@ -352,25 +352,22 @@ async fn page_size_is_capped() {
 }
 
 /* ------------------------------------------------------------------------ */
-/* A known quirk, pinned                                                     */
+/* One day is one day                                                        */
 /* ------------------------------------------------------------------------ */
 
-/// A TAQA car that serves two terminals on the same day is credited a working
-/// day in each terminal's group — one day of work counted twice — so the fleet
-/// rental comes out one day's taper high.
+/// A car that serves two terminals on the same date has worked ONE day, and is
+/// rented for one day.
 ///
-/// This is not something the allocation introduced. It is how the statistics
-/// queries have always grouped their working-day counts, and it is live: car
-/// "ف ع ص 4381" ran Alex and Suez on 2025-06-05, worth 1535.71. Counting the
-/// day once is almost certainly the right reading of the rental contract, but
-/// changing it changes what TAQA is billed, so the behaviour is pinned here
-/// rather than quietly corrected.
+/// This did not used to hold. The statistics queries counted working days per
+/// (terminal, car, month), so such a date was credited to each terminal and the
+/// fleet was billed a day it had not earned — live in production, where car
+/// "ف ع ص 4381" ran Alex and Suez on 2025-06-05.
 ///
-/// What this test actually guards is that the list and statistics stay in
-/// agreement about it. Whichever way the question is settled, they must move
-/// together.
+/// The single rental is now split between the terminals in proportion to the
+/// days each saw, so per-terminal reporting still works, the shares add back to
+/// one rental, and the trips list agrees with all of it.
 #[tokio::test]
-async fn a_car_at_two_terminals_in_one_day_is_billed_twice_for_it() {
+async fn a_car_at_two_terminals_in_one_day_is_rented_for_one_day() {
     use apex::db::revenue::TAQA_RENTAL_PER_DAY;
     use apex::db::stats_queries::get_taqa_stats;
 
@@ -378,7 +375,7 @@ async fn a_car_at_two_terminals_in_one_day_is_billed_twice_for_it() {
     sqlx::raw_sql(
         "INSERT INTO fee_mappings (company, terminal, drop_off_point, distance, fee) VALUES
             ('TAQA','Alex','Site',100.0,0), ('TAQA','Suez','Site',100.0,0);
-         -- One car, ten days at Alex. The tenth day it also runs from Suez.
+         -- One car, ten days at Alex. On the tenth it also runs from Suez.
          INSERT INTO trips (company, terminal, drop_off_point, car_no_plate,
                             tank_capacity, date, receipt_no)
          SELECT 'TAQA','Alex','Site','SPLIT-1', 30000,
@@ -398,6 +395,36 @@ async fn a_car_at_two_terminals_in_one_day_is_billed_twice_for_it() {
         .unwrap();
     let stats_rental: f64 = stats.iter().filter_map(|d| d.car_rental).sum();
 
+    // Ten distinct dates worked, so exactly one tapered rental for ten days --
+    // NOT one for Alex's ten plus another for Suez's one.
+    let expected = 43_000.0 - (28.0 - 10.0) * TAQA_RENTAL_PER_DAY;
+    assert!(
+        (stats_rental - expected).abs() < 0.01,
+        "expected one rental of {expected}, got {stats_rental}"
+    );
+
+    // The old behaviour, for the record: a second full taper for Suez's single
+    // day. If this ever passes again, the day is being billed twice.
+    let double_billed = expected + (43_000.0 - (28.0 - 1.0) * TAQA_RENTAL_PER_DAY);
+    assert!(
+        (stats_rental - double_billed).abs() > 1.0,
+        "the shared day is being billed to both terminals again"
+    );
+
+    // Both terminals still report a rental -- the day is split, not assigned to
+    // whichever terminal happened to sort first -- and the parts add back up.
+    let per_terminal: Vec<f64> = stats.iter().filter_map(|d| d.car_rental).collect();
+    assert_eq!(per_terminal.len(), 2, "expected a row for Alex and for Suez");
+    assert!(
+        per_terminal.iter().all(|v| *v > 0.0),
+        "a terminal that used the car was charged nothing: {per_terminal:?}"
+    );
+    assert!(
+        (per_terminal.iter().sum::<f64>() - expected).abs() < 0.01,
+        "the terminal shares do not add back to the one rental"
+    );
+
+    // And the trips list agrees with statistics, which is the contract.
     let filters = TripListFilters {
         page: 1,
         limit: MAX_LIMIT,
@@ -409,29 +436,9 @@ async fn a_car_at_two_terminals_in_one_day_is_billed_twice_for_it() {
     .normalized();
     let (rows, _) = list_trips(&pool, &filters, true).await.unwrap();
     let list_rental: f64 = rows.iter().filter_map(|r| r.allocated_rental).sum();
-
-    // The two must agree. That is the contract.
     assert!(
         (list_rental - stats_rental).abs() < 0.01,
         "list rental {list_rental} != statistics {stats_rental}"
-    );
-
-    // And they agree on the double-count: Alex sees 10 working days, Suez sees
-    // 1, for 11 days of credit against 10 days of actual work.
-    let alex = 43_000.0 - (28.0 - 10.0) * TAQA_RENTAL_PER_DAY;
-    let suez = 43_000.0 - (28.0 - 1.0) * TAQA_RENTAL_PER_DAY;
-    assert!(
-        (stats_rental - (alex + suez)).abs() < 0.01,
-        "expected {} (Alex {alex} + Suez {suez}), got {stats_rental}",
-        alex + suez
-    );
-
-    // Stated the other way: counting 2025-05-10 once would bill exactly one
-    // day's taper less. This is the figure a decision here would move.
-    let counted_once = 43_000.0 - (28.0 - 10.0) * TAQA_RENTAL_PER_DAY;
-    assert!(
-        (stats_rental - counted_once - suez).abs() < 0.01,
-        "the gap should be exactly Suez's separate taper"
     );
 }
 
