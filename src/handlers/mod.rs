@@ -63,6 +63,10 @@ pub fn configure_api_v1(cfg: &mut web::ServiceConfig) {
                 "/dashboard/fuel",
                 web::get().to(dashboard::get_fuel_drawer).wrap(at(4)),
             )
+            .route(
+                "/dashboard/fuel-events",
+                web::get().to(dashboard::get_fuel_events).wrap(at(4)),
+            )
             .service(web::scope("/sessions").route(
                 "/{id}/location-pings",
                 web::get().to(session::get_session_location_pings).wrap(at(1)),

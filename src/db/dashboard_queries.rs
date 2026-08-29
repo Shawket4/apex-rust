@@ -599,3 +599,80 @@ pub async fn fuel_by_method(
         .map(|r| (r.get("m"), r.get("spend"), r.get("liters")))
         .collect())
 }
+
+/// One page of fuel events in full detail — the dashboard's infinite list.
+pub struct FullFuelEventRow {
+    pub id: i64,
+    pub car_id: Option<i64>,
+    pub car_no_plate: String,
+    pub driver_name: String,
+    pub date: String,
+    pub time: String,
+    pub liters: f64,
+    pub price_per_liter: f64,
+    pub price: f64,
+    pub fuel_rate: f64,
+    pub odometer_before: i64,
+    pub odometer_after: i64,
+    pub method: String,
+}
+
+pub async fn fuel_events_page(
+    pool: &PgPool,
+    from: &str,
+    to: &str,
+    limit: i64,
+    offset: i64,
+) -> Result<(Vec<FullFuelEventRow>, i64)> {
+    let total: i64 = sqlx::query(
+        "SELECT COUNT(*) AS n FROM fuel_events \
+         WHERE deleted_at IS NULL AND date BETWEEN $1 AND $2",
+    )
+    .bind(from)
+    .bind(to)
+    .fetch_one(pool)
+    .await?
+    .get("n");
+
+    let rows = sqlx::query(
+        "SELECT id, car_id, COALESCE(car_no_plate, '') AS car_no_plate, \
+                COALESCE(driver_name, '') AS driver_name, \
+                COALESCE(date, '') AS date, COALESCE(time, '') AS time, \
+                COALESCE(liters, 0.0)::float8 AS liters, \
+                COALESCE(price_per_liter, 0.0)::float8 AS price_per_liter, \
+                COALESCE(price, 0.0)::float8 AS price, \
+                COALESCE(fuel_rate, 0.0)::float8 AS fuel_rate, \
+                COALESCE(odometer_before, 0)::bigint AS odometer_before, \
+                COALESCE(odometer_after, 0)::bigint AS odometer_after, \
+                COALESCE(NULLIF(method, ''), 'Manual') AS method \
+         FROM fuel_events \
+         WHERE deleted_at IS NULL AND date BETWEEN $1 AND $2 \
+         ORDER BY date DESC, time DESC, id DESC LIMIT $3 OFFSET $4",
+    )
+    .bind(from)
+    .bind(to)
+    .bind(limit)
+    .bind(offset)
+    .fetch_all(pool)
+    .await?;
+
+    let items = rows
+        .into_iter()
+        .map(|r| FullFuelEventRow {
+            id: r.get::<i32, _>("id") as i64,
+            car_id: r.get::<Option<i64>, _>("car_id"),
+            car_no_plate: r.get("car_no_plate"),
+            driver_name: r.get("driver_name"),
+            date: r.get("date"),
+            time: r.get("time"),
+            liters: r.get("liters"),
+            price_per_liter: r.get("price_per_liter"),
+            price: r.get("price"),
+            fuel_rate: r.get("fuel_rate"),
+            odometer_before: r.get("odometer_before"),
+            odometer_after: r.get("odometer_after"),
+            method: r.get("method"),
+        })
+        .collect();
+    Ok((items, total))
+}

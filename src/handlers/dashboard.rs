@@ -756,6 +756,97 @@ pub async fn get_fuel_drawer(
     response(&payload, use_msgpack).map_err(actix_web::error::ErrorInternalServerError)
 }
 
+/// The Go wire shape the fuel-events page already parses
+/// (`fuelEventSchema` in apex-react) — field names are FalconGo's, so the
+/// frontend reuses its existing schema and card components untouched.
+#[derive(Serialize)]
+pub struct GoFuelEvent {
+    #[serde(rename = "ID")]
+    pub id: i64,
+    pub car_id: Option<i64>,
+    pub car_no_plate: String,
+    pub driver_id: Option<i64>,
+    pub driver_name: String,
+    pub date: String,
+    pub time: String,
+    pub liters: f64,
+    pub price_per_liter: f64,
+    pub price: f64,
+    pub fuel_rate: f64,
+    pub odometer_before: i64,
+    pub odometer_after: i64,
+    pub method: String,
+}
+
+#[derive(Serialize)]
+struct FuelEventsPage {
+    items: Vec<GoFuelEvent>,
+    total: i64,
+    page: i64,
+    limit: i64,
+}
+
+#[derive(Deserialize)]
+pub struct FuelEventsQuery {
+    pub month: Option<String>,
+    pub from: Option<String>,
+    pub to: Option<String>,
+    pub company: Option<String>,
+    pub page: Option<i64>,
+    pub limit: Option<i64>,
+    pub format: Option<String>,
+}
+
+/// The dashboard's infinite fuel list: one window, served in pages.
+pub async fn get_fuel_events(
+    pool: web::Data<PgPool>,
+    query: web::Query<FuelEventsQuery>,
+    req: HttpRequest,
+) -> Result<HttpResponse, actix_web::Error> {
+    require_financial(&req)?;
+    let use_msgpack = query.format.as_deref() == Some("msgpack");
+    let w = resolve_window(&DashboardQuery {
+        month: query.month.clone(),
+        from: query.from.clone(),
+        to: query.to.clone(),
+        company: None,
+        format: None,
+    });
+    let page = query.page.unwrap_or(1).max(1);
+    let limit = query.limit.unwrap_or(15).clamp(1, 50);
+
+    let (items, total) =
+        q::fuel_events_page(pool.get_ref(), &w.from, &w.to, limit, (page - 1) * limit)
+            .await
+            .map_err(internal)?;
+
+    let payload = FuelEventsPage {
+        items: items
+            .into_iter()
+            .map(|e| GoFuelEvent {
+                id: e.id,
+                car_id: e.car_id,
+                car_no_plate: e.car_no_plate,
+                driver_id: None,
+                driver_name: e.driver_name,
+                date: e.date,
+                time: e.time,
+                liters: e.liters,
+                price_per_liter: e.price_per_liter,
+                price: e.price,
+                fuel_rate: e.fuel_rate,
+                odometer_before: e.odometer_before,
+                odometer_after: e.odometer_after,
+                method: e.method,
+            })
+            .collect(),
+        total,
+        page,
+        limit,
+    };
+    response(&payload, use_msgpack).map_err(actix_web::error::ErrorInternalServerError)
+}
+
 /* ------------------------------------------------------------------------ */
 /* Tests                                                                     */
 /* ------------------------------------------------------------------------ */
