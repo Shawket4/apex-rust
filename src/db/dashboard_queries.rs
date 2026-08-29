@@ -490,3 +490,112 @@ pub async fn trips_by_company(
     .await?;
     Ok(rows.into_iter().map(|r| (r.get("company"), r.get("trips"))).collect())
 }
+
+/* ------------------------------------------------------------------------ */
+/* Fuel                                                                      */
+/* ------------------------------------------------------------------------ */
+
+/// The fuel CARD is a consumption view: every event counts, whatever paid
+/// for it. (Unlike `cash_out`, which dedups manual fuel against the bank
+/// ledger — different question, different number, both correct.)
+pub struct FuelTotals {
+    pub spend: f64,
+    pub liters: f64,
+    pub events: i64,
+}
+
+pub async fn fuel_totals(pool: &PgPool, from: &str, to: &str) -> Result<FuelTotals> {
+    let row = sqlx::query(
+        "SELECT COALESCE(SUM(price), 0.0)::float8 AS spend, \
+                COALESCE(SUM(liters), 0.0)::float8 AS liters, COUNT(*) AS n \
+         FROM fuel_events WHERE deleted_at IS NULL AND date BETWEEN $1 AND $2",
+    )
+    .bind(from)
+    .bind(to)
+    .fetch_one(pool)
+    .await?;
+    Ok(FuelTotals {
+        spend: row.get("spend"),
+        liters: row.get("liters"),
+        events: row.get("n"),
+    })
+}
+
+pub struct FuelEventRow {
+    pub id: i64,
+    pub car_no_plate: String,
+    pub driver_name: String,
+    pub date: String,
+    pub time: String,
+    pub liters: f64,
+    pub price_per_liter: f64,
+    pub price: f64,
+    pub method: String,
+    pub fuel_rate: f64,
+}
+
+/// Latest events first. `within` bounds the window for the drawer; the main
+/// payload passes an open window and a small limit.
+pub async fn recent_fuel_events(
+    pool: &PgPool,
+    from: &str,
+    to: &str,
+    limit: i64,
+) -> Result<Vec<FuelEventRow>> {
+    let rows = sqlx::query(
+        "SELECT id, COALESCE(car_no_plate, '') AS car_no_plate, \
+                COALESCE(driver_name, '') AS driver_name, \
+                COALESCE(date, '') AS date, COALESCE(time, '') AS time, \
+                COALESCE(liters, 0.0)::float8 AS liters, \
+                COALESCE(price_per_liter, 0.0)::float8 AS price_per_liter, \
+                COALESCE(price, 0.0)::float8 AS price, \
+                COALESCE(NULLIF(method, ''), 'Cash') AS method, \
+                COALESCE(fuel_rate, 0.0)::float8 AS fuel_rate \
+         FROM fuel_events \
+         WHERE deleted_at IS NULL AND date BETWEEN $1 AND $2 \
+         ORDER BY date DESC, time DESC, id DESC LIMIT $3",
+    )
+    .bind(from)
+    .bind(to)
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|r| FuelEventRow {
+            id: r.get::<i32, _>("id") as i64,
+            car_no_plate: r.get("car_no_plate"),
+            driver_name: r.get("driver_name"),
+            date: r.get("date"),
+            time: r.get("time"),
+            liters: r.get("liters"),
+            price_per_liter: r.get("price_per_liter"),
+            price: r.get("price"),
+            method: r.get("method"),
+            fuel_rate: r.get("fuel_rate"),
+        })
+        .collect())
+}
+
+/// Spend and litres per payment method, for the fuel drawer.
+pub async fn fuel_by_method(
+    pool: &PgPool,
+    from: &str,
+    to: &str,
+) -> Result<Vec<(String, f64, f64)>> {
+    let rows = sqlx::query(
+        "SELECT COALESCE(NULLIF(method, ''), 'Cash') AS m, \
+                COALESCE(SUM(price), 0.0)::float8 AS spend, \
+                COALESCE(SUM(liters), 0.0)::float8 AS liters \
+         FROM fuel_events WHERE deleted_at IS NULL AND date BETWEEN $1 AND $2 \
+         GROUP BY 1 ORDER BY spend DESC",
+    )
+    .bind(from)
+    .bind(to)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|r| (r.get("m"), r.get("spend"), r.get("liters")))
+        .collect())
+}
