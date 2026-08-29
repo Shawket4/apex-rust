@@ -42,6 +42,9 @@ pub struct DashboardResponse {
     /// Absent below permission 4.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub money: Option<MoneyBlock>,
+    /// Absent below permission 4, like money.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fuel: Option<FuelBlock>,
     pub fleet: Vec<FleetEntry>,
     pub exceptions: Vec<Exception>,
 }
@@ -89,6 +92,32 @@ pub struct OwedBlock {
     pub employee_loans: String,
     pub employee_loans_count: i64,
     pub total: String,
+}
+
+/// The fuel card: today's consumption at a glance plus the latest events,
+/// each linking to its detail page. Consumption view — every event counts
+/// regardless of payment method (dedup against the bank is cash_out's job).
+#[derive(Serialize)]
+pub struct FuelBlock {
+    pub today: String,
+    pub today_liters: f64,
+    pub today_events: i64,
+    pub recent: Vec<FuelEventOut>,
+}
+
+#[derive(Serialize)]
+pub struct FuelEventOut {
+    pub id: i64,
+    pub plate_no: String,
+    pub plate_ar: String,
+    pub driver_name: String,
+    pub date: String,
+    pub time: String,
+    pub liters: f64,
+    pub price_per_liter: String,
+    pub price: String,
+    pub method: String,
+    pub fuel_rate: f64,
 }
 
 #[derive(Serialize)]
@@ -227,6 +256,23 @@ fn money_str(v: f64) -> String {
     format!("{v:.2}")
 }
 
+fn fuel_event_out(e: q::FuelEventRow) -> FuelEventOut {
+    let (plate_no, plate_ar) = split_plate(&e.car_no_plate);
+    FuelEventOut {
+        id: e.id,
+        plate_no,
+        plate_ar,
+        driver_name: e.driver_name,
+        date: e.date,
+        time: e.time,
+        liters: e.liters,
+        price_per_liter: money_str(e.price_per_liter),
+        price: money_str(e.price),
+        method: e.method,
+        fuel_rate: e.fuel_rate,
+    }
+}
+
 /* ------------------------------------------------------------------------ */
 /* Handlers                                                                  */
 /* ------------------------------------------------------------------------ */
@@ -295,6 +341,22 @@ pub async fn get_dashboard(
 
     let mut tile_revenue: std::collections::HashMap<(String, bool), f64> =
         std::collections::HashMap::new();
+
+    let fuel = if financial {
+        let (totals, recent) = tokio::try_join!(
+            q::fuel_totals(p, &today_s, &today_s),
+            q::recent_fuel_events(p, "0000-01-01", &today_s, 5),
+        )
+        .map_err(internal)?;
+        Some(FuelBlock {
+            today: money_str(totals.spend),
+            today_liters: totals.liters,
+            today_events: totals.events,
+            recent: recent.into_iter().map(fuel_event_out).collect(),
+        })
+    } else {
+        None
+    };
 
     let money = if financial {
         let (revenue, revenue_prev, cash_bank, fuel_out, advances_out, categories, owed, per_car) =
@@ -432,6 +494,7 @@ pub async fn get_dashboard(
             litres: totals.litres,
         },
         money,
+        fuel,
         fleet,
         exceptions,
     };
@@ -640,6 +703,55 @@ pub async fn get_advances_drawer(
                 count: x.count,
             })
             .collect(),
+    };
+    response(&payload, use_msgpack).map_err(actix_web::error::ErrorInternalServerError)
+}
+
+#[derive(Serialize)]
+struct FuelDrawer {
+    window_spend: String,
+    window_liters: f64,
+    window_events: i64,
+    by_method: Vec<MethodOut>,
+    events: Vec<FuelEventOut>,
+}
+#[derive(Serialize)]
+struct MethodOut {
+    method: String,
+    spend: String,
+    liters: f64,
+}
+
+pub async fn get_fuel_drawer(
+    pool: web::Data<PgPool>,
+    query: web::Query<DashboardQuery>,
+    req: HttpRequest,
+) -> Result<HttpResponse, actix_web::Error> {
+    require_financial(&req)?;
+    let use_msgpack = query.format.as_deref() == Some("msgpack");
+    let w = resolve_window(&query);
+    let p = pool.get_ref();
+
+    let (totals, by_method, events) = tokio::try_join!(
+        q::fuel_totals(p, &w.from, &w.to),
+        q::fuel_by_method(p, &w.from, &w.to),
+        q::recent_fuel_events(p, &w.from, &w.to, 25),
+    )
+    .map_err(internal)?;
+
+    let payload = FuelDrawer {
+        window_spend: money_str(totals.spend),
+        window_liters: totals.liters,
+        window_events: totals.events,
+        by_method: by_method
+            .into_iter()
+            .map(|(method, spend, liters)| MethodOut {
+                method,
+                spend: money_str(spend),
+                liters,
+            })
+            .collect(),
+        events: events.into_iter().map(fuel_event_out).collect(),
     };
     response(&payload, use_msgpack).map_err(actix_web::error::ErrorInternalServerError)
 }
