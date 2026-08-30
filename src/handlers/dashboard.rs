@@ -41,10 +41,6 @@ const DOC_HORIZON_DAYS: i64 = 60;
 /// must agree or the dashboard will name trucks that screen calls healthy.
 const OIL_DUE_KM: f64 = 3000.0;
 
-/// Neither list is a report — they are a prompt to go and look, so they are cut
-/// to what fits a panel beside the fleet grid.
-const ATTENTION_LIMIT: usize = 6;
-
 /* ------------------------------------------------------------------------ */
 /* Wire shapes                                                               */
 /* ------------------------------------------------------------------------ */
@@ -70,10 +66,10 @@ pub struct DashboardResponse {
 
 #[derive(Serialize)]
 pub struct AttentionBlock {
-    /// Soonest deadline first, so anything already lapsed leads. Truncated —
-    /// `documents_total` is how many met the same test, because a fleet that
-    /// has let three papers lapse since last year would otherwise fill the
-    /// list forever and hide the one expiring next week.
+    /// Soonest deadline first, so anything already lapsed leads. Complete —
+    /// the panel scrolls rather than the server deciding what is worth
+    /// knowing. `documents_total` is the same count, kept so a caller can
+    /// render the tally without walking the array.
     pub documents: Vec<ExpiringDocument>,
     pub documents_total: usize,
     /// Least kilometres remaining first, overdue (negative) first of all.
@@ -104,6 +100,11 @@ pub struct OilChangeDue {
     pub km_since: i64,
     /// Negative once overdue.
     pub km_left: i64,
+    /// What went in with the last oil change. Answers "is the water separator
+    /// also due" without opening the truck's history.
+    pub oil_filter: bool,
+    pub fuel_filter: bool,
+    pub water_filter: bool,
 }
 
 #[derive(Serialize)]
@@ -563,8 +564,10 @@ pub async fn get_dashboard(
             })
         })
         .collect();
+    // Every match ships. The panel decides how much of it to show at once;
+    // the server truncating meant a fleet with a dozen lapsed papers could
+    // never see past the first six, whatever the page did.
     let documents_total = documents.len();
-    documents.truncate(ATTENTION_LIMIT);
 
     // Due-ness is the oil-changes screen's rule, kept in one shape here:
     // remaining = interval - distance driven since the change.
@@ -584,13 +587,15 @@ pub async fn get_dashboard(
                     interval_km: o.interval_km as i64,
                     km_since: since as i64,
                     km_left: left as i64,
+                    oil_filter: o.oil_filter,
+                    fuel_filter: o.fuel_filter,
+                    water_filter: o.water_filter,
                 }
             })
         })
         .collect();
     oil_changes.sort_by_key(|o| o.km_left);
     let oil_changes_total = oil_changes.len();
-    oil_changes.truncate(ATTENTION_LIMIT);
 
     let payload = DashboardResponse {
         as_of: Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),

@@ -734,6 +734,11 @@ pub struct OilChangeRow {
     pub interval_km: f64,
     pub odometer_at_change: f64,
     pub current_odometer: f64,
+    /// Which filters went in with the oil. Columns FalconGo added; older rows
+    /// carry the DEFAULT false, which reads as "oil only".
+    pub oil_filter: bool,
+    pub fuel_filter: bool,
+    pub water_filter: bool,
 }
 
 /// The most recent oil change per car.
@@ -746,7 +751,10 @@ pub async fn latest_oil_change_per_car(pool: &PgPool) -> Result<Vec<OilChangeRow
     let rows = sqlx::query(
         r#"
         SELECT DISTINCT ON (o.car_id)
-               o.car_no_plate, o.date, o.mileage, o.odometer_at_change, o.current_odometer
+               o.car_no_plate, o.date, o.mileage, o.odometer_at_change, o.current_odometer,
+               COALESCE(o.oil_filter_changed, false)   AS oil_filter,
+               COALESCE(o.fuel_filter_changed, false)  AS fuel_filter,
+               COALESCE(o.water_filter_changed, false) AS water_filter
         FROM oil_changes o
         WHERE o.deleted_at IS NULL
         ORDER BY o.car_id, o.date DESC, o.id DESC
@@ -762,6 +770,9 @@ pub async fn latest_oil_change_per_car(pool: &PgPool) -> Result<Vec<OilChangeRow
             interval_km: num(&r, "mileage"),
             odometer_at_change: num(&r, "odometer_at_change"),
             current_odometer: num(&r, "current_odometer"),
+            oil_filter: r.get("oil_filter"),
+            fuel_filter: r.get("fuel_filter"),
+            water_filter: r.get("water_filter"),
         })
         .collect())
 }
