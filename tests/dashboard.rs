@@ -225,3 +225,64 @@ async fn msgpack_matches_json_including_absences() {
         assert_eq!(strip(packed), strip(json), "diverged at permission {permission}");
     }
 }
+
+/// The attention block: papers about to lapse, services about to fall due.
+///
+/// Both lists are dated, and both are the reason someone opens this page before
+/// a truck leaves — so the test pins the arithmetic (`days_left`, `km_left`),
+/// the truncation, and the two ways a row is *not* due: a blank date and an
+/// interval nobody set.
+#[actix_web::test]
+async fn attention_names_what_lapses_and_what_falls_due() {
+    support::init();
+    let pool = db("apex_dash_attention").await;
+
+    sqlx::raw_sql(
+        "-- One paper lapsed, one expiring inside the horizon, one far outside
+         -- it, and one never recorded ('' — not a date, must not be read as one).
+         UPDATE cars SET license_expiration_date      = to_char(CURRENT_DATE - 10, 'YYYY-MM-DD'),
+                         calibration_expiration_date  = to_char(CURRENT_DATE + 30, 'YYYY-MM-DD'),
+                         tank_license_expiration_date = to_char(CURRENT_DATE + 400, 'YYYY-MM-DD')
+          WHERE car_no_plate = 'PA-A';
+         UPDATE cars SET license_expiration_date = '' WHERE car_no_plate = 'WA-C';
+
+         -- PA-A is 500 km from its service; WA-C has 5000 km of slack; the
+         -- service vehicle has no interval at all, which is a data gap for the
+         -- oil-changes screen and not a service to chase here.
+         INSERT INTO oil_changes (car_id, car_no_plate, date, mileage, odometer_at_change, current_odometer)
+         SELECT id, car_no_plate, '2025-05-01', 8000, 100000, 107500 FROM cars WHERE car_no_plate = 'PA-A';
+         INSERT INTO oil_changes (car_id, car_no_plate, date, mileage, odometer_at_change, current_odometer)
+         SELECT id, car_no_plate, '2025-05-01', 8000, 200000, 203000 FROM cars WHERE car_no_plate = 'WA-C';
+         INSERT INTO oil_changes (car_id, car_no_plate, date, mileage, odometer_at_change, current_odometer)
+         SELECT id, car_no_plate, '2025-05-01', 0, 300000, 399000 FROM cars WHERE car_no_plate = 'SVC 9001';",
+    )
+    .execute(&pool)
+    .await
+    .expect("attention fixture");
+
+    let app = app_of!(pool);
+    let body = get_json!(app, 4, "/api/v1/dashboard?month=2025-05");
+    let a = &body["attention"];
+
+    // Two of PA-A's three papers are inside the horizon; the 400-day one is not,
+    // and WA-C's blank is not a date.
+    let docs = a["documents"].as_array().expect("documents array");
+    assert_eq!(a["documents_total"].as_u64().unwrap(), 2, "only the two inside the horizon");
+    assert_eq!(docs.len(), 2);
+
+    // Lapsed leads, because it sorts by deadline and its deadline is furthest past.
+    assert_eq!(docs[0]["kind"].as_str().unwrap(), "license");
+    assert_eq!(docs[0]["days_left"].as_i64().unwrap(), -10, "negative once lapsed");
+    assert_eq!(docs[1]["kind"].as_str().unwrap(), "calibration");
+    assert_eq!(docs[1]["days_left"].as_i64().unwrap(), 30);
+
+    // Only PA-A is within 3000 km. WA-C has 5000 left; the service vehicle's
+    // zero interval is excluded rather than read as "99,000 km overdue".
+    let oil = a["oil_changes"].as_array().expect("oil array");
+    assert_eq!(a["oil_changes_total"].as_u64().unwrap(), 1);
+    assert_eq!(oil.len(), 1);
+    assert_eq!(oil[0]["plate_no"].as_str().unwrap(), "PA-A");
+    assert_eq!(oil[0]["km_since"].as_i64().unwrap(), 7500);
+    assert_eq!(oil[0]["interval_km"].as_i64().unwrap(), 8000);
+    assert_eq!(oil[0]["km_left"].as_i64().unwrap(), 500);
+}

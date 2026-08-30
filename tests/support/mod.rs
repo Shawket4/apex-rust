@@ -194,6 +194,21 @@ pub async fn fresh_db(name: &str) -> PgPool {
             -- Empty string, not NULL, on untracked vehicles — mirroring what
             -- production actually stores; the dashboard normalises it.
             etit_car_id TEXT DEFAULT '',
+            -- The three papers, stored as TEXT 'YYYY-MM-DD' exactly as the Go
+            -- backend writes them — including the '' that means "never
+            -- recorded", which the dashboard's shape guard has to survive.
+            license_expiration_date TEXT DEFAULT '',
+            calibration_expiration_date TEXT DEFAULT '',
+            tank_license_expiration_date TEXT DEFAULT '',
+            created_at TIMESTAMPTZ DEFAULT now(), updated_at TIMESTAMPTZ DEFAULT now(),
+            deleted_at TIMESTAMPTZ
+        );
+        -- `mileage` is the service INTERVAL in km, not distance driven; the
+        -- legacy name the Go backend still writes.
+        CREATE TABLE public.oil_changes (
+            id SERIAL PRIMARY KEY, car_id BIGINT, car_no_plate TEXT,
+            date TEXT, mileage NUMERIC, odometer_at_change NUMERIC,
+            current_odometer NUMERIC,
             created_at TIMESTAMPTZ DEFAULT now(), updated_at TIMESTAMPTZ DEFAULT now(),
             deleted_at TIMESTAMPTZ
         );
@@ -228,7 +243,11 @@ pub async fn fresh_db(name: &str) -> PgPool {
             deleted_at TIMESTAMPTZ,
             date TEXT, driver_name TEXT, car_no_plate TEXT, transporter TEXT,
             liters NUMERIC, price_per_liter NUMERIC, price NUMERIC, method TEXT,
-            petroapp_bill_id BIGINT
+            petroapp_bill_id BIGINT,
+            -- Production orders fuel events by (date, time) and reads the
+            -- odometer pair; without these the dashboard's own query fails and
+            -- every test in tests/dashboard.rs 500s.
+            time TEXT, odometer_before BIGINT, odometer_after BIGINT, fuel_rate NUMERIC
         );
         CREATE TABLE public.fleet_expenses (
             id SERIAL PRIMARY KEY, car_no_plate VARCHAR(50), expense_date DATE,

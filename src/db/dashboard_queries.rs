@@ -676,3 +676,100 @@ pub async fn fuel_events_page(
         .collect();
     Ok((items, total))
 }
+
+/* ------------------------------------------------------------------------ */
+/* Attention — what expires or falls due next                                */
+/* ------------------------------------------------------------------------ */
+
+pub struct ExpiringDocRow {
+    pub plate: String,
+    pub kind: String,
+    pub expires_on: String,
+}
+
+/// Vehicle documents already expired or expiring inside the horizon.
+///
+/// The three dates live in three columns on `cars` rather than a documents
+/// table, so the union is the join — it reads every car three times, which at
+/// fleet size is one index-free scan of twenty-odd rows.
+///
+/// They are stored as text. Lexical order is chronological for `YYYY-MM-DD`,
+/// so the comparison and the sort are both plain string work — but only for
+/// values that actually are dates, hence the shape guard: the legacy rows
+/// carry `''` for "never recorded", and a malformed one must not sort itself
+/// to the top of a list the fleet is meant to act on.
+pub async fn expiring_documents(pool: &PgPool, horizon: &str) -> Result<Vec<ExpiringDocRow>> {
+    let rows = sqlx::query(
+        r#"
+        SELECT plate, kind, expires_on FROM (
+            SELECT car_no_plate AS plate, 'license'      AS kind, license_expiration_date      AS expires_on FROM cars WHERE deleted_at IS NULL
+            UNION ALL
+            SELECT car_no_plate,          'calibration',         calibration_expiration_date              FROM cars WHERE deleted_at IS NULL
+            UNION ALL
+            SELECT car_no_plate,          'tank_license',        tank_license_expiration_date             FROM cars WHERE deleted_at IS NULL
+        ) d
+        WHERE expires_on ~ '^\d{4}-\d{2}-\d{2}$'
+          AND expires_on <= $1
+        ORDER BY expires_on, plate
+        "#,
+    )
+    .bind(horizon)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|r| ExpiringDocRow {
+            plate: r.get::<Option<String>, _>("plate").unwrap_or_default(),
+            kind: r.get("kind"),
+            expires_on: r.get("expires_on"),
+        })
+        .collect())
+}
+
+pub struct OilChangeRow {
+    pub plate: String,
+    pub date: Option<String>,
+    /// `mileage` is the service *interval* in km, not distance driven — the
+    /// legacy column name the Go backend still writes.
+    pub interval_km: f64,
+    pub odometer_at_change: f64,
+    pub current_odometer: f64,
+}
+
+/// The most recent oil change per car.
+///
+/// `DISTINCT ON` descends the (car_id, date) order once per car rather than
+/// grouping the whole table, the same shape as the fleet query above. Whether
+/// a car is *due* is decided by the caller, because that rule lives in one
+/// place shared with the oil-changes screen.
+pub async fn latest_oil_change_per_car(pool: &PgPool) -> Result<Vec<OilChangeRow>> {
+    let rows = sqlx::query(
+        r#"
+        SELECT DISTINCT ON (o.car_id)
+               o.car_no_plate, o.date, o.mileage, o.odometer_at_change, o.current_odometer
+        FROM oil_changes o
+        WHERE o.deleted_at IS NULL
+        ORDER BY o.car_id, o.date DESC, o.id DESC
+        "#,
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|r| OilChangeRow {
+            plate: r.get::<Option<String>, _>("car_no_plate").unwrap_or_default(),
+            date: r.get("date"),
+            interval_km: num(&r, "mileage"),
+            odometer_at_change: num(&r, "odometer_at_change"),
+            current_odometer: num(&r, "current_odometer"),
+        })
+        .collect())
+}
+
+/// `numeric` columns arrive as `Decimal`; the arithmetic here is comparisons
+/// against thresholds in whole kilometres, so f64 is honest for it.
+fn num(row: &sqlx::postgres::PgRow, col: &str) -> f64 {
+    row.get::<Option<Decimal>, _>(col)
+        .and_then(|d| d.to_string().parse::<f64>().ok())
+        .unwrap_or(0.0)
+}
