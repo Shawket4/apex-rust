@@ -31,6 +31,20 @@ use crate::utils::response;
 /// The permission that may see money on the dashboard.
 const FINANCIAL_PERMISSION: i32 = 4;
 
+/// How far ahead a document counts as "expiring". Two months is one renewal
+/// cycle at this fleet's pace — long enough to act, short enough that the list
+/// is still a list.
+const DOC_HORIZON_DAYS: i64 = 60;
+
+/// Kilometres of slack below which an oil change is worth surfacing. Same
+/// number as `OIL_CHANGE_THRESHOLDS.WARNING` on the oil-changes screen; the two
+/// must agree or the dashboard will name trucks that screen calls healthy.
+const OIL_DUE_KM: f64 = 3000.0;
+
+/// Neither list is a report — they are a prompt to go and look, so they are cut
+/// to what fits a panel beside the fleet grid.
+const ATTENTION_LIMIT: usize = 6;
+
 /* ------------------------------------------------------------------------ */
 /* Wire shapes                                                               */
 /* ------------------------------------------------------------------------ */
@@ -47,6 +61,49 @@ pub struct DashboardResponse {
     pub fuel: Option<FuelBlock>,
     pub fleet: Vec<FleetEntry>,
     pub exceptions: Vec<Exception>,
+    /// Dated obligations: papers about to lapse, services about to fall due.
+    /// Always present — an empty pair is the honest "nothing is due" answer,
+    /// and the panel that renders it should not have to distinguish that from
+    /// a field the payload forgot.
+    pub attention: AttentionBlock,
+}
+
+#[derive(Serialize)]
+pub struct AttentionBlock {
+    /// Soonest deadline first, so anything already lapsed leads. Truncated —
+    /// `documents_total` is how many met the same test, because a fleet that
+    /// has let three papers lapse since last year would otherwise fill the
+    /// list forever and hide the one expiring next week.
+    pub documents: Vec<ExpiringDocument>,
+    pub documents_total: usize,
+    /// Least kilometres remaining first, overdue (negative) first of all.
+    pub oil_changes: Vec<OilChangeDue>,
+    pub oil_changes_total: usize,
+}
+
+#[derive(Serialize)]
+pub struct ExpiringDocument {
+    pub plate_no: String,
+    pub plate_ar: String,
+    /// `license` | `calibration` | `tank_license` — a key, not a label: the
+    /// frontend owns the wording and its Arabic.
+    pub kind: String,
+    pub expires_on: String,
+    /// Negative once it has lapsed.
+    pub days_left: i64,
+}
+
+#[derive(Serialize)]
+pub struct OilChangeDue {
+    pub plate_no: String,
+    pub plate_ar: String,
+    pub last_change_date: Option<String>,
+    /// Service interval and distance since, both in km, so the frontend can
+    /// show the arithmetic rather than just its verdict.
+    pub interval_km: i64,
+    pub km_since: i64,
+    /// Negative once overdue.
+    pub km_left: i64,
 }
 
 #[derive(Serialize)]
@@ -329,13 +386,19 @@ pub async fn get_dashboard(
     let today_s = today.format("%Y-%m-%d").to_string();
     let yesterday_s = (today - chrono::Duration::days(1)).format("%Y-%m-%d").to_string();
 
-    // Everything the page needs, in flight together. The money queries only
-    // join the party when the caller may see the results.
-    let (totals, fleet, zero_trips, unreviewed) = tokio::try_join!(
+    let doc_horizon = (today + chrono::Duration::days(DOC_HORIZON_DAYS))
+        .format("%Y-%m-%d")
+        .to_string();
+
+    // Everything the page needs, in flight together — the two attention
+    // queries join the same wave rather than adding a round trip.
+    let (totals, fleet, zero_trips, unreviewed, docs, oil) = tokio::try_join!(
         q::month_totals(p, &w.from, &w.to, company),
         q::fleet(p),
         q::trips_earning_zero(p, &w.from, &w.to, company),
         q::transactions_unreviewed(p),
+        q::expiring_documents(p, &doc_horizon),
+        q::latest_oil_change_per_car(p),
     )
     .map_err(internal)?;
 
@@ -486,6 +549,49 @@ pub async fn get_dashboard(
         });
     }
 
+    let mut documents: Vec<ExpiringDocument> = docs
+        .into_iter()
+        .filter_map(|d| {
+            let on = chrono::NaiveDate::parse_from_str(&d.expires_on, "%Y-%m-%d").ok()?;
+            let (plate_no, plate_ar) = split_plate(&d.plate);
+            Some(ExpiringDocument {
+                plate_no,
+                plate_ar,
+                kind: d.kind,
+                days_left: (on - today).num_days(),
+                expires_on: d.expires_on,
+            })
+        })
+        .collect();
+    let documents_total = documents.len();
+    documents.truncate(ATTENTION_LIMIT);
+
+    // Due-ness is the oil-changes screen's rule, kept in one shape here:
+    // remaining = interval - distance driven since the change.
+    let mut oil_changes: Vec<OilChangeDue> = oil
+        .into_iter()
+        .filter_map(|o| {
+            let since = (o.current_odometer - o.odometer_at_change).max(0.0);
+            let left = o.interval_km - since;
+            // An interval of zero means nobody set one; that is a data gap for
+            // the oil-changes screen to show, not a service to chase here.
+            (o.interval_km > 0.0 && left <= OIL_DUE_KM).then(|| {
+                let (plate_no, plate_ar) = split_plate(&o.plate);
+                OilChangeDue {
+                    plate_no,
+                    plate_ar,
+                    last_change_date: o.date,
+                    interval_km: o.interval_km as i64,
+                    km_since: since as i64,
+                    km_left: left as i64,
+                }
+            })
+        })
+        .collect();
+    oil_changes.sort_by_key(|o| o.km_left);
+    let oil_changes_total = oil_changes.len();
+    oil_changes.truncate(ATTENTION_LIMIT);
+
     let payload = DashboardResponse {
         as_of: Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
         month: MonthBlock {
@@ -497,6 +603,12 @@ pub async fn get_dashboard(
         fuel,
         fleet,
         exceptions,
+        attention: AttentionBlock {
+            documents,
+            documents_total,
+            oil_changes,
+            oil_changes_total,
+        },
     };
 
     response(&payload, use_msgpack).map_err(actix_web::error::ErrorInternalServerError)
