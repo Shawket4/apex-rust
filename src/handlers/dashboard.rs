@@ -105,6 +105,11 @@ pub struct OilChangeDue {
     pub oil_filter: bool,
     pub fuel_filter: bool,
     pub water_filter: bool,
+    /// Oil changes the fitted element has served, this one included. The
+    /// dashboard is the only surface without the history to count this for
+    /// itself; the frontend decides what the number means.
+    pub oil_filter_cycles: i64,
+    pub fuel_filter_cycles: i64,
 }
 
 #[derive(Serialize)]
@@ -590,6 +595,8 @@ pub async fn get_dashboard(
                     oil_filter: o.oil_filter,
                     fuel_filter: o.fuel_filter,
                     water_filter: o.water_filter,
+                    oil_filter_cycles: o.oil_filter_cycles,
+                    fuel_filter_cycles: o.fuel_filter_cycles,
                 }
             })
         })

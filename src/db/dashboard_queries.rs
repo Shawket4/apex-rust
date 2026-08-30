@@ -739,6 +739,11 @@ pub struct OilChangeRow {
     pub oil_filter: bool,
     pub fuel_filter: bool,
     pub water_filter: bool,
+    /// Oil changes the fitted oil/fuel element has served, this one included.
+    /// A count, not a verdict — the frontend owns what counts as due, so there
+    /// is one threshold in the codebase rather than one per backend.
+    pub oil_filter_cycles: i64,
+    pub fuel_filter_cycles: i64,
 }
 
 /// The most recent oil change per car.
@@ -750,14 +755,35 @@ pub struct OilChangeRow {
 pub async fn latest_oil_change_per_car(pool: &PgPool) -> Result<Vec<OilChangeRow>> {
     let rows = sqlx::query(
         r#"
-        SELECT DISTINCT ON (o.car_id)
-               o.car_no_plate, o.date, o.mileage, o.odometer_at_change, o.current_odometer,
-               COALESCE(o.oil_filter_changed, false)   AS oil_filter,
-               COALESCE(o.fuel_filter_changed, false)  AS fuel_filter,
-               COALESCE(o.water_filter_changed, false) AS water_filter
-        FROM oil_changes o
-        WHERE o.deleted_at IS NULL
-        ORDER BY o.car_id, o.date DESC, o.id DESC
+        WITH ranked AS (
+            SELECT o.*,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY o.car_id ORDER BY o.date DESC, o.id DESC
+                   ) AS rn
+            FROM oil_changes o
+            WHERE o.deleted_at IS NULL
+        ),
+        -- Position of the most recent replacement IS the cycle count: replaced
+        -- in the newest record is 1, replaced one back is 2. An element never
+        -- replaced anywhere in the history falls back to how many records we
+        -- hold, which is a floor rather than a measurement -- it can only
+        -- understate, which is the safe direction for a maintenance prompt.
+        cycles AS (
+            SELECT car_id,
+                   COALESCE(MIN(rn) FILTER (WHERE oil_filter_changed),  COUNT(*)) AS oil_cycles,
+                   COALESCE(MIN(rn) FILTER (WHERE fuel_filter_changed), COUNT(*)) AS fuel_cycles
+            FROM ranked
+            GROUP BY car_id
+        )
+        SELECT r.car_no_plate, r.date, r.mileage, r.odometer_at_change, r.current_odometer,
+               COALESCE(r.oil_filter_changed, false)   AS oil_filter,
+               COALESCE(r.fuel_filter_changed, false)  AS fuel_filter,
+               COALESCE(r.water_filter_changed, false) AS water_filter,
+               c.oil_cycles, c.fuel_cycles
+        FROM ranked r
+        JOIN cycles c ON c.car_id = r.car_id
+        WHERE r.rn = 1
+        ORDER BY r.car_no_plate
         "#,
     )
     .fetch_all(pool)
@@ -773,6 +799,8 @@ pub async fn latest_oil_change_per_car(pool: &PgPool) -> Result<Vec<OilChangeRow
             oil_filter: r.get("oil_filter"),
             fuel_filter: r.get("fuel_filter"),
             water_filter: r.get("water_filter"),
+            oil_filter_cycles: r.get("oil_cycles"),
+            fuel_filter_cycles: r.get("fuel_cycles"),
         })
         .collect())
 }

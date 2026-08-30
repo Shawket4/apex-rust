@@ -249,9 +249,18 @@ async fn attention_names_what_lapses_and_what_falls_due() {
          -- PA-A is 500 km from its service; WA-C has 5000 km of slack; the
          -- service vehicle has no interval at all, which is a data gap for the
          -- oil-changes screen and not a service to chase here.
+         -- PA-A's newest change replaced the oil filter but not the fuel one,
+         -- and the change before it replaced neither -- so the fuel element has
+         -- served three changes and the oil element one.
          INSERT INTO oil_changes (car_id, car_no_plate, date, mileage, odometer_at_change, current_odometer,
                                   oil_filter_changed, fuel_filter_changed, water_filter_changed)
-         SELECT id, car_no_plate, '2025-05-01', 8000, 100000, 107500, true, true, false FROM cars WHERE car_no_plate = 'PA-A';
+         SELECT id, car_no_plate, '2025-03-01', 8000, 84000, 92000, false, false, false FROM cars WHERE car_no_plate = 'PA-A';
+         INSERT INTO oil_changes (car_id, car_no_plate, date, mileage, odometer_at_change, current_odometer,
+                                  oil_filter_changed, fuel_filter_changed, water_filter_changed)
+         SELECT id, car_no_plate, '2025-04-01', 8000, 92000, 100000, false, false, false FROM cars WHERE car_no_plate = 'PA-A';
+         INSERT INTO oil_changes (car_id, car_no_plate, date, mileage, odometer_at_change, current_odometer,
+                                  oil_filter_changed, fuel_filter_changed, water_filter_changed)
+         SELECT id, car_no_plate, '2025-05-01', 8000, 100000, 107500, true, false, false FROM cars WHERE car_no_plate = 'PA-A';
          INSERT INTO oil_changes (car_id, car_no_plate, date, mileage, odometer_at_change, current_odometer)
          SELECT id, car_no_plate, '2025-05-01', 8000, 200000, 203000 FROM cars WHERE car_no_plate = 'WA-C';
          INSERT INTO oil_changes (car_id, car_no_plate, date, mileage, odometer_at_change, current_odometer)
@@ -290,6 +299,15 @@ async fn attention_names_what_lapses_and_what_falls_due() {
     // The filters carry through as three separate answers, so the panel can say
     // the water separator is still outstanding without opening the history.
     assert_eq!(oil[0]["oil_filter"].as_bool().unwrap(), true);
-    assert_eq!(oil[0]["fuel_filter"].as_bool().unwrap(), true);
+    assert_eq!(oil[0]["fuel_filter"].as_bool().unwrap(), false);
     assert_eq!(oil[0]["water_filter"].as_bool().unwrap(), false);
+
+    // The oil element went in with the newest change, so it is on cycle 1
+    // however many changes went by untouched before it -- the count is the
+    // position of the most recent replacement, not a tally of misses.
+    assert_eq!(oil[0]["oil_filter_cycles"].as_i64().unwrap(), 1);
+    // The fuel element was never replaced in any of the three records we hold,
+    // so it falls back to that count: a floor, and the frontend reads anything
+    // at or above its service life as due.
+    assert_eq!(oil[0]["fuel_filter_cycles"].as_i64().unwrap(), 3);
 }
