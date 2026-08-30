@@ -209,6 +209,9 @@ pub async fn fresh_db(name: &str) -> PgPool {
             id SERIAL PRIMARY KEY, car_id BIGINT, car_no_plate TEXT,
             date TEXT, mileage NUMERIC, odometer_at_change NUMERIC,
             current_odometer NUMERIC,
+            oil_filter_changed BOOLEAN DEFAULT false,
+            fuel_filter_changed BOOLEAN DEFAULT false,
+            water_filter_changed BOOLEAN DEFAULT false,
             created_at TIMESTAMPTZ DEFAULT now(), updated_at TIMESTAMPTZ DEFAULT now(),
             deleted_at TIMESTAMPTZ
         );

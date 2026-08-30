@@ -249,8 +249,9 @@ async fn attention_names_what_lapses_and_what_falls_due() {
          -- PA-A is 500 km from its service; WA-C has 5000 km of slack; the
          -- service vehicle has no interval at all, which is a data gap for the
          -- oil-changes screen and not a service to chase here.
-         INSERT INTO oil_changes (car_id, car_no_plate, date, mileage, odometer_at_change, current_odometer)
-         SELECT id, car_no_plate, '2025-05-01', 8000, 100000, 107500 FROM cars WHERE car_no_plate = 'PA-A';
+         INSERT INTO oil_changes (car_id, car_no_plate, date, mileage, odometer_at_change, current_odometer,
+                                  oil_filter_changed, fuel_filter_changed, water_filter_changed)
+         SELECT id, car_no_plate, '2025-05-01', 8000, 100000, 107500, true, true, false FROM cars WHERE car_no_plate = 'PA-A';
          INSERT INTO oil_changes (car_id, car_no_plate, date, mileage, odometer_at_change, current_odometer)
          SELECT id, car_no_plate, '2025-05-01', 8000, 200000, 203000 FROM cars WHERE car_no_plate = 'WA-C';
          INSERT INTO oil_changes (car_id, car_no_plate, date, mileage, odometer_at_change, current_odometer)
@@ -285,4 +286,10 @@ async fn attention_names_what_lapses_and_what_falls_due() {
     assert_eq!(oil[0]["km_since"].as_i64().unwrap(), 7500);
     assert_eq!(oil[0]["interval_km"].as_i64().unwrap(), 8000);
     assert_eq!(oil[0]["km_left"].as_i64().unwrap(), 500);
+
+    // The filters carry through as three separate answers, so the panel can say
+    // the water separator is still outstanding without opening the history.
+    assert_eq!(oil[0]["oil_filter"].as_bool().unwrap(), true);
+    assert_eq!(oil[0]["fuel_filter"].as_bool().unwrap(), true);
+    assert_eq!(oil[0]["water_filter"].as_bool().unwrap(), false);
 }
