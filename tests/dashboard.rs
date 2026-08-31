@@ -321,6 +321,10 @@ async fn attention_names_what_lapses_and_what_falls_due() {
 
     // Raw odometers, so the sheet can show the arithmetic rather than only its
     // result.
+    // The split is for display; anything addressing the vehicle needs the
+    // plate as stored, because a plate recorded digits-first cannot be
+    // reassembled from the two halves.
+    assert_eq!(oil[0]["plate_raw"].as_str().unwrap(), "PA-A");
     assert_eq!(oil[0]["odometer_at_change"].as_i64().unwrap(), 100000);
     assert_eq!(oil[0]["current_odometer"].as_i64().unwrap(), 107500);
 
