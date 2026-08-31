@@ -163,6 +163,79 @@ fn scrub(mut event: Event<'static>) -> Option<Event<'static>> {
     Some(event)
 }
 
+/// Fraction of requests traced.
+///
+/// Env-tunable so the rate can be dropped without a rebuild: this Sentry runs
+/// on modest hardware and tracing is the part that loads it. Defaults to 0.5.
+/// Anything unparseable or out of range falls back to the default rather than
+/// panicking a service at boot over a typo.
+fn traces_sample_rate() -> f32 {
+    std::env::var("SENTRY_TRACES_SAMPLE_RATE")
+        .ok()
+        .and_then(|v| v.trim().parse::<f32>().ok())
+        .filter(|r| (0.0..=1.0).contains(r))
+        .unwrap_or(0.5)
+}
+
+/// Report a failed call to a third-party service.
+///
+/// Upstreams throttle, time out and change shape without warning, and those
+/// failures are invisible to the HTTP middleware because this service usually
+/// handles them and returns something sensible. They are exactly what you want
+/// to see trending in Sentry.
+///
+/// Only the shape of the failure is attached — service, operation, status —
+/// never the response body, which is where an upstream's own PII would be.
+pub fn capture_upstream_failure(
+    service: &str,
+    operation: &str,
+    status: Option<u16>,
+    error: &dyn std::error::Error,
+) {
+    sentry::with_scope(
+        |scope| {
+            scope.set_tag("upstream.service", service);
+            scope.set_tag("upstream.operation", operation);
+            if let Some(code) = status {
+                scope.set_tag("upstream.status", code);
+            }
+            // Throttling is its own failure mode and worth grouping apart.
+            if status == Some(429) {
+                scope.set_tag("upstream.throttled", "true");
+            }
+        },
+        || {
+            sentry::capture_error(error);
+        },
+    );
+}
+
+/// Report an upstream failure that has no error safe to attach.
+///
+/// Some upstream error types embed the response body in their `Display` — and
+/// an upstream's body is exactly where its own users' data lives. The scrubber
+/// redacts by KEY and so cannot clean a free-text message, which means such an
+/// error must never be handed to `capture_upstream_failure`. This builds the
+/// message from the shape alone instead.
+pub fn capture_upstream_status(service: &str, operation: &str, status: u16) {
+    sentry::with_scope(
+        |scope| {
+            scope.set_tag("upstream.service", service);
+            scope.set_tag("upstream.operation", operation);
+            scope.set_tag("upstream.status", status);
+            if status == 429 {
+                scope.set_tag("upstream.throttled", "true");
+            }
+        },
+        || {
+            sentry::capture_message(
+                &format!("{service} {operation} returned {status}"),
+                sentry::Level::Error,
+            );
+        },
+    );
+}
+
 /// Install Sentry, or don't.
 ///
 /// Returns `None` when `SENTRY_DSN` is unset or blank — the service then runs
@@ -198,9 +271,7 @@ pub fn init() -> Option<ClientInitGuard> {
         .environment(environment)
         // Compliance: never send the SDK's idea of "default" personal data.
         .send_default_pii(false)
-        // Performance tracing off. This Sentry runs on modest hardware, so
-        // turning it up is a deliberate decision rather than a default.
-        .traces_sample_rate(0.0)
+        .traces_sample_rate(traces_sample_rate())
         .before_send(scrub);
 
     Some(sentry::init((dsn, options)))
