@@ -212,6 +212,9 @@ pub async fn fresh_db(name: &str) -> PgPool {
             oil_filter_changed BOOLEAN DEFAULT false,
             fuel_filter_changed BOOLEAN DEFAULT false,
             water_filter_changed BOOLEAN DEFAULT false,
+            -- The attention sheet reads these off the latest record.
+            driver_name TEXT DEFAULT '', super_visor TEXT DEFAULT '',
+            cost NUMERIC DEFAULT 0,
             created_at TIMESTAMPTZ DEFAULT now(), updated_at TIMESTAMPTZ DEFAULT now(),
             deleted_at TIMESTAMPTZ
         );
