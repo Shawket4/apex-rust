@@ -25,6 +25,11 @@ async fn main() -> std::io::Result<()> {
     dotenv::dotenv().ok();
     env_logger::init();
 
+    // Sentry, if SENTRY_DSN is set. The guard has to outlive the server, so it
+    // is bound here rather than in a helper: dropping it flushes the queue and
+    // shuts the transport down. With no DSN this is None and nothing changes.
+    let _sentry = apex::observability::init();
+
     info!("Starting Apex Transport Rust Microservice");
 
     let pool = PgPoolOptions::new()
@@ -141,6 +146,12 @@ async fn main() -> std::io::Result<()> {
 
         let app = App::new()
             .app_data(web::Data::new(pool.clone()))
+            // Captures errors that resolve to 5xx, and attaches request
+            // context. It does NOT report 4xx: a client sending a bad request
+            // is not a bug in this service, and the volume would bury the ones
+            // that are. Everything it attaches passes through the scrubber in
+            // `observability` before it leaves the process.
+            .wrap(sentry_actix::Sentry::builder().capture_server_errors(true).finish())
             .wrap(cors)
             .wrap(middleware::Logger::default())
             .wrap(middleware::Compress::default())
