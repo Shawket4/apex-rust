@@ -78,6 +78,8 @@ log = "0.4"
 once_cell = "1.19"
 futures-util = "0.3.31"
 rmp = "0.8.15"
+sentry = "0.49"
+sentry-actix = "0.49"
 
 [profile.release]
 opt-level = 3

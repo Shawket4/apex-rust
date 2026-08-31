@@ -1062,6 +1062,9 @@ mod tests {
             from: Some(from.into()),
             to: Some(to.into()),
             company: None,
+            // resolve_window reads only the date fields; the expiry horizon is
+            // applied later, against the attention queries.
+            doc_horizon_days: None,
             format: None,
         };
 

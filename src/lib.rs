@@ -12,6 +12,7 @@ pub mod errors;
 pub mod handlers;
 pub mod ingest;
 pub mod models;
+pub mod observability;
 pub mod ops;
 pub mod parser;
 pub mod utils;
