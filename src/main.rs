@@ -151,7 +151,14 @@ async fn main() -> std::io::Result<()> {
             // is not a bug in this service, and the volume would bury the ones
             // that are. Everything it attaches passes through the scrubber in
             // `observability` before it leaves the process.
-            .wrap(sentry_actix::Sentry::builder().capture_server_errors(true).finish())
+            .wrap(
+                sentry_actix::Sentry::builder()
+                    .capture_server_errors(true)
+                    // Transactions, so request throughput and latency are
+                    // visible and not just failures.
+                    .start_transaction(true)
+                    .finish(),
+            )
             .wrap(cors)
             .wrap(middleware::Logger::default())
             .wrap(middleware::Compress::default())
