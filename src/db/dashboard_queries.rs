@@ -727,6 +727,9 @@ pub async fn expiring_documents(pool: &PgPool, horizon: &str) -> Result<Vec<Expi
 }
 
 pub struct OilChangeRow {
+    /// The vehicle's id, so a caller can address the car itself rather than
+    /// trying to match on a plate string.
+    pub car_id: i64,
     pub plate: String,
     pub date: Option<String>,
     /// `mileage` is the service *interval* in km, not distance driven — the
@@ -791,7 +794,7 @@ pub async fn latest_oil_change_per_car(pool: &PgPool) -> Result<Vec<OilChangeRow
             FROM ranked
             GROUP BY car_id
         )
-        SELECT r.car_no_plate, r.date, r.mileage, r.odometer_at_change, r.current_odometer,
+        SELECT r.car_id, r.car_no_plate, r.date, r.mileage, r.odometer_at_change, r.current_odometer,
                COALESCE(r.oil_filter_changed, false)   AS oil_filter,
                COALESCE(r.fuel_filter_changed, false)  AS fuel_filter,
                COALESCE(r.water_filter_changed, false) AS water_filter,
@@ -809,6 +812,7 @@ pub async fn latest_oil_change_per_car(pool: &PgPool) -> Result<Vec<OilChangeRow
     Ok(rows
         .into_iter()
         .map(|r| OilChangeRow {
+            car_id: r.get::<Option<i64>, _>("car_id").unwrap_or_default(),
             plate: r.get::<Option<String>, _>("car_no_plate").unwrap_or_default(),
             date: r.get("date"),
             interval_km: num(&r, "mileage"),
