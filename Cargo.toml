@@ -80,6 +80,9 @@ futures-util = "0.3.31"
 rmp = "0.8.15"
 sentry = "0.49"
 sentry-actix = "0.49"
+sentry-tracing = "0.49"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [profile.release]
 opt-level = 3

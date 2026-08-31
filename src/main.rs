@@ -23,7 +23,32 @@ fn configure_routes(cfg: &mut web::ServiceConfig) {
 async fn main() -> std::io::Result<()> {
     // .env before the logger: RUST_LOG lives in .env.
     dotenv::dotenv().ok();
-    env_logger::init();
+
+    // tracing_subscriber rather than env_logger, for one reason: it lets the
+    // Sentry layer see events. This crate logs through `log`, and
+    // tracing-subscriber's tracing-log bridge picks those up, so every existing
+    // log::info!/error! still prints exactly as before and RUST_LOG is still
+    // what controls it.
+    //
+    // The payoff is sqlx: it emits a span per query with elapsed time, so an
+    // error event now arrives carrying the last queries the request ran and how
+    // long each took. Sentry gets its own filter so it can see sqlx at debug
+    // without that going to the console.
+    {
+        use tracing_subscriber::prelude::*;
+        let console = tracing_subscriber::fmt::layer().with_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        );
+        let sentry_layer = sentry_tracing::layer().with_filter(
+            tracing_subscriber::EnvFilter::try_from_env("SENTRY_TRACING_FILTER")
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,sqlx=debug")),
+        );
+        tracing_subscriber::registry()
+            .with(sentry_layer)
+            .with(console)
+            .init();
+    }
 
     // Sentry, if SENTRY_DSN is set. The guard has to outlive the server, so it
     // is bound here rather than in a helper: dropping it flushes the queue and
