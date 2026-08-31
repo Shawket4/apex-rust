@@ -99,6 +99,14 @@ fn redact_query(query: &str) -> String {
 
 /// The compliance control. See the module docs before changing anything here.
 fn scrub(mut event: Event<'static>) -> Option<Event<'static>> {
+    // Which service this came from. Every backend shares one Sentry project, so
+    // without this you are left inferring it from the release string or the SDK
+    // name. Set in before_send rather than on a scope so it is on every event,
+    // whichever hub raised it. CARGO_PKG_NAME keeps it honest per crate.
+    event
+        .tags
+        .insert("service".to_string(), env!("CARGO_PKG_NAME").to_string());
+
     // Whatever the SDK managed to infer about the person making the request,
     // drop it. `send_default_pii: false` already suppresses most of this;
     // clearing it outright means a future SDK release cannot quietly widen

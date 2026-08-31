@@ -406,6 +406,9 @@ fn internal(e: anyhow::Error) -> actix_web::Error {
     actix_web::error::ErrorInternalServerError("dashboard unavailable")
 }
 
+// skip_all is not optional here: span fields are recorded verbatim and the
+// query struct carries filters. Only the name travels.
+#[tracing::instrument(skip_all, name = "dashboard")]
 pub async fn get_dashboard(
     pool: web::Data<PgPool>,
     query: web::Query<DashboardQuery>,
@@ -687,6 +690,9 @@ struct DailyAmount {
     amount: String,
 }
 
+// skip_all is not optional here: span fields are recorded verbatim and the
+// query struct carries filters. Only the name travels.
+#[tracing::instrument(skip_all, name = "dashboard.revenue")]
 pub async fn get_revenue_drawer(
     pool: web::Data<PgPool>,
     query: web::Query<DashboardQuery>,
@@ -735,6 +741,9 @@ struct PaymentRow {
     amount: String,
 }
 
+// skip_all is not optional here: span fields are recorded verbatim and the
+// query struct carries filters. Only the name travels.
+#[tracing::instrument(skip_all, name = "dashboard.cash_out")]
 pub async fn get_cash_out_drawer(
     pool: web::Data<PgPool>,
     query: web::Query<DashboardQuery>,
@@ -803,6 +812,9 @@ struct DailyCount {
     trips: i64,
 }
 
+// skip_all is not optional here: span fields are recorded verbatim and the
+// query struct carries filters. Only the name travels.
+#[tracing::instrument(skip_all, name = "dashboard.trips")]
 pub async fn get_trips_drawer(
     pool: web::Data<PgPool>,
     query: web::Query<DashboardQuery>,
@@ -889,6 +901,9 @@ struct MethodOut {
     liters: f64,
 }
 
+// skip_all is not optional here: span fields are recorded verbatim and the
+// query struct carries filters. Only the name travels.
+#[tracing::instrument(skip_all, name = "dashboard.fuel")]
 pub async fn get_fuel_drawer(
     pool: web::Data<PgPool>,
     query: web::Query<DashboardQuery>,
@@ -965,6 +980,9 @@ pub struct FuelEventsQuery {
 }
 
 /// The dashboard's infinite fuel list: one window, served in pages.
+// skip_all is not optional here: span fields are recorded verbatim and the
+// query struct carries filters. Only the name travels.
+#[tracing::instrument(skip_all, name = "dashboard.fuel_events")]
 pub async fn get_fuel_events(
     pool: web::Data<PgPool>,
     query: web::Query<FuelEventsQuery>,
