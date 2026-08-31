@@ -113,6 +113,18 @@ pub struct OilChangeDue {
     /// itself; the frontend decides what the number means.
     pub oil_filter_cycles: i64,
     pub fuel_filter_cycles: i64,
+    /// Enough to answer "what is actually going on with this truck" without a
+    /// second request. The panel opens a sheet on these.
+    pub odometer_at_change: i64,
+    pub current_odometer: i64,
+    /// When each element was last replaced; null means never, in the records
+    /// we hold — the same history the cycle count falls back on.
+    pub oil_filter_date: Option<String>,
+    pub fuel_filter_date: Option<String>,
+    pub water_filter_date: Option<String>,
+    pub driver_name: String,
+    pub super_visor: String,
+    pub cost: f64,
 }
 
 #[derive(Serialize)]
@@ -610,6 +622,14 @@ pub async fn get_dashboard(
                     water_filter: o.water_filter,
                     oil_filter_cycles: o.oil_filter_cycles,
                     fuel_filter_cycles: o.fuel_filter_cycles,
+                    odometer_at_change: o.odometer_at_change as i64,
+                    current_odometer: o.current_odometer as i64,
+                    oil_filter_date: o.oil_filter_date,
+                    fuel_filter_date: o.fuel_filter_date,
+                    water_filter_date: o.water_filter_date,
+                    driver_name: o.driver_name.unwrap_or_default(),
+                    super_visor: o.super_visor.unwrap_or_default(),
+                    cost: o.cost,
                 }
             })
         })

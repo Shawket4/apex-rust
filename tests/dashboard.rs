@@ -312,6 +312,18 @@ async fn attention_names_what_lapses_and_what_falls_due() {
     // at or above its service life as due.
     assert_eq!(oil[0]["fuel_filter_cycles"].as_i64().unwrap(), 3);
 
+    // The dates behind those counts. The oil element went in with the newest
+    // change, so it carries that change's date; the fuel element was never
+    // replaced in any record we hold, so it has no date at all -- the same
+    // history its count fell back on, which is what keeps the two agreeing.
+    assert_eq!(oil[0]["oil_filter_date"].as_str().unwrap(), "2025-05-01");
+    assert!(oil[0]["fuel_filter_date"].is_null(), "never replaced means no date");
+
+    // Raw odometers, so the sheet can show the arithmetic rather than only its
+    // result.
+    assert_eq!(oil[0]["odometer_at_change"].as_i64().unwrap(), 100000);
+    assert_eq!(oil[0]["current_odometer"].as_i64().unwrap(), 107500);
+
     // A tighter window is the caller's to ask for: at 14 days only the lapsed
     // paper qualifies, and the one 30 days out drops off.
     let tight = get_json!(app, 4, "/api/v1/dashboard?month=2025-05&doc_horizon_days=14");

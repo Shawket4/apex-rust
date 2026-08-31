@@ -744,6 +744,16 @@ pub struct OilChangeRow {
     /// is one threshold in the codebase rather than one per backend.
     pub oil_filter_cycles: i64,
     pub fuel_filter_cycles: i64,
+    /// When each element was last actually replaced. `None` means it was never
+    /// replaced in any record we hold — which is the same history the cycle
+    /// count falls back on, so the two always agree.
+    pub oil_filter_date: Option<String>,
+    pub fuel_filter_date: Option<String>,
+    pub water_filter_date: Option<String>,
+    /// Who did it and what it cost, from the latest record.
+    pub driver_name: Option<String>,
+    pub super_visor: Option<String>,
+    pub cost: f64,
 }
 
 /// The most recent oil change per car.
@@ -771,7 +781,13 @@ pub async fn latest_oil_change_per_car(pool: &PgPool) -> Result<Vec<OilChangeRow
         cycles AS (
             SELECT car_id,
                    COALESCE(MIN(rn) FILTER (WHERE oil_filter_changed),  COUNT(*)) AS oil_cycles,
-                   COALESCE(MIN(rn) FILTER (WHERE fuel_filter_changed), COUNT(*)) AS fuel_cycles
+                   COALESCE(MIN(rn) FILTER (WHERE fuel_filter_changed), COUNT(*)) AS fuel_cycles,
+                   -- Same walk, one step further: the date attached to that
+                   -- most recent replacement. array_agg ordered by rn puts the
+                   -- newest matching record first, so [1] is it.
+                   (ARRAY_AGG(date ORDER BY rn) FILTER (WHERE oil_filter_changed))[1]   AS oil_filter_date,
+                   (ARRAY_AGG(date ORDER BY rn) FILTER (WHERE fuel_filter_changed))[1]  AS fuel_filter_date,
+                   (ARRAY_AGG(date ORDER BY rn) FILTER (WHERE water_filter_changed))[1] AS water_filter_date
             FROM ranked
             GROUP BY car_id
         )
@@ -779,7 +795,9 @@ pub async fn latest_oil_change_per_car(pool: &PgPool) -> Result<Vec<OilChangeRow
                COALESCE(r.oil_filter_changed, false)   AS oil_filter,
                COALESCE(r.fuel_filter_changed, false)  AS fuel_filter,
                COALESCE(r.water_filter_changed, false) AS water_filter,
-               c.oil_cycles, c.fuel_cycles
+               c.oil_cycles, c.fuel_cycles,
+               c.oil_filter_date, c.fuel_filter_date, c.water_filter_date,
+               r.driver_name, r.super_visor, r.cost
         FROM ranked r
         JOIN cycles c ON c.car_id = r.car_id
         WHERE r.rn = 1
@@ -801,6 +819,12 @@ pub async fn latest_oil_change_per_car(pool: &PgPool) -> Result<Vec<OilChangeRow
             water_filter: r.get("water_filter"),
             oil_filter_cycles: r.get("oil_cycles"),
             fuel_filter_cycles: r.get("fuel_cycles"),
+            oil_filter_date: r.get("oil_filter_date"),
+            fuel_filter_date: r.get("fuel_filter_date"),
+            water_filter_date: r.get("water_filter_date"),
+            driver_name: r.get("driver_name"),
+            super_visor: r.get("super_visor"),
+            cost: num(&r, "cost"),
         })
         .collect())
 }
