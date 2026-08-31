@@ -125,6 +125,11 @@ pub struct OilChangeDue {
     pub driver_name: String,
     pub super_visor: String,
     pub cost: f64,
+    /// The plate exactly as stored. `plate_no`/`plate_ar` are a split for
+    /// display and cannot be reassembled — some plates are recorded with the
+    /// digits first — so anything that has to address the vehicle (a link to
+    /// its history, a lookup) needs the original.
+    pub plate_raw: String,
 }
 
 #[derive(Serialize)]
@@ -613,6 +618,7 @@ pub async fn get_dashboard(
                 OilChangeDue {
                     plate_no,
                     plate_ar,
+                    plate_raw: o.plate.clone(),
                     last_change_date: o.date,
                     interval_km: o.interval_km as i64,
                     km_since: since as i64,
