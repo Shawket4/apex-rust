@@ -325,6 +325,9 @@ async fn attention_names_what_lapses_and_what_falls_due() {
     // plate as stored, because a plate recorded digits-first cannot be
     // reassembled from the two halves.
     assert_eq!(oil[0]["plate_raw"].as_str().unwrap(), "PA-A");
+    // The vehicle's own id, so the create form can preselect it rather than
+    // matching on a plate string.
+    assert!(oil[0]["car_id"].as_i64().unwrap() > 0);
     assert_eq!(oil[0]["odometer_at_change"].as_i64().unwrap(), 100000);
     assert_eq!(oil[0]["current_odometer"].as_i64().unwrap(), 107500);
 

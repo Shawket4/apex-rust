@@ -94,6 +94,9 @@ pub struct ExpiringDocument {
 
 #[derive(Serialize)]
 pub struct OilChangeDue {
+    /// Lets the sheet open the create form with this vehicle already chosen,
+    /// without matching on a plate string.
+    pub car_id: i64,
     pub plate_no: String,
     pub plate_ar: String,
     pub last_change_date: Option<String>,
@@ -616,6 +619,7 @@ pub async fn get_dashboard(
             (o.interval_km > 0.0 && left <= OIL_DUE_KM).then(|| {
                 let (plate_no, plate_ar) = split_plate(&o.plate);
                 OilChangeDue {
+                    car_id: o.car_id,
                     plate_no,
                     plate_ar,
                     plate_raw: o.plate.clone(),
