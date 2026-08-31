@@ -271,10 +271,11 @@ async fn attention_names_what_lapses_and_what_falls_due() {
     .expect("attention fixture");
 
     let app = app_of!(pool);
-    let body = get_json!(app, 4, "/api/v1/dashboard?month=2025-05");
+    let body = get_json!(app, 4, "/api/v1/dashboard?month=2025-05&doc_horizon_days=60");
     let a = &body["attention"];
 
-    // Two of PA-A's three papers are inside the horizon; the 400-day one is not,
+    // The horizon is the caller's to set, and the frontend always sends it.
+    // Two of PA-A's three papers are inside 60 days; the 400-day one is not,
     // and WA-C's blank is not a date.
     let docs = a["documents"].as_array().expect("documents array");
     assert_eq!(a["documents_total"].as_u64().unwrap(), 2, "only the two inside the horizon");
@@ -310,4 +311,19 @@ async fn attention_names_what_lapses_and_what_falls_due() {
     // so it falls back to that count: a floor, and the frontend reads anything
     // at or above its service life as due.
     assert_eq!(oil[0]["fuel_filter_cycles"].as_i64().unwrap(), 3);
+
+    // A tighter window is the caller's to ask for: at 14 days only the lapsed
+    // paper qualifies, and the one 30 days out drops off.
+    let tight = get_json!(app, 4, "/api/v1/dashboard?month=2025-05&doc_horizon_days=14");
+    assert_eq!(tight["attention"]["documents_total"].as_u64().unwrap(), 1);
+    assert_eq!(
+        tight["attention"]["documents"][0]["days_left"].as_i64().unwrap(),
+        -10,
+        "a lapsed paper is inside every horizon"
+    );
+
+    // No parameter falls back to the constant, which is 30 days -- so the
+    // 30-day paper is still in and the 400-day one is still out.
+    let default = get_json!(app, 4, "/api/v1/dashboard?month=2025-05");
+    assert_eq!(default["attention"]["documents_total"].as_u64().unwrap(), 2);
 }

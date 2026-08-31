@@ -31,10 +31,13 @@ use crate::utils::response;
 /// The permission that may see money on the dashboard.
 const FINANCIAL_PERMISSION: i32 = 4;
 
-/// How far ahead a document counts as "expiring". Two months is one renewal
-/// cycle at this fleet's pace — long enough to act, short enough that the list
-/// is still a list.
-const DOC_HORIZON_DAYS: i64 = 60;
+/// Fallback window for a caller that sends no `doc_horizon_days`. The frontend
+/// always sends one; this only keeps a bare curl honest.
+const DOC_HORIZON_DAYS: i64 = 30;
+
+/// A horizon past this is not a filter, it is the whole table — and a negative
+/// one would quietly return nothing at all.
+const DOC_HORIZON_MAX_DAYS: i64 = 3650;
 
 /// Kilometres of slack below which an oil change is worth surfacing. Same
 /// number as `OIL_CHANGE_THRESHOLDS.WARNING` on the oil-changes screen; the two
@@ -350,6 +353,12 @@ pub struct DashboardQuery {
     /// Scopes the trips dimension (revenue, counts, fleet revenue). Cash-out
     /// and owed money have no company dimension and ignore it.
     pub company: Option<String>,
+    /// How far ahead a document counts as expiring. The frontend owns this
+    /// rule — see DOCUMENT_EXPIRY_WARNING_DAYS in entities/car/expiry.ts — so
+    /// the cars screen and this panel cannot disagree about which papers are
+    /// expiring. Clamped below; the constant is only the fallback for a caller
+    /// that sends nothing.
+    pub doc_horizon_days: Option<i64>,
     pub format: Option<String>,
 }
 
@@ -392,7 +401,11 @@ pub async fn get_dashboard(
     let today_s = today.format("%Y-%m-%d").to_string();
     let yesterday_s = (today - chrono::Duration::days(1)).format("%Y-%m-%d").to_string();
 
-    let doc_horizon = (today + chrono::Duration::days(DOC_HORIZON_DAYS))
+    let horizon_days = query
+        .doc_horizon_days
+        .unwrap_or(DOC_HORIZON_DAYS)
+        .clamp(0, DOC_HORIZON_MAX_DAYS);
+    let doc_horizon = (today + chrono::Duration::days(horizon_days))
         .format("%Y-%m-%d")
         .to_string();
 
@@ -934,6 +947,8 @@ pub async fn get_fuel_events(
         from: query.from.clone(),
         to: query.to.clone(),
         company: None,
+        // Only the window matters here; this endpoint reads no documents.
+        doc_horizon_days: None,
         format: None,
     });
     let page = query.page.unwrap_or(1).max(1);
