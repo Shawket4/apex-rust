@@ -80,8 +80,27 @@ fn normalise(key: &str) -> String {
         .collect()
 }
 
+/// Keys that match a denylist entry but are not personal.
+///
+/// `name` has to stay a fragment — it is what catches driver_name, first_name
+/// and the rest — but it also matches the SDK's own metadata and the tags this
+/// module sets itself. APEX-7 arrived from the Go service with job.name,
+/// os.name and runtime.name all redacted, so the event could not say which job
+/// had failed.
+///
+/// Exact matches only, and only for keys whose value is a machine's word for
+/// itself. `device.name` is deliberately absent — that one is "Shawket's
+/// iPhone".
+const ALLOW_EXACT: &[&str] = &[
+    "jobname", "osname", "runtimename", "browsername", "sdkname",
+    "servicename", "rustname", "gonamespace",
+];
+
 fn is_sensitive(key: &str) -> bool {
     let k = normalise(key);
+    if ALLOW_EXACT.contains(&k.as_str()) {
+        return false;
+    }
     REDACT_EXACT.contains(&k.as_str()) || REDACT_FRAGMENTS.iter().any(|f| k.contains(f))
 }
 
