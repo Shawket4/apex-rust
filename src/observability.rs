@@ -14,6 +14,7 @@
 //! process routinely. Do not relax `before_send`, and do not set
 //! `send_default_pii` to true, without a corresponding change to that policy.
 
+use regex::Regex;
 use std::borrow::Cow;
 
 use sentry::protocol::{Context, Event, Value};
@@ -43,11 +44,32 @@ const REDACT_FRAGMENTS: &[&str] = &[
     "longitude",
     "national",
     "ssn",
+    // Payload-bearing field names. An upstream body is not ours to export and
+    // cannot be cleaned once it is a string, so the value is dropped wherever
+    // one of these names appears.
+    "body",
+    "payload",
+    "response_text",
+    "html",
+    // Value-of-a-payload key names. "text" is what a messaging API calls the
+    // thing a person wrote. Not "message": Sentry's own breadcrumbs use that
+    // field and redacting it would blank the trail.
+    "text",
+    "caption",
+    "content",
 ];
 
 /// Keys that are personal in full but too short to match as substrings —
 /// `lat` would otherwise match `plate` and `translate`.
-const REDACT_EXACT: &[&str] = &["lat", "lng", "lon", "long", "coords", "gps"];
+const REDACT_EXACT: &[&str] = &[
+    "lat", "lng", "lon", "long", "coords", "gps",
+    // Short credential names the long ones miss: the list had "password" and
+    // "passwd" but not "pass", which is what a login query string uses.
+    "pass", "pwd", "user", "auth", "apikey", "sig", "jwt", "otp", "pin", "creds",
+    // Keys whose VALUE is a person's name. "driver_name" is caught by the
+    // "name" fragment; a bare "driver" is not. Exact, so "driver_id" survives.
+    "driver", "employee", "owner", "contact", "person", "customer",
+];
 
 const REDACTED: &str = "[redacted]";
 
@@ -244,6 +266,76 @@ pub fn capture_upstream_status(service: &str, operation: &str, status: u16) {
     );
 }
 
+/// Make a free-text error message safe to export.
+///
+/// The scrubber redacts by KEY, walking structured data. It cannot help with a
+/// message, which is why error text used to be withheld from Sentry entirely —
+/// safe, but it left events thin: an operation name and no indication of what
+/// actually went wrong.
+///
+/// This redacts inside the text instead, so the message can be attached in
+/// full. It targets the shapes personal data actually takes in an error
+/// string: a key=value pair in a URL query, a JSON field, a `key: value`
+/// fragment, an email address, a phone number, a bearer token. The key
+/// judgement is `is_sensitive`, the same one the scrubber uses, so the two
+/// cannot drift.
+///
+/// Compliance control. Deliberately conservative: over-redacting costs a
+/// little detail, under-redacting exports somebody's phone number.
+pub fn sanitize_message(s: &str) -> String {
+    use std::sync::OnceLock;
+
+    static QUERY_PAIR: OnceLock<Regex> = OnceLock::new();
+    static JSON_PAIR: OnceLock<Regex> = OnceLock::new();
+    static COLON_PAIR: OnceLock<Regex> = OnceLock::new();
+    static EMAIL: OnceLock<Regex> = OnceLock::new();
+    static JWT: OnceLock<Regex> = OnceLock::new();
+    static INTL_PHONE: OnceLock<Regex> = OnceLock::new();
+    static LOCAL_MOBILE: OnceLock<Regex> = OnceLock::new();
+
+    let query = QUERY_PAIR
+        .get_or_init(|| Regex::new(r"([A-Za-z_][\w\-.]*)=([^&\s\x22'<>]+)").unwrap());
+    let json = JSON_PAIR
+        .get_or_init(|| Regex::new(r#""([^"]{1,64})"\s*:\s*"([^"]*)""#).unwrap());
+    let colon = COLON_PAIR
+        .get_or_init(|| Regex::new(r"\b([A-Za-z_][\w\-.]*)\s*:\s+([^\s,;}]+)").unwrap());
+    let email = EMAIL.get_or_init(|| Regex::new(r"[\w.+\-]+@[\w\-]+\.[\w.\-]+").unwrap());
+    let jwt = JWT.get_or_init(|| Regex::new(r"eyJ[\w\-]{4,}\.[\w\-]{4,}(\.[\w\-]+)?").unwrap());
+    let intl = INTL_PHONE.get_or_init(|| Regex::new(r"\+\d[\d\s\-]{8,16}\d").unwrap());
+    let local = LOCAL_MOBILE.get_or_init(|| Regex::new(r"\b01\d{9}\b").unwrap());
+
+    // Keep the key, replace the value: the message still says WHICH field was
+    // involved, which is usually the useful half.
+    let redact_pair = |caps: &regex::Captures| -> String {
+        let whole = caps.get(0).map(|m| m.as_str()).unwrap_or("");
+        let key = caps.get(1).map(|m| m.as_str()).unwrap_or("");
+        if !is_sensitive(key) {
+            return whole.to_string();
+        }
+        match whole.find([':', '=']) {
+            Some(i) => format!("{}{}", &whole[..=i], REDACTED),
+            None => whole.to_string(),
+        }
+    };
+
+    let out = query.replace_all(s, &redact_pair).into_owned();
+    let out = json.replace_all(&out, &redact_pair).into_owned();
+    let out = colon.replace_all(&out, &redact_pair).into_owned();
+    let out = email.replace_all(&out, REDACTED).into_owned();
+    let out = jwt.replace_all(&out, REDACTED).into_owned();
+    let out = intl.replace_all(&out, REDACTED).into_owned();
+    let mut out = local.replace_all(&out, REDACTED).into_owned();
+
+    // A message long enough to be a pasted payload is not a message.
+    const MAX_LEN: usize = 2000;
+    if out.len() > MAX_LEN {
+        let cut = (0..=MAX_LEN).rev().find(|i| out.is_char_boundary(*i)).unwrap_or(0);
+        out.truncate(cut);
+        out.push_str("…[truncated]");
+    }
+    out
+}
+
 /// Install Sentry, or don't.
 ///
 /// Returns `None` when `SENTRY_DSN` is unset or blank — the service then runs
@@ -323,8 +415,11 @@ mod tests {
         redact(&mut v);
 
         assert_eq!(v["trip"]["id"], 7, "non-sensitive values are left alone");
-        assert_eq!(v["trip"]["driver"]["name"], REDACTED);
-        assert_eq!(v["trip"]["driver"]["phone"], REDACTED);
+        // A sensitive key takes its whole subtree with it, rather than being
+        // walked into and cleaned field by field. Costs the ids underneath;
+        // means a personal value under an innocent-looking key cannot survive
+        // inside a container we already know is personal.
+        assert_eq!(v["trip"]["driver"], REDACTED);
         assert_eq!(v["trip"]["stops"][0]["latitude"], REDACTED);
         assert_eq!(v["trip"]["stops"][0]["longitude"], REDACTED);
         assert_eq!(v["trip"]["stops"][0]["label"], "depot");

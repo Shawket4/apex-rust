@@ -37,13 +37,14 @@ pub enum AppError {
     /// The String carries the upstream's response body for the operator log.
     /// It is deliberately NOT interpolated into the Display.
     ///
-    /// Compliance control — do not "helpfully" put `{0}` back. WhatsApp error
-    /// bodies contain phone numbers and message text, and this Display is what
-    /// reaches the client's 502 body AND, via `capture_server_errors`, the
-    /// exception value in Sentry. The scrubber redacts by KEY and cannot clean
-    /// free text, so keeping the body out of Display is the only thing that
-    /// keeps it out of both. The detail is logged locally in `error_response`.
-    #[error("upstream WhatsApp API error")]
+    /// Compliance control — the body is interpolated through
+    /// `sanitize_message`, never raw. WhatsApp error bodies contain phone
+    /// numbers and message text, and this Display is what `capture_server_errors`
+    /// sends to Sentry as the exception value. The scrubber redacts by KEY and
+    /// cannot clean free text, so sanitizing here is what makes it safe to
+    /// carry. The client never sees this: `error_response` builds its own
+    /// opaque detail for 5xx.
+    #[error("upstream WhatsApp API error: {}", crate::observability::sanitize_message(.0))]
     Upstream(String),
 
     #[error("database error")]
@@ -180,22 +181,19 @@ mod tests {
     /// held for the operator log only. This asserts it escapes through neither
     /// of the two doors it used to: the Display, which `capture_server_errors`
     /// sends to Sentry as the exception value, and the client's 502 body.
+    /// The Display is what Sentry receives. It carries the detail now, but
+    /// cleaned: the status and shape survive, the phone number and the message
+    /// text do not.
     #[test]
-    fn upstream_bodies_reach_neither_sentry_nor_the_client() {
+    fn upstream_bodies_reach_sentry_cleaned() {
         let body = "HTTP 400: {\"to\":\"+201001234567\",\"text\":\"salary sent\"}";
         let err = AppError::Upstream(body.to_string());
 
         let displayed = err.to_string();
         assert!(!displayed.contains("201001234567"), "Display leaked a phone number: {displayed}");
         assert!(!displayed.contains("salary sent"), "Display leaked message text: {displayed}");
-
-        let resp = err.error_response();
-        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
-        let detail = match &err {
-            AppError::Upstream(_) => "upstream request failed",
-            _ => unreachable!(),
-        };
-        assert!(!detail.contains("201001234567"));
+        assert!(displayed.contains("HTTP 400"), "over-redacted the diagnosis: {displayed}");
+        assert_eq!(err.status_code(), StatusCode::BAD_GATEWAY);
     }
 
     /// Quieting the leak must not quiet the fault: it is still a 502.
