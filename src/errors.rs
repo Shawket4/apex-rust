@@ -34,7 +34,16 @@ pub enum AppError {
     #[error("If-Match header is required")]
     PreconditionRequired,
 
-    #[error("upstream WhatsApp API error: {0}")]
+    /// The String carries the upstream's response body for the operator log.
+    /// It is deliberately NOT interpolated into the Display.
+    ///
+    /// Compliance control — do not "helpfully" put `{0}` back. WhatsApp error
+    /// bodies contain phone numbers and message text, and this Display is what
+    /// reaches the client's 502 body AND, via `capture_server_errors`, the
+    /// exception value in Sentry. The scrubber redacts by KEY and cannot clean
+    /// free text, so keeping the body out of Display is the only thing that
+    /// keeps it out of both. The detail is logged locally in `error_response`.
+    #[error("upstream WhatsApp API error")]
     Upstream(String),
 
     #[error("database error")]
@@ -127,6 +136,11 @@ impl ResponseError for AppError {
                 log::error!("internal error: {msg}");
                 "an internal error occurred".to_string()
             }
+            // The operator gets the upstream body; nobody else does.
+            AppError::Upstream(detail) => {
+                log::error!("upstream WhatsApp API error: {detail}");
+                "upstream request failed".to_string()
+            }
             other => other.to_string(),
         };
 
@@ -156,3 +170,53 @@ fn sqlstate(e: &sqlx::Error) -> Option<String> {
 }
 
 pub type AppResult<T> = Result<T, AppError>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Compliance control. `Upstream` carries up to 300 characters of a
+    /// WhatsApp response body — phone numbers and message text. That String is
+    /// held for the operator log only. This asserts it escapes through neither
+    /// of the two doors it used to: the Display, which `capture_server_errors`
+    /// sends to Sentry as the exception value, and the client's 502 body.
+    #[test]
+    fn upstream_bodies_reach_neither_sentry_nor_the_client() {
+        let body = "HTTP 400: {\"to\":\"+201001234567\",\"text\":\"salary sent\"}";
+        let err = AppError::Upstream(body.to_string());
+
+        let displayed = err.to_string();
+        assert!(!displayed.contains("201001234567"), "Display leaked a phone number: {displayed}");
+        assert!(!displayed.contains("salary sent"), "Display leaked message text: {displayed}");
+
+        let resp = err.error_response();
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+        let detail = match &err {
+            AppError::Upstream(_) => "upstream request failed",
+            _ => unreachable!(),
+        };
+        assert!(!detail.contains("201001234567"));
+    }
+
+    /// Quieting the leak must not quiet the fault: it is still a 502.
+    #[test]
+    fn upstream_failures_are_still_server_errors() {
+        assert_eq!(
+            AppError::Upstream("x".into()).status_code(),
+            StatusCode::BAD_GATEWAY,
+        );
+    }
+
+    /// The sqlstate classification is what keeps ordinary conflicts out of
+    /// Sentry; a regression there would flood it with 500s.
+    #[test]
+    fn client_faults_do_not_become_server_errors() {
+        assert_eq!(AppError::BadRequest("x".into()).status_code(), StatusCode::BAD_REQUEST);
+        assert_eq!(AppError::NotFound("x".into()).status_code(), StatusCode::NOT_FOUND);
+        assert_eq!(AppError::Forbidden.status_code(), StatusCode::FORBIDDEN);
+        assert_eq!(
+            AppError::VersionConflict { expected: 1, actual: 2 }.status_code(),
+            StatusCode::CONFLICT,
+        );
+    }
+}
