@@ -165,6 +165,11 @@ async fn main() -> std::io::Result<()> {
                 actix_web::http::header::CONTENT_TYPE,
             ])
             .allowed_header("If-Match")
+            // The caller's trace id. Neither header is CORS-safelisted, so
+            // without them the browser strips them at preflight and every
+            // request looks like the start of a new trace.
+            .allowed_header("sentry-trace")
+            .allowed_header("baggage")
             .supports_credentials()
             .max_age(3600)
             .allow_any_origin();
