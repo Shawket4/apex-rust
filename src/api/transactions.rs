@@ -81,6 +81,8 @@ pub struct ListQuery {
     pub include_fuel: Option<String>,
     #[serde(default)]
     pub include_loans: Option<String>,
+    /// `amount` (biggest first) or `date` (newest first, the default).
+    pub sort: Option<String>,
     pub cursor: Option<String>,
     pub limit: Option<u32>,
     /// Export only: render the sheet right-to-left for Arabic locales.
@@ -96,7 +98,20 @@ fn flag(v: &Option<String>, default: bool) -> bool {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SortBy {
+    Date,
+    Amount,
+}
+
 impl ListQuery {
+    fn sort_by(&self) -> AppResult<SortBy> {
+        match self.sort.as_deref() {
+            None | Some("") | Some("date") => Ok(SortBy::Date),
+            Some("amount") => Ok(SortBy::Amount),
+            Some(other) => Err(AppError::BadRequest(format!("unknown sort: {other}"))),
+        }
+    }
     fn wants_fuel(&self) -> bool {
         // A bank-only filter prunes the fuel branch outright.
         flag(&self.include_fuel, true)
@@ -341,20 +356,40 @@ async fn loans_for(
         .collect())
 }
 
-fn parse_cursor(cursor: &Option<String>) -> AppResult<Option<(DateTime<Utc>, i64)>> {
+/// Keyset position of the last row on a page. Date cursors are
+/// `<millis>:<id>`; amount cursors are `amt:<decimal>:<id>`, so a cursor
+/// minted under one sort can never be replayed under the other.
+enum Cursor {
+    Date(DateTime<Utc>, i64),
+    Amount(Decimal, i64),
+}
+
+fn parse_cursor(cursor: &Option<String>, sort: SortBy) -> AppResult<Option<Cursor>> {
     let Some(c) = cursor else { return Ok(None) };
-    let (millis, id) = c
-        .split_once(':')
-        .ok_or_else(|| AppError::BadRequest("malformed cursor".into()))?;
-    let millis: i64 = millis
-        .parse()
-        .map_err(|_| AppError::BadRequest("malformed cursor".into()))?;
-    let id: i64 = id
-        .parse()
-        .map_err(|_| AppError::BadRequest("malformed cursor".into()))?;
-    let ts = DateTime::<Utc>::from_timestamp_millis(millis)
-        .ok_or_else(|| AppError::BadRequest("malformed cursor".into()))?;
-    Ok(Some((ts, id)))
+    let bad = || AppError::BadRequest("malformed cursor".into());
+    match sort {
+        SortBy::Amount => {
+            let rest = c.strip_prefix("amt:").ok_or_else(bad)?;
+            let (amount, id) = rest.split_once(':').ok_or_else(bad)?;
+            let amount = Decimal::from_str(amount).map_err(|_| bad())?;
+            let id: i64 = id.parse().map_err(|_| bad())?;
+            Ok(Some(Cursor::Amount(amount, id)))
+        }
+        SortBy::Date => {
+            let (millis, id) = c.split_once(':').ok_or_else(bad)?;
+            let millis: i64 = millis.parse().map_err(|_| bad())?;
+            let id: i64 = id.parse().map_err(|_| bad())?;
+            let ts = DateTime::<Utc>::from_timestamp_millis(millis).ok_or_else(bad)?;
+            Ok(Some(Cursor::Date(ts, id)))
+        }
+    }
+}
+
+fn push_order(qb: &mut QueryBuilder<'_, Postgres>, sort: SortBy) {
+    match sort {
+        SortBy::Date => qb.push(" ORDER BY u.occurred_at DESC, u.id DESC"),
+        SortBy::Amount => qb.push(" ORDER BY u.amount DESC, u.id DESC"),
+    };
 }
 
 /* ------------------------------------------------------------------------ */
@@ -367,19 +402,31 @@ pub async fn list(
 ) -> AppResult<HttpResponse> {
     let f = query.into_inner();
     let limit = f.limit.unwrap_or(100).min(200) as i64;
-    let cursor = parse_cursor(&f.cursor)?;
+    let sort = f.sort_by()?;
+    let cursor = parse_cursor(&f.cursor, sort)?;
 
     let mut qb: QueryBuilder<Postgres> = QueryBuilder::new("SELECT u.* FROM ");
     push_union(&mut qb, &f);
     qb.push(" WHERE TRUE");
-    if let Some((ts, id)) = cursor {
-        qb.push(" AND (u.occurred_at, u.id) < (")
-            .push_bind(ts)
-            .push(", ")
-            .push_bind(id)
-            .push(")");
+    match cursor {
+        Some(Cursor::Date(ts, id)) => {
+            qb.push(" AND (u.occurred_at, u.id) < (")
+                .push_bind(ts)
+                .push(", ")
+                .push_bind(id)
+                .push(")");
+        }
+        Some(Cursor::Amount(amount, id)) => {
+            qb.push(" AND (u.amount, u.id) < (")
+                .push_bind(amount)
+                .push(", ")
+                .push_bind(id)
+                .push(")");
+        }
+        None => {}
     }
-    qb.push(" ORDER BY u.occurred_at DESC, u.id DESC LIMIT ");
+    push_order(&mut qb, sort);
+    qb.push(" LIMIT ");
     qb.push_bind(limit + 1);
 
     let rows = qb.build().fetch_all(pool.get_ref()).await?;
@@ -389,8 +436,10 @@ pub async fn list(
     let loans = loans_for(pool.get_ref(), rows).await?;
     let data: Vec<TransactionView> = rows.iter().map(|r| row_to_view(r, &loans)).collect();
     let next_cursor = if has_more {
-        data.last()
-            .map(|v| format!("{}:{}", v.occurred_at.timestamp_millis(), v.id))
+        data.last().map(|v| match sort {
+            SortBy::Date => format!("{}:{}", v.occurred_at.timestamp_millis(), v.id),
+            SortBy::Amount => format!("amt:{}:{}", v.amount, v.id),
+        })
     } else {
         None
     };
@@ -585,9 +634,11 @@ pub async fn export(
     use rust_xlsxwriter::{Format, Workbook};
 
     let f = query.into_inner();
+    let sort = f.sort_by()?;
     let mut qb: QueryBuilder<Postgres> = QueryBuilder::new("SELECT u.* FROM ");
     push_union(&mut qb, &f);
-    qb.push(" ORDER BY u.occurred_at DESC, u.id DESC LIMIT 10000");
+    push_order(&mut qb, sort);
+    qb.push(" LIMIT 10000");
     let rows = qb.build().fetch_all(pool.get_ref()).await?;
     let loans = loans_for(pool.get_ref(), &rows).await?;
 

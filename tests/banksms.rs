@@ -800,3 +800,87 @@ async fn split_lifecycle_keeps_the_money_exact() {
         "a settled loan blocks the unsplit"
     );
 }
+
+#[actix_web::test]
+async fn ledger_sorts_by_amount_across_pages() {
+    use actix_web::{test, web, App};
+
+    support::init();
+    let pool = support::fresh_db("apex_bsms_sort_amount").await;
+    apex::boot::run_banksms_migrations(&pool).await.unwrap();
+
+    let app = test::init_service(
+        App::new()
+            .app_data(web::Data::new(pool.clone()))
+            .configure(apex::api::configure),
+    )
+    .await;
+    let auth = ("Authorization", format!("Bearer {}", support::admin_token(3)));
+
+    // Amounts deliberately out of date order, with a tie to exercise the id
+    // tiebreak in the keyset.
+    for (amount, at) in [
+        ("150", "2026-08-01T10:00:00Z"),
+        ("9000.5", "2026-08-02T10:00:00Z"),
+        ("42", "2026-08-03T10:00:00Z"),
+        ("1200", "2026-08-04T10:00:00Z"),
+        ("1200", "2026-08-05T10:00:00Z"),
+    ] {
+        let req = test::TestRequest::post()
+            .uri("/api/v1/transactions")
+            .insert_header(auth.clone())
+            .set_json(serde_json::json!({
+                "direction": "out", "amount": amount, "occurred_at": at,
+            }))
+            .to_request();
+        assert!(test::call_service(&app, req).await.status().is_success());
+    }
+
+    // Page through two at a time; the cursor must carry the amount order.
+    let mut amounts: Vec<f64> = Vec::new();
+    let mut ids: Vec<i64> = Vec::new();
+    let mut cursor: Option<String> = None;
+    loop {
+        let mut uri = "/api/v1/transactions?direction=out&sort=amount&limit=2".to_string();
+        if let Some(c) = &cursor {
+            uri.push_str(&format!("&cursor={}", urlencoding_min(c)));
+        }
+        let req = test::TestRequest::get()
+            .uri(&uri)
+            .insert_header(auth.clone())
+            .to_request();
+        let page: serde_json::Value = test::call_and_read_body_json(&app, req).await;
+        for row in page["data"].as_array().unwrap() {
+            amounts.push(row["amount"].as_str().unwrap().parse().unwrap());
+            ids.push(row["id"].as_i64().unwrap());
+        }
+        match page["next_cursor"].as_str() {
+            Some(c) => cursor = Some(c.to_string()),
+            None => break,
+        }
+    }
+    assert_eq!(amounts, vec![9000.5, 1200.0, 1200.0, 150.0, 42.0]);
+    let mut unique = ids.clone();
+    unique.sort();
+    unique.dedup();
+    assert_eq!(unique.len(), 5, "no row repeats or goes missing across pages");
+
+    // A date cursor replayed under the amount sort is refused, not misread.
+    let req = test::TestRequest::get()
+        .uri("/api/v1/transactions?sort=amount&cursor=1754042400000:1")
+        .insert_header(auth.clone())
+        .to_request();
+    assert_eq!(test::call_service(&app, req).await.status(), 400);
+
+    // Unknown sort keys are refused.
+    let req = test::TestRequest::get()
+        .uri("/api/v1/transactions?sort=bogus")
+        .insert_header(auth.clone())
+        .to_request();
+    assert_eq!(test::call_service(&app, req).await.status(), 400);
+}
+
+/// Cursors are `amt:<decimal>:<id>` — only ':' and '.' need care in a query.
+fn urlencoding_min(s: &str) -> String {
+    s.replace(':', "%3A")
+}
