@@ -865,6 +865,31 @@ async fn ledger_sorts_by_amount_across_pages() {
     unique.dedup();
     assert_eq!(unique.len(), 5, "no row repeats or goes missing across pages");
 
+    // The work queue: once a row has a category it leaves the uncategorized
+    // filter, on the list and on the statistics alike.
+    sqlx::query("UPDATE banksms.transactions SET category = 'Parts' WHERE amount = 9000.5")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let req = test::TestRequest::get()
+        .uri("/api/v1/transactions?direction=out&sort=amount&category=__uncategorized__")
+        .insert_header(auth.clone())
+        .to_request();
+    let page: serde_json::Value = test::call_and_read_body_json(&app, req).await;
+    let queue: Vec<f64> = page["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["amount"].as_str().unwrap().parse().unwrap())
+        .collect();
+    assert_eq!(queue, vec![1200.0, 1200.0, 150.0, 42.0]);
+    let req = test::TestRequest::get()
+        .uri("/api/v1/transactions/statistics?category=__uncategorized__")
+        .insert_header(auth.clone())
+        .to_request();
+    let stats: serde_json::Value = test::call_and_read_body_json(&app, req).await;
+    assert_eq!(stats["count"], 4);
+
     // A date cursor replayed under the amount sort is refused, not misread.
     let req = test::TestRequest::get()
         .uri("/api/v1/transactions?sort=amount&cursor=1754042400000:1")
