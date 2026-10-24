@@ -248,6 +248,13 @@ async fn main() -> std::io::Result<()> {
 
     let wa_for_app = ingest::WhatsAppClient::from_config();
 
+    // The advisor (src/advisor): routes only once its schema exists, i.e. after
+    // the migrations above; the digest schedule runs beside the server.
+    let advisor = apex::advisor::Advisor::from_env();
+    if !cutover_pending {
+        tokio::spawn(apex::advisor::digest::run_schedule(pool.clone(), advisor.clone()));
+    }
+
     HttpServer::new(move || {
         let cors = Cors::default()
             .allowed_methods(vec!["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"])
@@ -285,6 +292,7 @@ async fn main() -> std::io::Result<()> {
             .wrap(middleware::Logger::default())
             .wrap(middleware::Compress::default())
             .app_data(web::Data::new(wa_for_app.clone()))
+            .app_data(web::Data::new(advisor.clone()))
             .route("/health", web::get().to(health_check))
             .route("/healthz", web::get().to(api::health::healthz))
             .route("/readyz", web::get().to(api::health::readyz));
@@ -295,6 +303,7 @@ async fn main() -> std::io::Result<()> {
             app.configure(api::configure_cutover_pending)
         } else {
             app.configure(api::configure)
+                .configure(apex::advisor::handlers::configure)
         };
         app.configure(configure_routes)
     })
