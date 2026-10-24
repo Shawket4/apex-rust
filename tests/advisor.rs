@@ -285,9 +285,11 @@ async fn chat_without_a_key_says_so_and_search_falls_back_to_the_words() {
         .to_request();
     assert_eq!(test::call_service(&app, req).await.status(), 400);
 
+    // Search is open to any admin user (permission 1), like FalconGo's.
+    let viewer = support::token_with_permission(43, 1);
     let req = test::TestRequest::post()
         .uri("/api/v1/advisor/search")
-        .insert_header(("Authorization", format!("Bearer {admin}")))
+        .insert_header(("Authorization", format!("Bearer {viewer}")))
         .set_json(json!({ "query": "لحام" }))
         .to_request();
     let v: Value = test::call_and_read_body_json(&app, req).await;

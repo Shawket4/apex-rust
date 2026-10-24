@@ -1,4 +1,5 @@
-//! `/api/v1/advisor/*` — every route permission 4 (the owner's rule).
+//! `/api/v1/advisor/*` — permission 4 (the owner's rule), except the
+//! read-only search, which any admin user may run.
 //!
 //! The chat answers as server-sent events: a turn can take a minute (several
 //! tool calls), longer than a proxy will hold a silent request, so the stream
@@ -39,7 +40,9 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
             .route("/suggestions", web::get().to(list_suggestions).wrap(admin()))
             .route("/suggestions/{id}/approve", web::post().to(approve).wrap(admin()))
             .route("/suggestions/{id}/reject", web::post().to(reject).wrap(admin()))
-            .route("/search", web::post().to(search_history).wrap(admin()))
+            // Read-only, like FalconGo's own invoice search (Verify(1)): any
+            // admin user may search; only the chat and approvals need 4.
+            .route("/search", web::post().to(search_history).wrap(JwtAuth { required_permission: Some(1) }))
             .route("/digests", web::get().to(list_digests).wrap(admin()))
             .route("/digests/run", web::post().to(run_digest).wrap(admin())),
     );
@@ -338,7 +341,10 @@ async fn search_history(
     req: HttpRequest,
     body: web::Json<SearchBody>,
 ) -> AppResult<HttpResponse> {
-    caller(&req)?;
+    req.extensions()
+        .get::<AuthContext>()
+        .filter(|c| c.has_at_least(1))
+        .ok_or(AppError::Forbidden)?;
     let query = body.query.trim();
     if query.is_empty() {
         return Err(AppError::BadRequest("query is required".into()));
