@@ -222,7 +222,7 @@ mod tests {
     #[test]
     fn arabic_survives_in_the_body() {
         let body = sample().body();
-        assert!(body.contains("محمد"));
+        assert!(body.contains("نادر"));
         assert!(body.contains("EGP 1500.00"));
         assert!(body.contains("9001-01"));
         assert!(body.contains("eb0bf61f"));
