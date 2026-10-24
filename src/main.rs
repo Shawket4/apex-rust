@@ -165,6 +165,36 @@ async fn main() -> std::io::Result<()> {
                 }
             }
         }
+        // `apex-rust import-loans FILE.json`: the loan sheet, replacing the
+        // schedule.
+        Some("import-loans") => {
+            let Some(path) = std::env::args().nth(2) else {
+                error!("usage: apex-rust import-loans FILE.json");
+                std::process::exit(2);
+            };
+            let parsed = std::fs::read_to_string(&path)
+                .map_err(|e| e.to_string())
+                .and_then(|s| {
+                    serde_json::from_str::<apex::classify::LoanFile>(&s).map_err(|e| e.to_string())
+                });
+            let file = match parsed {
+                Ok(f) => f,
+                Err(e) => {
+                    error!("{path}: {e}");
+                    std::process::exit(2);
+                }
+            };
+            match apex::classify::import_loans(&pool, &file, "import").await {
+                Ok(n) => {
+                    info!("imported {n} loan(s)");
+                    return Ok(());
+                }
+                Err(e) => {
+                    error!("import failed, nothing was changed: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
         _ => {}
     }
 

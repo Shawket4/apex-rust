@@ -60,6 +60,8 @@ pub struct Payee {
     pub driver_id: Option<i64>,
     pub employee_id: Option<i64>,
     pub notes: Option<String>,
+    /// Transfers to them are checked against the loan sheet.
+    pub pays_loans: bool,
     /// Every spelling the banks use for them.
     pub spellings: Vec<String>,
 }
@@ -68,7 +70,7 @@ pub struct Payee {
 pub async fn list_payees(pool: web::Data<PgPool>) -> AppResult<HttpResponse> {
     let rows = sqlx::query(
         "SELECT p.id, p.name, p.kind, p.category, p.consistency, p.driver_id, p.employee_id,
-                p.notes,
+                p.notes, p.pays_loans,
                 COALESCE(array_agg(a.spelling ORDER BY a.spelling)
                          FILTER (WHERE a.spelling IS NOT NULL), '{}') AS spellings
          FROM banksms.payees p
@@ -88,6 +90,7 @@ pub async fn list_payees(pool: web::Data<PgPool>) -> AppResult<HttpResponse> {
             driver_id: r.get("driver_id"),
             employee_id: r.get("employee_id"),
             notes: r.get("notes"),
+            pays_loans: r.get("pays_loans"),
             spellings: r.get("spellings"),
         })
         .collect();

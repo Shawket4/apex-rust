@@ -1,7 +1,7 @@
 //! Everything the rules look at, loaded in one go. A few thousand rows: the
 //! rules run in memory, and the database only sees the result.
 
-use chrono::{DateTime, NaiveDate, Utc};
+use chrono::{DateTime, Datelike, Duration, NaiveDate, Utc};
 use chrono_tz::Africa::Cairo;
 use rust_decimal::Decimal;
 use sqlx::{PgPool, Row};
@@ -88,6 +88,9 @@ pub struct Payee {
     pub employee_id: Option<i64>,
     /// When the label was last set.
     pub labelled_at: Option<DateTime<Utc>>,
+    /// Transfers to them are often loan installments paid on the company's
+    /// behalf.
+    pub pays_loans: bool,
 }
 
 impl Payee {
@@ -95,6 +98,47 @@ impl Payee {
     /// of the business.
     pub fn is_own(&self) -> bool {
         matches!(self.kind.as_str(), "owner" | "family")
+    }
+}
+
+/// A bank loan from the loan sheet: a fixed installment every month.
+#[derive(Debug, Clone)]
+pub struct BankLoan {
+    pub id: i64,
+    pub name: String,
+    pub installment: Decimal,
+    pub due_day: u32,
+    /// None: running since before the ledger begins.
+    pub first_due: Option<NaiveDate>,
+    pub last_due: NaiveDate,
+    /// The one payee it is always paid through, when there is one.
+    pub payee_id: Option<i64>,
+}
+
+impl BankLoan {
+    /// The installments that fall due within `days` of `date`.
+    pub fn due_near(&self, date: NaiveDate, days: i64) -> Vec<NaiveDate> {
+        let (from, to) = (date - Duration::days(days), date + Duration::days(days));
+        let mut out = Vec::new();
+        let (mut y, mut m) = (from.year(), from.month());
+        while (y, m) <= (to.year(), to.month()) {
+            if let Some(due) = self.due_in(y, m).filter(|d| (from..=to).contains(d)) {
+                out.push(due);
+            }
+            (y, m) = if m == 12 { (y + 1, 1) } else { (y, m + 1) };
+        }
+        out
+    }
+
+    /// The installment due in a month, if the loan was running then. A due
+    /// day past the end of a short month is its last day.
+    fn due_in(&self, year: i32, month: u32) -> Option<NaiveDate> {
+        let last = (28..=31)
+            .rev()
+            .find(|d| NaiveDate::from_ymd_opt(year, month, *d).is_some())?;
+        let due = NaiveDate::from_ymd_opt(year, month, self.due_day.min(last))?;
+        let started = self.first_due.is_none_or(|f| due >= f);
+        (started && due <= self.last_due).then_some(due)
     }
 }
 
@@ -141,6 +185,8 @@ pub struct Model {
     pub employees: Vec<Person>,
     /// Loans entered in FalconGo that no bank payment represents yet.
     pub open_loans: Vec<Loan>,
+    /// The company's bank loans, from the loan sheet.
+    pub bank_loans: Vec<BankLoan>,
     /// By key, lower-cased (keys are matched case-insensitively everywhere).
     pub categories: HashMap<String, CategoryInfo>,
     /// Accounts that have sent PetroApp top-ups (from suppressed messages).
@@ -223,7 +269,8 @@ impl Model {
         }
 
         for r in sqlx::query(
-            "SELECT id, name, kind, category, consistency, driver_id, employee_id, updated_at
+            "SELECT id, name, kind, category, consistency, driver_id, employee_id, updated_at,
+                    pays_loans
              FROM banksms.payees",
         )
         .fetch_all(pool)
@@ -243,8 +290,26 @@ impl Model {
                     driver_id: r.get("driver_id"),
                     employee_id: r.get("employee_id"),
                     labelled_at: r.get("updated_at"),
+                    pays_loans: r.get("pays_loans"),
                 },
             );
+        }
+        for r in sqlx::query(
+            "SELECT id, name, installment, due_day, first_due, last_due, payee_id
+             FROM banksms.bank_loans ORDER BY id",
+        )
+        .fetch_all(pool)
+        .await?
+        {
+            m.bank_loans.push(BankLoan {
+                id: r.get("id"),
+                name: r.get("name"),
+                installment: r.get("installment"),
+                due_day: r.get::<i16, _>("due_day") as u32,
+                first_due: r.get("first_due"),
+                last_due: r.get("last_due"),
+                payee_id: r.get("payee_id"),
+            });
         }
         for r in sqlx::query("SELECT key, payee_id FROM banksms.payee_aliases")
             .fetch_all(pool)
@@ -377,5 +442,52 @@ impl Model {
         }
 
         Ok(m)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::str::FromStr;
+
+    fn d(s: &str) -> NaiveDate {
+        NaiveDate::parse_from_str(s, "%Y-%m-%d").unwrap()
+    }
+
+    fn loan(due_day: u32, first: Option<&str>, last: &str) -> BankLoan {
+        BankLoan {
+            id: 1,
+            name: "Bank".into(),
+            installment: Decimal::from_str("1000").unwrap(),
+            due_day,
+            first_due: first.map(d),
+            last_due: d(last),
+            payee_id: None,
+        }
+    }
+
+    #[test]
+    fn installments_fall_due_monthly_between_the_first_and_the_last() {
+        let l = loan(1, None, "2027-01-01");
+        // A window across the turn of the month.
+        assert_eq!(l.due_near(d("2026-08-28"), 7), vec![d("2026-09-01")]);
+        assert_eq!(l.due_near(d("2026-09-09"), 7), vec![]);
+        // Repaid: nothing due after the last installment.
+        assert_eq!(l.due_near(d("2027-02-01"), 7), vec![]);
+        assert_eq!(l.due_near(d("2027-01-03"), 7), vec![d("2027-01-01")]);
+        // Not started yet.
+        let l = loan(15, Some("2026-05-15"), "2027-02-15");
+        assert_eq!(l.due_near(d("2026-04-14"), 7), vec![]);
+        assert_eq!(l.due_near(d("2026-05-10"), 7), vec![d("2026-05-15")]);
+        // The 31st in a short month is its last day.
+        let l = loan(31, None, "2028-12-31");
+        assert_eq!(l.due_near(d("2027-02-27"), 3), vec![d("2027-02-28")]);
+        assert_eq!(l.due_near(d("2028-02-27"), 3), vec![d("2028-02-29")]);
+        // A wide window holds two installments.
+        let l = loan(1, None, "2027-12-01");
+        assert_eq!(
+            l.due_near(d("2026-09-15"), 20),
+            vec![d("2026-09-01"), d("2026-10-01")]
+        );
     }
 }

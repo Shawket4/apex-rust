@@ -332,12 +332,17 @@ pub struct PayeeIn {
     pub employee_id: Option<i64>,
     #[serde(default)]
     pub notes: Option<String>,
+    /// Transfers to them are often loan installments paid on the company's
+    /// behalf: check each against the loan sheet.
+    #[serde(default)]
+    pub pays_loans: bool,
     pub aliases: Vec<String>,
 }
 
 /// Load payees (`apex-rust import-payees FILE`). A payee whose spelling is
 /// already known is updated in place, so the file can be re-imported after
-/// more labelling. All or nothing.
+/// more labelling; one the file leaves as it was keeps its label date, so
+/// what people decided since still counts as since. All or nothing.
 pub async fn import_payees(
     pool: &PgPool,
     file: &PayeeFile,
@@ -384,8 +389,11 @@ pub async fn import_payees(
             Some(id) => {
                 sqlx::query(
                     "UPDATE banksms.payees SET name = $1, kind = $2, category = $3, consistency = $4,
-                         driver_id = $5, employee_id = $6, notes = $7, updated_at = now()
-                     WHERE id = $8",
+                         driver_id = $5, employee_id = $6, notes = $7, pays_loans = $8,
+                         updated_at = now()
+                     WHERE id = $9
+                       AND (name, kind, category, consistency, driver_id, employee_id, notes, pays_loans)
+                           IS DISTINCT FROM ($1, $2, $3, $4, $5, $6, $7, $8)",
                 )
                 .bind(&p.name)
                 .bind(&p.kind)
@@ -394,6 +402,7 @@ pub async fn import_payees(
                 .bind(p.driver_id)
                 .bind(p.employee_id)
                 .bind(&p.notes)
+                .bind(p.pays_loans)
                 .bind(id)
                 .execute(&mut *tx)
                 .await?;
@@ -402,8 +411,9 @@ pub async fn import_payees(
             None => {
                 sqlx::query_scalar(
                     "INSERT INTO banksms.payees
-                         (name, kind, category, consistency, driver_id, employee_id, notes, created_by)
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id",
+                         (name, kind, category, consistency, driver_id, employee_id, notes, pays_loans,
+                          created_by)
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING id",
                 )
                 .bind(&p.name)
                 .bind(&p.kind)
@@ -412,6 +422,7 @@ pub async fn import_payees(
                 .bind(p.driver_id)
                 .bind(p.employee_id)
                 .bind(&p.notes)
+                .bind(p.pays_loans)
                 .bind(actor)
                 .fetch_one(&mut *tx)
                 .await?
@@ -440,6 +451,95 @@ pub async fn import_payees(
     }
     tx.commit().await?;
     Ok((payees, aliases))
+}
+
+/* ---------------------------- bank loans --------------------------------- */
+
+/// The import file: the loan sheet, one entry per loan.
+#[derive(Debug, Deserialize)]
+pub struct LoanFile {
+    pub loans: Vec<LoanIn>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct LoanIn {
+    pub lender: String,
+    /// Defaults to the lender.
+    #[serde(default)]
+    pub name: Option<String>,
+    pub installment: Decimal,
+    pub due_day: u32,
+    #[serde(default)]
+    pub first_due: Option<chrono::NaiveDate>,
+    pub last_due: chrono::NaiveDate,
+    /// The payee it is always paid through, by name or any spelling.
+    #[serde(default)]
+    pub paid_via: Option<String>,
+    #[serde(default)]
+    pub notes: Option<String>,
+}
+
+/// Load the loan sheet (`apex-rust import-loans FILE`). The file is the
+/// whole schedule: it replaces what was there. All or nothing.
+pub async fn import_loans(pool: &PgPool, file: &LoanFile, actor: &str) -> AppResult<usize> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("DELETE FROM banksms.bank_loans")
+        .execute(&mut *tx)
+        .await?;
+    for l in &file.loans {
+        let name = l
+            .name
+            .clone()
+            .filter(|n| !n.trim().is_empty())
+            .unwrap_or_else(|| l.lender.clone());
+        let bad = |m: String| AppError::BadRequest(format!("loan '{name}': {m}"));
+        if l.installment <= Decimal::ZERO {
+            return Err(bad("the installment must be more than zero".into()));
+        }
+        if !(1..=31).contains(&l.due_day) {
+            return Err(bad(format!(
+                "due_day {} is not a day of the month",
+                l.due_day
+            )));
+        }
+        if l.first_due.is_some_and(|f| f > l.last_due) {
+            return Err(bad("first_due is after last_due".into()));
+        }
+        let payee_id: Option<i64> = match l.paid_via.as_deref().filter(|v| !v.trim().is_empty()) {
+            None => None,
+            Some(via) => {
+                let found: Option<i64> = sqlx::query_scalar(
+                    "SELECT p.id FROM banksms.payees p
+                     WHERE lower(p.name) = lower($1)
+                        OR p.id = (SELECT payee_id FROM banksms.payee_aliases WHERE key = $2)
+                     ORDER BY p.id LIMIT 1",
+                )
+                .bind(via.trim())
+                .bind(fold::fold(via))
+                .fetch_optional(&mut *tx)
+                .await?;
+                Some(found.ok_or_else(|| bad(format!("no payee called '{via}'")))?)
+            }
+        };
+        sqlx::query(
+            "INSERT INTO banksms.bank_loans
+                 (lender, name, installment, due_day, first_due, last_due, payee_id, notes, created_by)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+        )
+        .bind(l.lender.trim())
+        .bind(name.trim())
+        .bind(l.installment)
+        .bind(l.due_day as i16)
+        .bind(l.first_due)
+        .bind(l.last_due)
+        .bind(payee_id)
+        .bind(&l.notes)
+        .bind(actor)
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await?;
+    Ok(file.loans.len())
 }
 
 /// For logs: a decision in one line.

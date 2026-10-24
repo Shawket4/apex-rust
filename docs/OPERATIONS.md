@@ -124,6 +124,7 @@ or more is written to the transaction; anything less is stored as a suggestion
 
 ```bash
 sudo ./apex-rust import-payees payees.json      # payee labels; re-importable
+sudo ./apex-rust import-loans loans.json        # the loan sheet; replaces the schedule
 sudo ./apex-rust classify --dry-run --verbose   # what it would do, one line each
 sudo ./apex-rust classify                       # every open transaction
 ```
@@ -138,6 +139,25 @@ sudo ./apex-rust classify                       # every open transaction
 `kind` is one of supplier, driver, employee, owner, family, bank, merchant,
 other; `driver_id`/`employee_id` name the person on the books. `always` lets
 the label apply on its own; `varies` only suggests (and fills in the person).
+Re-importing an unchanged payee keeps its label date, so what people decided
+since still counts.
+
+`"pays_loans": true` marks someone who pays loan installments on the
+company's behalf. Each transfer to them is checked against the loan sheet
+(`loans.json`, private too):
+
+```json
+{"loans": [{"lender": "Delta Bank", "name": "Delta car loan", "installment": "64000",
+            "due_day": 1, "last_due": "2028-01-01", "first_due": "2025-02-01",
+            "paid_via": "Delta loan account"}]}
+```
+
+`first_due` is optional (running since before the ledger); `paid_via` names
+the one payee a loan is always paid through, if there is one. A transfer that
+is exactly an installment due within a week of it is a Bank loan payment
+(written when it is 50,000 or more, asked below that); one that adds up to
+several installments due then is asked; anything else is judged by the label.
+Each installment is paid once.
 
 Categories in `report_group = 'excluded'` (internal transfers, PetroApp
 top-ups, reversed transfers, personal) stay in the ledger and out of every

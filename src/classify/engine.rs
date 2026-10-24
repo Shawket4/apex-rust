@@ -9,7 +9,8 @@
 //! 2. Advances already in FalconGo's loans list, matched to the payment that
 //!    paid them, so they count once.
 //! 3. One-row facts: cash withdrawals, the separate IPN fee, money in from
-//!    the owner.
+//!    the owner, a transfer to someone who pays the company's loans that is
+//!    an installment falling due.
 //! 4. What people have said: payee labels, then the categories they gave
 //!    earlier payments to the same name.
 //! 5. Weak hints, never applied: PetroApp-shaped transfers, merchant names,
@@ -17,7 +18,8 @@
 //!
 //! A decision at 95% or more is applied; anything less waits for review.
 
-use chrono::Duration;
+use chrono::{Duration, NaiveDate};
+use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -131,11 +133,12 @@ pub fn decide(model: &Model, targets: Option<&HashSet<i64>>) -> Vec<Decision> {
 
     // 3-5. One row at a time.
     let history = History::build(model);
+    let fits = loan_fits(model, &out);
     for t in model.txns.iter().filter(|t| wanted(t)) {
         if out.contains_key(&t.id) {
             continue;
         }
-        if let Some(d) = single(model, &history, t) {
+        if let Some(d) = single(model, &history, &fits, t) {
             out.insert(t.id, d);
         }
     }
@@ -282,6 +285,9 @@ fn refunds(model: &Model) -> Vec<Decision> {
 /// Money leaving one account and the same amount arriving in another within
 /// minutes. With the owner named on either side it is certain; between two
 /// unnamed accounts it is very likely but asked.
+///
+/// The arrival may have been removed from the ledger already (money in is
+/// reviewed and removed by hand): it still arrived, so it still pairs.
 fn internal_pairs(model: &Model, taken: &BTreeMap<i64, Decision>) -> Vec<(Decision, Decision)> {
     let is_refund = |t: &Txn| {
         t.template
@@ -292,7 +298,7 @@ fn internal_pairs(model: &Model, taken: &BTreeMap<i64, Decision>) -> Vec<(Decisi
     // Either side naming someone else (a supplier paid, a customer paying)
     // is ordinary business that happens to share an amount.
     let usable = |t: &Txn| {
-        t.open()
+        (t.open() || !t.is_out() && t.deleted && !t.split && !t.child)
             && !taken.contains_key(&t.id)
             && !is_refund(t)
             && (t.counterparty.is_none() || own(t).is_some())
@@ -550,6 +556,238 @@ fn kind_word(l: &Loan) -> &'static str {
     }
 }
 
+/* ------------------------- loan installments ----------------------------- */
+
+const BANK_LOAN: &str = "BankLoan";
+
+/// How far from its due date an installment is paid: early when it is taken
+/// to the branch ahead of time, late when the 1st falls on a weekend.
+const DUE_WINDOW_DAYS: i64 = 7;
+
+/// People also simply send round sums like 20,000 or 40,000, so a transfer
+/// matching an installment that small is a hint. From this size up it is the
+/// installment.
+const DISTINCT_INSTALLMENT: i64 = 50_000;
+
+/// What the loan sheet says about one transfer to someone who pays loans.
+#[derive(Debug, Clone, PartialEq)]
+pub enum LoanFit {
+    /// Exactly the installment of one loan falling due near it.
+    One { loan: i64, due: NaiveDate },
+    /// The sum of several installments falling due near it: the fewest that
+    /// add up (any such sum would do; which loans it paid is not known).
+    Several(Vec<(i64, NaiveDate)>),
+    /// Nothing falling due near it adds up to it.
+    Nothing,
+}
+
+/// Every transfer to a payee who pays loans, against the loan sheet, oldest
+/// first. An installment is paid once: transfers that are exactly one claim
+/// theirs, then the others are checked against what is left. Transfers
+/// already known to be something else (refunded, moved between accounts)
+/// pay nothing.
+fn loan_fits(model: &Model, decided: &BTreeMap<i64, Decision>) -> HashMap<i64, LoanFit> {
+    let mut fits = HashMap::new();
+    if model.bank_loans.is_empty() {
+        return fits; // no sheet: nothing to check against
+    }
+    let excluded = |c: Option<&str>| {
+        c.and_then(|c| model.category(c))
+            .is_some_and(|c| c.report_group == "excluded")
+    };
+    let payments: Vec<(&Txn, &Payee)> = model
+        .txns
+        .iter()
+        .filter(|t| t.live() && !t.child && t.is_out() && !excluded(t.category.as_deref()))
+        .filter(|t| !excluded(decided.get(&t.id).and_then(|d| d.category.as_deref())))
+        .filter_map(|t| model.payee_for(t).filter(|p| p.pays_loans).map(|p| (t, p)))
+        .collect();
+
+    // (index into bank_loans, due date) for each installment due near `t`
+    // that `p` may pay, largest first.
+    let due_near = |t: &Txn, p: &Payee| {
+        let mut v: Vec<(usize, NaiveDate)> = model
+            .bank_loans
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| l.payee_id.is_none_or(|id| id == p.id))
+            .flat_map(|(i, l)| {
+                l.due_near(t.cairo_date(), DUE_WINDOW_DAYS)
+                    .into_iter()
+                    .map(move |d| (i, d))
+            })
+            .collect();
+        v.sort_by(|a, b| {
+            let (la, lb) = (&model.bank_loans[a.0], &model.bank_loans[b.0]);
+            lb.installment
+                .cmp(&la.installment)
+                .then(la.id.cmp(&lb.id))
+                .then(a.1.cmp(&b.1))
+        });
+        v
+    };
+
+    let mut claimed: HashSet<(usize, NaiveDate)> = HashSet::new();
+    for &(t, p) in &payments {
+        let exact = due_near(t, p)
+            .into_iter()
+            .filter(|k| model.bank_loans[k.0].installment == t.amount && !claimed.contains(k))
+            .min_by_key(|(i, d)| {
+                (
+                    (*d - t.cairo_date()).num_days().abs(),
+                    model.bank_loans[*i].id,
+                )
+            });
+        if let Some(k) = exact {
+            claimed.insert(k);
+            fits.insert(
+                t.id,
+                LoanFit::One {
+                    loan: model.bank_loans[k.0].id,
+                    due: k.1,
+                },
+            );
+        }
+    }
+    for &(t, p) in &payments {
+        if fits.contains_key(&t.id) {
+            continue;
+        }
+        let pool: Vec<(usize, NaiveDate)> = due_near(t, p)
+            .into_iter()
+            .filter(|k| !claimed.contains(k))
+            .collect();
+        let amounts: Vec<Decimal> = pool
+            .iter()
+            .map(|(i, _)| model.bank_loans[*i].installment)
+            .collect();
+        let fit = match fewest_adding_up(&amounts, t.amount).filter(|s| s.len() >= 2) {
+            Some(parts) => {
+                let parts: Vec<(usize, NaiveDate)> = parts.into_iter().map(|j| pool[j]).collect();
+                claimed.extend(parts.iter().copied());
+                LoanFit::Several(
+                    parts
+                        .into_iter()
+                        .map(|(i, d)| (model.bank_loans[i].id, d))
+                        .collect(),
+                )
+            }
+            None => LoanFit::Nothing,
+        };
+        fits.insert(t.id, fit);
+    }
+    fits
+}
+
+/// The decision for a transfer the loan sheet explains; `None` when it
+/// doesn't (the payee's label decides then).
+fn installment(model: &Model, t: &Txn, p: &Payee, fit: &LoanFit) -> Option<Decision> {
+    let loan = |id: i64| model.bank_loans.iter().find(|l| l.id == id);
+    let day = |d: &NaiveDate| d.format("%-d %b").to_string();
+    match fit {
+        LoanFit::One { loan: id, due } => {
+            let l = loan(*id)?;
+            let (confidence, why) = if t.amount >= Decimal::from(DISTINCT_INSTALLMENT) {
+                (0.97, format!("and {} pays the company's loans.", p.name))
+            } else {
+                (
+                    0.85,
+                    format!(
+                        "but {} also gets sums this size for other things: check.",
+                        p.name
+                    ),
+                )
+            };
+            Some(
+                Decision::new(
+                    t,
+                    "loan_installment",
+                    confidence,
+                    format!(
+                        "{} is the {} installment due {}, {why}",
+                        money(t.amount),
+                        l.name,
+                        day(due)
+                    ),
+                )
+                .category(BANK_LOAN)
+                .payee(p),
+            )
+        }
+        LoanFit::Several(parts) => {
+            let named: Vec<String> = parts
+                .iter()
+                .filter_map(|(id, _)| loan(*id))
+                .take(3)
+                .map(|l| format!("{} {}", l.name, money(l.installment)))
+                .collect();
+            let more = match parts.len().saturating_sub(named.len()) {
+                0 => String::new(),
+                n => format!(" + {n} more"),
+            };
+            Some(
+                Decision::new(
+                    t,
+                    "loan_installment",
+                    0.80,
+                    format!(
+                        "{} adds up to {} installments due around {}: {}{more}. {} pays the company's loans; which ones this paid isn't certain.",
+                        money(t.amount),
+                        parts.len(),
+                        fmt_date(t),
+                        named.join(" + "),
+                        p.name
+                    ),
+                )
+                .category(BANK_LOAN)
+                .payee(p),
+            )
+        }
+        LoanFit::Nothing => None,
+    }
+}
+
+/// The fewest of `amounts` (each used at most once) that add up to `target`
+/// exactly, as indices; ties go to the subset found first, so earlier
+/// amounts win. `None` when no subset does, or the search is too big to be
+/// worth an answer.
+fn fewest_adding_up(amounts: &[Decimal], target: Decimal) -> Option<Vec<usize>> {
+    const MAX_STATES: usize = 250_000;
+    let cents = |d: Decimal| (d * Decimal::from(100)).round().to_i64();
+    let target = cents(target)?;
+    let items: Vec<i64> = amounts.iter().map(|a| cents(*a)).collect::<Option<_>>()?;
+    if target <= 0 || items.iter().sum::<i64>() < target {
+        return None;
+    }
+    // Reachable sum → the fewest items reaching it.
+    let mut best: BTreeMap<i64, Vec<usize>> = BTreeMap::from([(0, Vec::new())]);
+    for (i, &a) in items.iter().enumerate() {
+        if a <= 0 {
+            continue;
+        }
+        let grown: Vec<(i64, Vec<usize>)> = best
+            .range(..=target - a)
+            .map(|(s, set)| {
+                let mut set = set.clone();
+                set.push(i);
+                (s + a, set)
+            })
+            .collect();
+        for (s, set) in grown {
+            match best.get(&s) {
+                Some(have) if have.len() <= set.len() => {}
+                _ => {
+                    best.insert(s, set);
+                }
+            }
+        }
+        if best.len() > MAX_STATES {
+            return None;
+        }
+    }
+    best.remove(&target)
+}
+
 /* --------------------------- 3-5. one row ------------------------------- */
 
 /// What people have categorised before, per payee (or per spelling when no
@@ -592,27 +830,33 @@ impl History {
 
     /// The most common category (ties broken by name, for stability), how
     /// often, out of how many, and the person when every one of them had the
-    /// same.
+    /// same. Categories `skip` names are left out of both counts.
     fn top(
         &self,
         model: &Model,
         t: &Txn,
+        skip: &dyn Fn(&str) -> bool,
     ) -> Option<(String, u32, u32, Option<(Option<i64>, Option<i64>)>)> {
         let tally = self
             .by_name
             .get(&(History::name_of(model, t)?, t.is_out()))?;
-        let (cat, (k, parties)) = tally
-            .by_category
-            .iter()
-            .max_by(|a, b| a.1 .0.cmp(&b.1 .0).then_with(|| b.0.cmp(a.0)))?;
+        let kept = || tally.by_category.iter().filter(|(c, _)| !skip(c));
+        let n = kept().map(|(_, (k, _))| k).sum();
+        let (cat, (k, parties)) =
+            kept().max_by(|a, b| a.1 .0.cmp(&b.1 .0).then_with(|| b.0.cmp(a.0)))?;
         let party = (parties.len() == 1)
             .then(|| *parties.keys().next().unwrap())
             .filter(|(d, e)| d.is_some() || e.is_some());
-        Some((cat.clone(), *k, tally.n, party))
+        Some((cat.clone(), *k, n, party))
     }
 }
 
-fn single(model: &Model, history: &History, t: &Txn) -> Option<Decision> {
+fn single(
+    model: &Model,
+    history: &History,
+    fits: &HashMap<i64, LoanFit>,
+    t: &Txn,
+) -> Option<Decision> {
     let body = t.body.as_deref().unwrap_or("");
     let cp = t.counterparty.as_deref().unwrap_or("");
     let payee = model.payee_for(t);
@@ -685,13 +929,25 @@ fn single(model: &Model, history: &History, t: &Txn) -> Option<Decision> {
         );
     }
 
+    // Someone who pays the company's loans: the loan sheet says whether this
+    // was an installment falling due.
+    let fit = payee
+        .filter(|p| t.is_out() && p.pays_loans)
+        .and_then(|_| fits.get(&t.id));
+    if let (Some(p), Some(fit)) = (payee, fit) {
+        if let Some(d) = installment(model, t, p, fit) {
+            return Some(d);
+        }
+    }
+
     // A label says what payments TO someone are; money in from them is
     // another matter.
     if let Some(p) = payee.filter(|_| t.is_out()) {
-        return Some(from_payee(model, history, t, p));
+        let not_installment = matches!(fit, Some(LoanFit::Nothing));
+        return Some(from_payee(model, history, t, p, not_installment));
     }
 
-    if let Some((cat, k, n, party)) = history.top(model, t) {
+    if let Some((cat, k, n, party)) = history.top(model, t, &|_| false) {
         let p = succession(k, n);
         if p >= APPLY_AT || k * 10 >= n * 6 {
             let (d, e) = party.unwrap_or((None, None));
@@ -766,25 +1022,33 @@ fn single(model: &Model, history: &History, t: &Txn) -> Option<Decision> {
     None
 }
 
-fn from_payee(model: &Model, history: &History, t: &Txn, p: &Payee) -> Decision {
-    let top = history.top(model, t);
+/// What a payee's label (and what people chose since it) says. For someone
+/// who pays loans, a transfer the loan sheet has ruled out as an installment
+/// (`not_installment`) is judged by their other payments only.
+fn from_payee(
+    model: &Model,
+    history: &History,
+    t: &Txn,
+    p: &Payee,
+    not_installment: bool,
+) -> Decision {
+    let skip = |c: &str| not_installment && c.eq_ignore_ascii_case(BANK_LOAN);
+    let top = history.top(model, t, &skip);
     // People's later decisions outrank the label: one since the label that
     // disagrees with it takes the label's automatic say away. Earlier ones
     // don't — the label is the newer word (and often names a category that
     // did not exist yet, filed under Other meanwhile).
-    let since_label: Vec<&str> = match &p.category {
-        Some(_) => model
-            .txns
-            .iter()
-            .filter(|o| {
-                o.is_out() == t.is_out()
-                    && o.decided_at.zip(p.labelled_at).is_some_and(|(d, l)| d > l)
-                    && model.payee_for(o).is_some_and(|q| q.id == p.id)
-            })
-            .filter_map(|o| o.human_category())
-            .collect(),
-        None => Vec::new(),
-    };
+    let since_label: Vec<&str> = model
+        .txns
+        .iter()
+        .filter(|o| {
+            o.is_out() == t.is_out()
+                && o.decided_at.zip(p.labelled_at).is_some_and(|(d, l)| d > l)
+                && model.payee_for(o).is_some_and(|q| q.id == p.id)
+        })
+        .filter_map(|o| o.human_category())
+        .filter(|c| !skip(c))
+        .collect();
     let contrary = p.category.as_deref().and_then(|c| {
         since_label
             .iter()
@@ -817,22 +1081,43 @@ fn from_payee(model: &Model, history: &History, t: &Txn, p: &Payee) -> Decision 
         )
         .category(cat),
         (cat, _, _) => {
-            let (cat, why) = match (&top, cat) {
-                (Some((h, k, n, _)), _) if *n >= 2 => (
-                    Some(h.clone()),
-                    format!("{k} of {n} earlier ones were {}", label_of(model, h)),
+            // What to offer: what people have chosen since the label, then
+            // the label itself. Choices from before the label only speak for
+            // a label that names no category.
+            let recent = most_common(&since_label);
+            let (cat, why) = match (recent, cat, &top) {
+                (Some((h, k)), _, _) if since_label.len() >= 2 => (
+                    Some(h.to_string()),
+                    format!(
+                        "{k} of {} since the label were {}",
+                        since_label.len(),
+                        label_of(model, h)
+                    ),
                 ),
-                (_, Some(c)) => (
+                (_, Some(c), _) => (
                     Some(c.clone()),
                     format!("usually {} (label), but it varies", label_of(model, c)),
                 ),
+                (_, None, Some((h, k, n, _))) if *n >= 2 => (
+                    Some(h.clone()),
+                    format!("{k} of {n} earlier ones were {}", label_of(model, h)),
+                ),
                 _ => (None, "no usual category".to_string()),
+            };
+            let not_loan = if not_installment {
+                format!(
+                    " {} is no loan installment due around {}.",
+                    money(t.amount),
+                    fmt_date(t)
+                )
+            } else {
+                String::new()
             };
             let mut d = Decision::new(
                 t,
                 "payee",
                 if p.always { 0.80 } else { 0.75 },
-                format!("{}: {why}.", p.name),
+                format!("{}: {why}.{not_loan}", p.name),
             );
             d.category = cat;
             d
@@ -844,6 +1129,18 @@ fn from_payee(model: &Model, history: &History, t: &Txn, p: &Payee) -> Decision 
         d.fill_party = true;
     }
     d
+}
+
+/// The most frequent entry and its count; ties go to the first in name order.
+fn most_common<'a>(xs: &[&'a str]) -> Option<(&'a str, usize)> {
+    let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
+    for x in xs {
+        *counts.entry(*x).or_default() += 1;
+    }
+    counts.into_iter().fold(None, |best, (k, n)| match best {
+        Some((_, m)) if m >= n => best,
+        _ => Some((k, n)),
+    })
 }
 
 fn atm_word() -> &'static regex::Regex {
@@ -936,7 +1233,7 @@ fn relative(minutes: i64) -> String {
 mod tests {
     use super::*;
     use crate::classify::fold::fold;
-    use crate::classify::model::{CategoryInfo, Person};
+    use crate::classify::model::{BankLoan, CategoryInfo, Person};
     use chrono::{NaiveDateTime, TimeZone, Utc};
     use chrono_tz::Africa::Cairo;
     use std::str::FromStr;
@@ -1022,6 +1319,7 @@ mod tests {
             ("Utilities", None, "none", "operating"),
             ("CashWithdrawal", None, "none", "operating"),
             ("BankFees", None, "none", "operating"),
+            ("BankLoan", None, "none", "capital"),
             ("InternalTransfer", None, "none", "excluded"),
             ("PetroApp", None, "none", "excluded"),
             ("Reversed", None, "none", "excluded"),
@@ -1075,10 +1373,25 @@ mod tests {
                 driver_id: driver,
                 employee_id: None,
                 labelled_at: Some(at("2026-10-24 10:00")),
+                pays_loans: false,
             },
         );
         for s in spellings {
             m.aliases.insert(fold(s), id);
+        }
+    }
+
+    /// A bank loan on the sheet: `installment` on `due_day`, through
+    /// `last_due`.
+    fn bank_loan(id: i64, name: &str, installment: &str, due_day: u32, last_due: &str) -> BankLoan {
+        BankLoan {
+            id,
+            name: name.into(),
+            installment: Decimal::from_str(installment).unwrap(),
+            due_day,
+            first_due: None,
+            last_due: chrono::NaiveDate::parse_from_str(last_due, "%Y-%m-%d").unwrap(),
+            payee_id: None,
         }
     }
 
@@ -1375,6 +1688,220 @@ mod tests {
         let d = by_id(&decide(&m, None), 1).clone();
         assert_eq!((d.category.as_deref(), d.apply), (Some("Tires"), false));
         assert!(d.reason.contains("Parts"), "{}", d.reason);
+    }
+
+    #[test]
+    fn choices_from_before_the_label_do_not_outrank_it() {
+        let mut m = model(vec![
+            txn(1, "out", "90000", "2026-10-25 12:00").to("family acct")
+        ]);
+        payee(
+            &mut m,
+            1,
+            "Samira Adel",
+            "family",
+            Some("Tires"),
+            false,
+            None,
+            &["family acct"],
+        );
+        for (id, when) in [(10, "2026-10-09 22:00"), (11, "2026-10-09 22:10")] {
+            let mut t = txn(id, "out", "50000", "2026-10-01 12:00")
+                .to("family acct")
+                .cat("Other");
+            t.decided_at = Some(at(when));
+            m.txns.push(t);
+        }
+        let d = by_id(&decide(&m, None), 1).clone();
+        assert_eq!(
+            (d.category.as_deref(), d.apply),
+            (Some("Tires"), false),
+            "{}",
+            d.reason
+        );
+
+        // Two choices since the label do speak.
+        for id in [12, 13] {
+            let mut t = txn(id, "out", "50000", "2026-10-25 09:00")
+                .to("family acct")
+                .cat("Other");
+            t.decided_at = Some(at("2026-10-25 10:00"));
+            m.txns.push(t);
+        }
+        let d = by_id(&decide(&m, None), 1).clone();
+        assert_eq!(d.category.as_deref(), Some("Other"), "{}", d.reason);
+    }
+
+    /// A relative who pays the company's loans at the branch, and the sheet.
+    fn loan_payer(txns: Vec<Txn>) -> Model {
+        let mut m = model(txns);
+        payee(
+            &mut m,
+            1,
+            "Samira Adel",
+            "family",
+            Some("InternalTransfer"),
+            false,
+            None,
+            &["samira", "سميرة عادل"],
+        );
+        m.payees.get_mut(&1).unwrap().pays_loans = true;
+        payee(
+            &mut m,
+            2,
+            "Loan account",
+            "bank",
+            Some("BankLoan"),
+            true,
+            None,
+            &["loanacct"],
+        );
+        let mut via_account = bank_loan(5, "Bank E", "80000", 1, "2029-01-01");
+        via_account.payee_id = Some(2);
+        m.bank_loans = vec![
+            bank_loan(1, "Bank A", "120000", 1, "2027-09-01"),
+            bank_loan(2, "Bank B", "64000", 1, "2028-01-01"),
+            bank_loan(3, "Bank C", "31000", 3, "2028-01-03"),
+            bank_loan(4, "Bank D", "22000", 1, "2027-01-01"),
+            via_account,
+            bank_loan(6, "Bank F", "90000", 1, "2026-06-01"), // repaid in June
+        ];
+        m
+    }
+
+    #[test]
+    fn an_installment_falling_due_is_a_loan_payment() {
+        let ds = decide(
+            &loan_payer(vec![
+                txn(1, "out", "120000", "2026-09-01 11:15").to("samira"),
+                // Bank A's September installment is taken: a second
+                // 120,000 is not it again, and nothing else adds up to it.
+                txn(2, "out", "120000", "2026-09-02 10:00").to("samira"),
+                // Bank B + Bank C, both due in the first days of September.
+                txn(3, "out", "95000", "2026-09-01 11:25").to("samira"),
+                // Small, mid-month: savings, as the label says.
+                txn(4, "out", "12500", "2026-09-09 09:00").to("samira"),
+                // Bank D's, but people send 22,000 for other things too.
+                txn(5, "out", "22000", "2026-10-02 15:30").to("samira"),
+                // Bank E is only ever paid through its own account, and
+                // Bank F was repaid in June.
+                txn(6, "out", "80000", "2026-10-01 12:00").to("samira"),
+                txn(7, "out", "90000", "2026-09-01 12:00").to("سميرة عادل"),
+            ]),
+            None,
+        );
+        let got = |id| {
+            let d = by_id(&ds, id);
+            (d.rule, d.category.as_deref(), d.apply)
+        };
+        assert_eq!(got(1), ("loan_installment", Some("BankLoan"), true));
+        assert!(
+            by_id(&ds, 1).reason.contains("Bank A"),
+            "{}",
+            by_id(&ds, 1).reason
+        );
+        assert_eq!(got(2), ("payee", Some("InternalTransfer"), false));
+        assert_eq!(got(3), ("loan_installment", Some("BankLoan"), false));
+        assert!(
+            by_id(&ds, 3).reason.contains("2 installments"),
+            "{}",
+            by_id(&ds, 3).reason
+        );
+        assert_eq!(got(4), ("payee", Some("InternalTransfer"), false));
+        assert!(
+            by_id(&ds, 4).reason.contains("no loan installment"),
+            "{}",
+            by_id(&ds, 4).reason
+        );
+        assert_eq!(got(5), ("loan_installment", Some("BankLoan"), false));
+        assert_eq!(got(6), ("payee", Some("InternalTransfer"), false));
+        assert_eq!(got(7), ("payee", Some("InternalTransfer"), false));
+    }
+
+    #[test]
+    fn loan_payments_people_accepted_do_not_make_savings_look_like_loans() {
+        let mut m = loan_payer(vec![txn(1, "out", "12500", "2026-11-09 09:00").to("samira")]);
+        // Since the label, people filed two of Samira's transfers as loan
+        // payments.
+        for (id, day) in [(10, "2026-10-01 12:00"), (11, "2026-10-02 12:00")] {
+            let mut t = txn(id, "out", "120000", day).to("samira").cat("BankLoan");
+            t.decided_at = Some(at("2026-10-25 09:00"));
+            m.txns.push(t);
+        }
+        let d = by_id(&decide(&m, None), 1).clone();
+        assert_eq!(
+            (d.rule, d.category.as_deref()),
+            ("payee", Some("InternalTransfer")),
+            "{}",
+            d.reason
+        );
+    }
+
+    #[test]
+    fn without_a_loan_sheet_the_label_decides_alone() {
+        let mut m = loan_payer(vec![
+            txn(1, "out", "120000", "2026-09-01 11:15").to("samira")
+        ]);
+        m.bank_loans.clear();
+        let d = by_id(&decide(&m, None), 1).clone();
+        assert_eq!(
+            (d.rule, d.category.as_deref()),
+            ("payee", Some("InternalTransfer"))
+        );
+        assert!(!d.reason.contains("installment"), "{}", d.reason);
+    }
+
+    #[test]
+    fn money_passing_through_family_is_moved_not_spent() {
+        // Out of one account to Samira, back from her into another minutes
+        // later. The arrival was reviewed and removed from the ledger.
+        let mut back = txn(2, "in", "184000", "2026-08-27 16:14")
+            .acct("5555")
+            .to("سميرة عادل");
+        back.deleted = true;
+        let ds = decide(
+            &loan_payer(vec![
+                txn(1, "out", "184000", "2026-08-27 16:10")
+                    .acct("1111")
+                    .to("samira"),
+                back,
+            ]),
+            None,
+        );
+        assert_eq!(ds.len(), 1, "{ds:#?}");
+        let d = by_id(&ds, 1);
+        assert_eq!(
+            (d.rule, d.category.as_deref(), d.apply, d.pair_id),
+            ("internal_pair", Some("InternalTransfer"), true, Some(2))
+        );
+    }
+
+    #[test]
+    fn the_fewest_installments_that_add_up() {
+        let d = |v: &[i64]| v.iter().map(|x| Decimal::from(*x)).collect::<Vec<_>>();
+        let amounts = d(&[50, 40, 30, 20, 10]);
+        let pick = fewest_adding_up(&amounts, Decimal::from(60)).unwrap();
+        assert_eq!(pick.len(), 2);
+        assert_eq!(
+            pick.iter().map(|&i| amounts[i]).sum::<Decimal>(),
+            Decimal::from(60)
+        );
+        assert_eq!(
+            fewest_adding_up(&amounts, Decimal::from(150))
+                .unwrap()
+                .len(),
+            5
+        );
+        assert_eq!(fewest_adding_up(&amounts, Decimal::from(55)), None);
+        assert_eq!(fewest_adding_up(&amounts, Decimal::from(151)), None);
+        let odd = vec![
+            Decimal::from_str("17430").unwrap(),
+            Decimal::from_str("26110.50").unwrap(),
+        ];
+        assert_eq!(
+            fewest_adding_up(&odd, Decimal::from_str("43540.50").unwrap()),
+            Some(vec![0, 1])
+        );
     }
 
     #[test]

@@ -497,3 +497,134 @@ async fn classifier_end_to_end() {
         .unwrap();
     assert_eq!(owner["spellings"].as_array().unwrap().len(), 2);
 }
+
+/// The loan sheet: imported whole (a bad file changes nothing), and a
+/// transfer to the relative who pays the loans judged against it.
+#[actix_web::test]
+async fn loan_sheet_end_to_end() {
+    support::init();
+    let pool = support::fresh_db("apex_classifier_loans").await;
+    apex::boot::run_banksms_migrations(&pool).await.unwrap();
+    sqlx::raw_sql(
+        r#"
+        INSERT INTO banksms.raw_messages (id, wa_message_id, chat_jid, wa_timestamp, body, status, template) VALUES
+         (1, 'L1', 'x', '2026-09-01 08:15Z', 'mock', 'matched', 'arabic_ipn'),
+         (2, 'L2', 'x', '2026-09-01 08:25Z', 'mock', 'matched', 'arabic_ipn'),
+         (3, 'L3', 'x', '2026-09-09 07:30Z', 'mock', 'matched', 'arabic_ipn');
+        INSERT INTO banksms.transactions
+          (id, source, raw_message_id, direction, amount, occurred_at, account, counterparty, reference, created_by) VALUES
+         (1, 'whatsapp', 1, 'out', 120000, '2026-09-01 08:15Z', '2222', 'samira', 'FTL1', 'parser'),
+         (2, 'whatsapp', 2, 'out', 95000, '2026-09-01 08:25Z', '2222', 'samira', 'FTL2', 'parser'),
+         (3, 'whatsapp', 3, 'out', 12500, '2026-09-09 07:30Z', '2222', 'samira', 'FTL3', 'parser');
+        "#,
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let payees: apex::classify::PayeeFile = serde_json::from_str(
+        r#"{"payees": [
+          {"name": "Samira Adel", "kind": "family", "category": "InternalTransfer", "consistency": "varies",
+           "pays_loans": true, "aliases": ["samira"]},
+          {"name": "Loan account", "kind": "bank", "category": "BankLoan", "consistency": "always",
+           "aliases": ["loanacct"]}
+        ]}"#,
+    )
+    .unwrap();
+    apex::classify::import_payees(&pool, &payees, "test")
+        .await
+        .unwrap();
+    let labelled = || async {
+        sqlx::query_scalar::<_, chrono::DateTime<chrono::Utc>>(
+            "SELECT updated_at FROM banksms.payees WHERE name = 'Samira Adel'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+    };
+    let first = labelled().await;
+    // The same file again leaves the label date alone.
+    apex::classify::import_payees(&pool, &payees, "test")
+        .await
+        .unwrap();
+    assert_eq!(labelled().await, first);
+
+    let sheet: apex::classify::LoanFile = serde_json::from_str(
+        r#"{"loans": [
+          {"lender": "Bank A", "installment": "120000", "due_day": 1, "last_due": "2027-09-01"},
+          {"lender": "Bank B", "name": "Bank B car loan", "installment": "64000", "due_day": 1, "last_due": "2028-01-01"},
+          {"lender": "Bank C", "installment": "31000", "due_day": 3, "last_due": "2028-01-03"},
+          {"lender": "Bank E", "installment": "80000", "due_day": 1, "last_due": "2029-01-01", "paid_via": "loanacct"}
+        ]}"#,
+    )
+    .unwrap();
+    assert_eq!(
+        apex::classify::import_loans(&pool, &sheet, "test")
+            .await
+            .unwrap(),
+        4
+    );
+    let via: Option<i64> =
+        sqlx::query_scalar("SELECT payee_id FROM banksms.bank_loans WHERE lender = 'Bank E'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(via.is_some());
+
+    // A bad file changes nothing.
+    let bad: apex::classify::LoanFile = serde_json::from_str(
+        r#"{"loans": [{"lender": "Bank Z", "installment": "1000", "due_day": 1, "last_due": "2027-01-01",
+                       "paid_via": "nobody we know"}]}"#,
+    )
+    .unwrap();
+    assert!(apex::classify::import_loans(&pool, &bad, "test")
+        .await
+        .is_err());
+    let loans: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM banksms.bank_loans")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(loans, 4);
+
+    apex::classify::run(&pool, None, false).await.unwrap();
+    let got = |id: i64| {
+        let pool = pool.clone();
+        async move {
+            let r = txn(&pool, id).await;
+            (
+                r.get::<Option<String>, _>("category"),
+                r.get::<Option<String>, _>("status"),
+                r.get::<Option<String>, _>("rule"),
+            )
+        }
+    };
+    // Exactly Bank A's installment, on its due date: written.
+    assert_eq!(
+        got(1).await,
+        (
+            Some("BankLoan".into()),
+            Some("applied".into()),
+            Some("loan_installment".into())
+        )
+    );
+    // Bank B + Bank C: a loan payment, but which ones isn't certain: asked.
+    assert_eq!(
+        got(2).await,
+        (
+            None,
+            Some("suggested".into()),
+            Some("loan_installment".into())
+        )
+    );
+    // No installment due around the 9th: savings, as the label says, asked.
+    assert_eq!(
+        got(3).await,
+        (None, Some("suggested".into()), Some("payee".into()))
+    );
+    let reason: String =
+        sqlx::query_scalar("SELECT reason FROM banksms.classifications WHERE transaction_id = 3")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(reason.contains("no loan installment"), "{reason}");
+}
