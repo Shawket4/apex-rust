@@ -101,6 +101,30 @@ pub enum Target {
     Maint,
 }
 
+/// Is FalconGo's AI audit log live? Checked before every apply: without it
+/// FalconGo would accept the change but drop the `X-Via-AI` flag, breaking
+/// the owner's rule that every AI change records its approver and the chat.
+pub async fn falcon_audit_ready(
+    http: &reqwest::Client,
+    cfg: &AdvisorConfig,
+    token: &BearerToken,
+) -> Result<(), String> {
+    let resp = http
+        .get(format!("{}/ai-audit", cfg.falcon_api_url))
+        .bearer_auth(&token.0)
+        .query(&[("limit", "1")])
+        .send()
+        .await
+        .map_err(|e| format!("FalconGo unreachable: {e}"))?;
+    match resp.status().as_u16() {
+        200..=299 => Ok(()),
+        404 => Err("FalconGo's AI audit log is not deployed yet, so the change cannot be recorded as \
+                    coming from the AI chat; the suggestion stays pending"
+            .into()),
+        code => Err(format!("FalconGo's AI audit check answered {code}; the suggestion stays pending")),
+    }
+}
+
 /// One approved change, ready to send.
 pub struct ApplyCall<'a> {
     pub target: Target,

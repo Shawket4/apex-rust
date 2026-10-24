@@ -170,6 +170,11 @@ async fn keyword_search_folds_arabic_and_fuses_variants() {
 
 /// A stand-in FalconGo that records what reached it.
 async fn fake_falcon(seen: Arc<Mutex<Vec<Value>>>) -> String {
+    fake_falcon_with(seen, true).await
+}
+
+/// `audit_live: false` is a FalconGo from before the AI audit log (#2).
+async fn fake_falcon_with(seen: Arc<Mutex<Vec<Value>>>, audit_live: bool) -> String {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     let server = HttpServer::new(move || {
@@ -177,6 +182,13 @@ async fn fake_falcon(seen: Arc<Mutex<Vec<Value>>>) -> String {
         App::new().default_service(web::to(move |req: HttpRequest, body: web::Bytes| {
             let seen = seen.clone();
             async move {
+                if req.path() == "/api/ai-audit" {
+                    return if audit_live {
+                        HttpResponse::Ok().json(json!({ "logs": [], "count": 0 }))
+                    } else {
+                        HttpResponse::NotFound().finish()
+                    };
+                }
                 let h = |k: &str| req.headers().get(k).and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
                 seen.lock().unwrap().push(json!({
                     "method": req.method().as_str(),
@@ -295,4 +307,34 @@ async fn chat_without_a_key_says_so_and_search_falls_back_to_the_words() {
     let v: Value = test::call_and_read_body_json(&app, req).await;
     assert_eq!(v["variants"], json!(["لحام"]));
     assert_eq!(v["hits"][0]["service"], "لحام شاسيه", "{v}");
+}
+
+#[actix_web::test]
+async fn without_falcon_audit_nothing_is_applied() {
+    let pool = db("advisor_noaudit").await;
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let falcon = fake_falcon_with(seen.clone(), false).await;
+    let adv = offline_advisor(&falcon);
+    let token = apex::advisor::upstream::BearerToken("t".into());
+    let c = ctx(&pool, &adv, &token);
+    let proposed = tools::run(&c, "propose_change", &json!({
+        "kind": "assign_driver", "params": { "car_id": 2, "driver_id": 2 },
+        "title": "Pair 5678 with محمود", "rationale": "Truck has no driver"
+    })).await;
+    let id: uuid::Uuid = serde_json::from_value(proposed["suggestion_id"].clone()).unwrap();
+    let app = test::init_service(
+        App::new()
+            .app_data(web::Data::new(pool.clone()))
+            .app_data(web::Data::new(adv.clone()))
+            .configure(apex::advisor::handlers::configure),
+    )
+    .await;
+    let admin = support::admin_token(42);
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/advisor/suggestions/{id}/approve"))
+        .insert_header(("Authorization", format!("Bearer {admin}")))
+        .to_request();
+    assert_eq!(test::call_service(&app, req).await.status(), 409);
+    assert!(seen.lock().unwrap().is_empty(), "no write reached FalconGo");
+    assert_eq!(store::suggestion(&pool, id).await.unwrap().unwrap().status, "pending");
 }

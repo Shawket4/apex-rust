@@ -281,6 +281,13 @@ async fn approve(
     let who = caller(&req)?;
     let token = bearer(&req)?;
     let id = path.into_inner();
+    if let Some(pending) = store::suggestion(&pool, id).await? {
+        if pending.status == "pending" && pending.target == "falcon" {
+            upstream::falcon_audit_ready(&adv.http, &adv.cfg, &token)
+                .await
+                .map_err(AppError::Conflict)?;
+        }
+    }
     let s = match store::decide(&pool, id, who.user_id, "applying").await? {
         Some(s) => s,
         None => {
