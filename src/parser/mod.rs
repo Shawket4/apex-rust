@@ -8,10 +8,11 @@
 //! ```
 //!
 //! There is no triage scorer, no fallback field extractor, no skeleton mining
-//! and no review queue. Eight templates cover every bank SMS ever received in
-//! this chat (100/100, measured against the full corpus on 2026-08-12); a
-//! message they miss is visible in the Messages screen, and the fix is a new
-//! template row — not a lower tier of guessing.
+//! and no review queue. The templates cover every bank SMS received in this
+//! chat: the eight seeded from the 2026-08-12 corpus (100/100) and sixteen
+//! more for the formats that arrived by 2026-10-24 (all 148 money messages
+//! that had gone to ignored). A message they miss is visible in the Messages
+//! screen, and the fix is a new template row — not a lower tier of guessing.
 
 pub mod normalize;
 pub mod templates;
@@ -78,7 +79,9 @@ pub fn petroapp_pattern() -> &'static regex::Regex {
 }
 
 /// Parse one message body. `reference` is the message's arrival time — it
-/// supplies the year for the one date format that omits it.
+/// supplies the year for formats that omit it, the date for messages that
+/// carry none, the time for date-only messages, and the half of the day for
+/// a 12-hour clock.
 pub fn parse(
     body: &str,
     compiled: &[templates::CompiledTemplate],

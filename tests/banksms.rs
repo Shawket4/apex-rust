@@ -628,6 +628,143 @@ async fn every_seeded_template_passes_its_own_sample() {
 }
 
 /* ------------------------------------------------------------------------ */
+/* v3 templates: every format that arrived after the corpus froze, through  */
+/* the seeded rows. Messages are invented; the wording is each bank's.      */
+/* ------------------------------------------------------------------------ */
+
+#[actix_web::test]
+async fn v3_templates_extract_every_new_bank_format() {
+    use chrono::{TimeZone, Utc};
+    use chrono_tz::Africa::Cairo;
+
+    support::init();
+    let pool = support::fresh_db("apex_bsms_v3").await;
+    apex::boot::run_banksms_migrations(&pool).await.unwrap();
+    let templates = apex::parser::templates::load(&pool).await.unwrap();
+
+    // Arrival in Cairo time; DST (+3) through October 2026.
+    let at = |s: &str| {
+        Cairo
+            .from_local_datetime(
+                &chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M").unwrap(),
+            )
+            .unwrap()
+            .with_timezone(&Utc)
+    };
+
+    // (message, arrived, template, direction, amount, account, counterparty, reference, occurred Cairo)
+    let cases: &[(&str, &str, &str, &str, &str, Option<&str>, Option<&str>, Option<&str>, &str)] = &[
+        ("تم تحويل مبلغ 31500EGP     من حساب رقم xxx6666       فى 18-AUG-2026  عن طريق التحويل اللحظي",
+         "2026-08-18 12:41", "bm_transfer_out", "out", "31500", Some("6666"), None, None, "2026-08-18 12:41"),
+        // Arrived the next morning: the date stands, the time is unknown.
+        ("تم اضافة مبلغ 64000EGP     الى حساب رقم xxx6666      فى 18-AUG-2026  عن طريق التحويل اللحظي",
+         "2026-08-19 08:00", "bm_transfer_in", "in", "64000", Some("6666"), None, None, "2026-08-18 00:00"),
+        ("تم إضافة تحويل لحظي لحسابكم رقم 5555 بمبلغ 8250.00 جم من KARIM NABIL FAHMY رقم مرجعي 418273645091 يوم 09-03 الساعة 10:17 للمزيد اتصل بـ 19623",
+         "2026-09-03 10:17", "instant_credit", "in", "8250.00", Some("5555"), Some("KARIM NABIL FAHMY"), Some("418273645091"), "2026-09-03 10:17"),
+        ("تم إضافة تحويل لحظي لحسابكم رقم xxx6666 بمبلغ 64000 جم من KARIM NABIL FAHMY رقم مرجعي 449500000036 يوم 2026-10-05 الساعه 11:42 للمزيد اتصل علي 19888",
+         "2026-10-05 11:42", "instant_credit", "in", "64000", Some("6666"), Some("KARIM NABIL FAHMY"), Some("449500000036"), "2026-10-05 11:42"),
+        ("تم رد تحويل لحظي لحسابكم رقم 5555 بمبلغ 5.00 جم رقم مرجعي 186200000056 يوم 10-12 الساعة 15:08 للمزيد اتصل بـ 19623",
+         "2026-10-12 15:10", "instant_reversal", "in", "5.00", Some("5555"), None, Some("186200000056"), "2026-10-12 15:08"),
+        ("تم تنفيذ تحويل لحظي من حسابكم رقم xxx6666 بمبلغ 2500 جم إلى Hany Fawzy رقم مرجعي 551203948776 يوم 2026-10-02 الساعه 10:15 للمزيد اتصل ب 19888 ",
+         "2026-10-02 10:15", "wallet_transfer_v2", "out", "2500", Some("6666"), Some("Hany Fawzy"), Some("551203948776"), "2026-10-02 10:15"),
+        ("تم خصم مبلغ 1875.30 جم لحظيا باستخدام (شبكة المدفوعات اللحظية) من حسابكم رقم 5555 عند Corner Market يوم 08-22 الساعة16:05 مرجع التاجر 1400000033 للمزيد اتصل بـ 19623.",
+         "2026-08-22 16:05", "ipn_merchant", "out", "1875.30", Some("5555"), Some("Corner Market"), Some("1400000033"), "2026-08-22 16:05"),
+        ("تم خصم 2500 EGP  من بطاقة الخصم المباشر رقم7777  عندATM 0042 MAIN ST    يوم29/08/26  الساعه11:40  المتاح1204.15EGP  للمزيد إتصل ب ١٩٦٢٣",
+         "2026-08-29 11:41", "nbe_card", "out", "2500", Some("7777"), Some("ATM 0042 MAIN ST"), None, "2026-08-29 11:40"),
+        ("تم خصم مبلغ  EGP 610.00 من بطاقة الخصم المباشر المنتهية بـ **4444 عند NILE FUEL STATION في 17/08/26 09:25 ، الرصيد المتاح 3150.40 EGP",
+         "2026-08-17 09:25", "card_merchant", "out", "610.00", Some("4444"), Some("NILE FUEL STATION"), None, "2026-08-17 09:25"),
+        ("تم خصم EGP 355.25  من بطاقة الخصم المباشر # **4444 باستخدام Apple Pay عند  CITY INTERNET في  24/08/26 18:12الرصيد المتاح  EGP2210.05.",
+         "2026-08-24 18:12", "card_merchant", "out", "355.25", Some("4444"), Some("CITY INTERNET"), None, "2026-08-24 18:12"),
+        ("Your debit card **8888 was debited by EGP 12,400.00 at DELTA PHARMACY 1001 Giza EG. Available balance is EGP 3,105.20.",
+         "2026-09-26 13:20", "debit_card_en", "out", "12400.00", Some("8888"), Some("DELTA PHARMACY 1001 Giza"), None, "2026-09-26 13:20"),
+        // 12-hour clock: "08:15" arriving 20:17 is 20:15.
+        ("Your Credit Card#**3434 was charged EGP 89.00 at STREAMING SVC on 23/09/26 at 08:15. Your available limit is EGP 18800. For more info, call 19322.",
+         "2026-09-23 20:17", "credit_card_charge", "out", "89.00", Some("3434"), Some("STREAMING SVC"), None, "2026-09-23 20:15"),
+        ("Your ABK-Egypt Credit Card *3434 was credited with EGP 2750.00 on 10/14/26 10:30 with IPN transfer from OMAR TAREK SALEM (ID 6800018).For queries call 19322",
+         "2026-10-14 10:30", "credit_card_payment", "in", "2750.00", Some("3434"), Some("OMAR TAREK SALEM"), Some("6800018"), "2026-10-14 10:30"),
+        ("Reversal of debit of 412.5 EGP in your ABK-Egypt account *3333 on 10/6/26 16:05 for InstaPay transfer to وليد حازم عزت (ID 4b000001).For queries call 19322",
+         "2026-10-06 16:06", "abk_reversal", "in", "412.5", Some("3333"), Some("وليد حازم عزت"), Some("4b000001"), "2026-10-06 16:05"),
+        ("You have received a transfer reference #5a000096 with EGP 6500 from TAREK ADEL MANSOUR through IPN on 26/08/2026 at 17:48. For inquiries, call 19555.",
+         "2026-08-26 17:48", "ipn_received_en", "in", "6500", None, Some("TAREK ADEL MANSOUR"), Some("5a000096"), "2026-08-26 17:48"),
+        ("Purchase reference #0f000001 of EGP 92.40 has been debited from your account 9001-01 through IPN on 30/08/2026 at 12:10, your available balance is 615.33. For inquiries, call 19555.",
+         "2026-08-30 12:10", "ref_balance_v2", "out", "92.40", Some("9001-01"), None, Some("0f000001"), "2026-08-30 12:10"),
+        // The separately charged IPN fee: one decimal, empty reference.
+        ("Transfer reference # of EGP 0.5 has been debited from your account 9001-01 through IPN on 25/09/2026 at 09:05, your available balance is 4210.70. For inquiries, call 19555.",
+         "2026-09-25 09:05", "ref_balance_v2", "out", "0.5", Some("9001-01"), None, None, "2026-09-25 09:05"),
+        ("عميلنا العزيز، يرجى العلم أن عملية التحويل التي تمت عبر خدمات الإنترنت البنكية من حساب ********2222 بـ EGP85000.00 فى 03-10-2026 11:15 إلى Ayman K........ T... برقم مرجعي FT26274ABCDE لم يتم تنفيذها لحظيًا من خلال شبكة المدفوعات اللحظية (IPN)  وقد تم رد المبلغ إلى حسابكم.",
+         "2026-10-03 11:41", "ipn_refund", "in", "85000.00", Some("2222"), Some("Ayman K........ T..."), Some("FT26274ABCDE"), "2026-10-03 11:15"),
+        ("Dear Customer, You have initiated an Internal Account Transfer transaction from account XXXXXXXXXXXX1234567 to payee Hany Fawzy with the amount of EGP42,500",
+         "2026-08-27 14:02", "internal_transfer_en", "out", "42500", Some("4567"), Some("Hany Fawzy"), None, "2026-08-27 14:02"),
+    ];
+
+    let mut seen = std::collections::BTreeSet::new();
+    for &(body, arrived, tpl, dir, amount, account, counterparty, reference, occurred) in cases {
+        match parser::parse(body, &templates, Some(at(arrived))) {
+            Verdict::Matched { template, fields } => {
+                assert_eq!(template, tpl, "template for {body}");
+                assert_eq!(fields.direction, dir, "direction for {tpl}");
+                assert_eq!(
+                    fields.amount,
+                    Decimal::from_str(amount).unwrap(),
+                    "amount for {tpl}"
+                );
+                assert_eq!(fields.currency, "EGP", "currency for {tpl}");
+                assert_eq!(fields.account.as_deref(), account, "account for {tpl}");
+                assert_eq!(
+                    fields.counterparty.as_deref(),
+                    counterparty,
+                    "counterparty for {tpl}"
+                );
+                assert_eq!(
+                    fields.reference.as_deref(),
+                    reference,
+                    "reference for {tpl}"
+                );
+                assert_eq!(
+                    fields
+                        .occurred_at
+                        .with_timezone(&Cairo)
+                        .format("%Y-%m-%d %H:%M")
+                        .to_string(),
+                    occurred,
+                    "occurred_at for {tpl}"
+                );
+                seen.insert(template);
+            }
+            other => panic!("{tpl}: expected a match, got {} for {body}", other.status()),
+        }
+    }
+    let v3: Vec<String> = sqlx::query_scalar(
+        "SELECT name FROM banksms.parse_templates WHERE priority >= 50 ORDER BY priority",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    for name in &v3 {
+        assert!(seen.contains(name), "no case exercises template {name}");
+    }
+
+    // PetroApp through the Banque Misr wording is still suppressed.
+    let petro = "تم تنفيذ تحويل لحظي من حسابكم رقم xxx6666 بمبلغ 60000 جم إلى petroapp cib رقم مرجعي 772000000082 يوم 2026-10-05 الساعه 11:44 للمزيد اتصل ب 19888 ";
+    match parser::parse(petro, &templates, Some(at("2026-10-05 11:45"))) {
+        Verdict::Suppressed { template } => assert_eq!(template, "wallet_transfer_v2"),
+        other => panic!("petroapp must suppress, got {}", other.status()),
+    }
+
+    // Money-shaped messages that are not money movements stay ignored.
+    for body in [
+        "تم رفض المعاملة على بطاقتك المنتهية بـ **4444 بقيمة 0.00 EGP نظرا لادخال خاطئ لكود التحقق المدون خلف البطاقة",
+        "نأسف لعدم إتمام المعاملة بمبلغ 640 EGP التي تمت باستخدم البطاقة رقم 7777 بسبب عدم كفاية الرصيد, المتاح 512.10EGP للمزيد اتصل ب 19623",
+        "Your ABK-Egypt Credit Card 5100***3434 monthly statement has a balance of EGP 3120.40 /Minimum Due Payment is EGP 640.00 to be paid before Due Date: 28/10/26 by 5:00PM maximum.",
+        "عميلنا العزيز لانتظام حسابكم يرجى سداد قسط شهر10بمبلغ45000جم في ميعاد الاستحقاق05-10عن طريق الايداع او اجراء تحويل الى حسابكم الجاري طرفنا .",
+        "هذا الكود سري يرجى عدم مشاركته مع اي شخص اخر وهو مخصص لعملية الشراء التي تقوم بها الان بمبلغ EGP 39.99 عند التاجرGoogle بالبطاقة المنتهية برقم7777 NBE OTP: 123456",
+    ] {
+        let verdict = parser::parse(body, &templates, Some(at("2026-10-01 12:00")));
+        assert!(matches!(verdict, Verdict::Ignored), "must stay ignored: {body}");
+    }
+}
+
+/* ------------------------------------------------------------------------ */
 /* Split lifecycle: strict sums, per-part loans, guards, unsplit.            */
 /* ------------------------------------------------------------------------ */
 
