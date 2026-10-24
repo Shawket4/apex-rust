@@ -161,6 +161,8 @@ pub struct Person {
 #[derive(Debug, Clone)]
 pub struct CategoryInfo {
     pub key: String,
+    /// What people call it ("Driver custody"), for reasons.
+    pub label: String,
     pub posting_kind: Option<String>,
     pub required_party: String,
     pub report_group: String,
@@ -380,7 +382,7 @@ impl Model {
         }
 
         for r in sqlx::query(
-            "SELECT key, posting_kind, required_party, report_group
+            "SELECT key, label, posting_kind, required_party, report_group
              FROM banksms.categories WHERE enabled",
         )
         .fetch_all(pool)
@@ -391,6 +393,7 @@ impl Model {
                 key.to_lowercase(),
                 CategoryInfo {
                     key,
+                    label: r.get("label"),
                     posting_kind: r.get("posting_kind"),
                     required_party: r.get("required_party"),
                     report_group: r.get("report_group"),

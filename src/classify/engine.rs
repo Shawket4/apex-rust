@@ -956,11 +956,19 @@ fn single(
                     t,
                     "history",
                     p,
-                    format!(
-                        "{k} of {n} earlier payments {} {cp} were {}.",
-                        if t.is_out() { "to" } else { "from" },
-                        label_of(model, &cat)
-                    ),
+                    if n == 1 {
+                        format!(
+                            "The one earlier payment {} {cp} was {}.",
+                            if t.is_out() { "to" } else { "from" },
+                            label_of(model, &cat)
+                        )
+                    } else {
+                        format!(
+                            "{k} of {n} earlier payments {} {cp} were {}.",
+                            if t.is_out() { "to" } else { "from" },
+                            label_of(model, &cat)
+                        )
+                    },
                 )
                 .category(&cat)
                 .party(d, e),
@@ -1062,7 +1070,7 @@ fn from_payee(
             "payee",
             0.98,
             format!(
-                "Payments to {} are always {} (label).",
+                "Payments to {} are always {}, their label says.",
                 p.name,
                 label_of(model, cat)
             ),
@@ -1096,7 +1104,10 @@ fn from_payee(
                 ),
                 (_, Some(c), _) => (
                     Some(c.clone()),
-                    format!("usually {} (label), but it varies", label_of(model, c)),
+                    format!(
+                        "their label says usually {}, but it varies",
+                        label_of(model, c)
+                    ),
                 ),
                 (_, None, Some((h, k, n, _))) if *n >= 2 => (
                     Some(h.clone()),
@@ -1177,10 +1188,11 @@ fn merchant_hint(cp: &str) -> Option<(&'static str, &'static str)> {
         .map(|(_, c, w)| (*c, *w))
 }
 
+/// A category as people call it ("Driver custody"), for reasons.
 fn label_of(model: &Model, key: &str) -> String {
     model
         .category(key)
-        .map(|c| c.key.clone())
+        .map(|c| c.label.clone())
         .unwrap_or_else(|| key.to_string())
 }
 
@@ -1328,6 +1340,7 @@ mod tests {
                 key.to_lowercase(),
                 CategoryInfo {
                     key: key.into(),
+                    label: key.into(),
                     posting_kind: posting.map(String::from),
                     required_party: party.into(),
                     report_group: group.into(),
