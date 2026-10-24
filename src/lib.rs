@@ -5,6 +5,7 @@
 pub mod api;
 pub mod auth;
 pub mod boot;
+pub mod classify;
 pub mod config;
 pub mod cutover;
 pub mod db;

@@ -1,4 +1,4 @@
-//! Bank-SMS HTTP surface: 16 routes, everything permission 4, mounted under
+//! Bank-SMS HTTP surface: 18 routes, everything permission 4, mounted under
 //! /api/v1 ahead of the generic scope (actix matches the first scope whose
 //! prefix matches).
 
@@ -45,6 +45,12 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
             .route("/{id}/split", web::post().to(splits::split).wrap(admin()))
             .route("/{id}/split", web::put().to(splits::replace).wrap(admin()))
             .route("/{id}/unsplit", web::post().to(splits::unsplit).wrap(admin()))
+            .route(
+                "/{id}/suggestion/dismiss",
+                web::post()
+                    .to(transactions::dismiss_suggestion)
+                    .wrap(admin()),
+            )
             .route("/{id}", web::get().to(transactions::get).wrap(admin()))
             .route("/{id}", web::patch().to(transactions::patch).wrap(admin()))
             .route(
@@ -69,6 +75,9 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
     .service(
         web::scope("/api/v1/vehicles")
             .route("", web::get().to(refdata::list_vehicles).wrap(admin())),
+    )
+    .service(
+        web::scope("/api/v1/payees").route("", web::get().to(refdata::list_payees).wrap(admin())),
     )
     .service(
         web::scope("/api/v1/templates")
@@ -96,6 +105,7 @@ pub fn configure_cutover_pending(cfg: &mut web::ServiceConfig) {
         "/api/v1/categories",
         "/api/v1/parties",
         "/api/v1/vehicles",
+        "/api/v1/payees",
         "/api/v1/templates",
     ] {
         cfg.service(web::scope(prefix).default_service(web::route().to(pending)));

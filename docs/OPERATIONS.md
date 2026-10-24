@@ -104,6 +104,46 @@ without starting the HTTP server. Deliberately does **not** touch the cursor: th
 cursor tracks the live tail, and moving it from a historical walk would make the
 poller skip the present.
 
+## Re-parsing after new templates
+
+```bash
+cd /opt/apex-rust && sudo ./apex-rust reparse
+```
+
+Runs every stored message that never became a transaction through the current
+templates. Template rows added by a migration only take effect for old messages
+this way (rows written through `/api/v1/templates` trigger it themselves). Run
+it after the service has restarted on the new binary, so the migration is in.
+
+## The classifier
+
+New transactions are classified as the poller creates them. A decision at 95%
+or more is written to the transaction; anything less is stored as a suggestion
+(`GET /api/v1/transactions?review=true`). Everything it does is in
+`banksms.classifications`, with the rule and a reason.
+
+```bash
+sudo ./apex-rust import-payees payees.json      # payee labels; re-importable
+sudo ./apex-rust classify --dry-run --verbose   # what it would do, one line each
+sudo ./apex-rust classify                       # every open transaction
+```
+
+`payees.json` holds real names: keep it out of the repository. Its shape:
+
+```json
+{"payees": [{"name": "Delta Tires", "kind": "supplier", "category": "Tires",
+             "consistency": "always", "aliases": ["delta tyres", "DELTA T.... C."]}]}
+```
+
+`kind` is one of supplier, driver, employee, owner, family, bank, merchant,
+other; `driver_id`/`employee_id` name the person on the books. `always` lets
+the label apply on its own; `varies` only suggests (and fills in the person).
+
+Categories in `report_group = 'excluded'` (internal transfers, PetroApp
+top-ups, reversed transfers, personal) stay in the ledger and out of every
+total. A payment linked to a FalconGo loan (`linked_loan_id`) replaces that
+loan in the ledger and in the dashboard's advances, so the advance counts once.
+
 ## Cutting the dashboard over, and dropping `fleet_expenses`
 
 `migrations_manual/20260808120300_drop_fleet_expenses.{up,down}.sql` is **not** in

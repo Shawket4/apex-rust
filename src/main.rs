@@ -103,6 +103,68 @@ async fn main() -> std::io::Result<()> {
                 std::process::exit(1);
             }
         },
+        // `apex-rust classify [--dry-run] [--verbose]`: every open transaction.
+        Some("classify") => {
+            let args: Vec<String> = std::env::args().skip(2).collect();
+            let dry_run = args.iter().any(|a| a == "--dry-run");
+            let verbose = args.iter().any(|a| a == "--verbose");
+            match apex::classify::run(&pool, None, dry_run).await {
+                Ok(report) => {
+                    if verbose {
+                        for d in &report.decisions {
+                            println!(
+                                "{} {}",
+                                if d.apply { "APPLY  " } else { "SUGGEST" },
+                                apex::classify::describe(d)
+                            );
+                        }
+                    }
+                    print!(
+                        "{}{}",
+                        if dry_run {
+                            "dry run, nothing written: "
+                        } else {
+                            ""
+                        },
+                        report.summary()
+                    );
+                    return Ok(());
+                }
+                Err(e) => {
+                    error!("classify failed: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        // `apex-rust import-payees FILE.json`: payee labels and their spellings.
+        Some("import-payees") => {
+            let Some(path) = std::env::args().nth(2) else {
+                error!("usage: apex-rust import-payees FILE.json");
+                std::process::exit(2);
+            };
+            let parsed = std::fs::read_to_string(&path)
+                .map_err(|e| e.to_string())
+                .and_then(|s| {
+                    serde_json::from_str::<apex::classify::PayeeFile>(&s).map_err(|e| e.to_string())
+                });
+            let file = match parsed {
+                Ok(f) => f,
+                Err(e) => {
+                    error!("{path}: {e}");
+                    std::process::exit(2);
+                }
+            };
+            match apex::classify::import_payees(&pool, &file, "import").await {
+                Ok((payees, spellings)) => {
+                    info!("imported {payees} payee(s), {spellings} spelling(s)");
+                    return Ok(());
+                }
+                Err(e) => {
+                    error!("import failed, nothing was changed: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
         _ => {}
     }
 

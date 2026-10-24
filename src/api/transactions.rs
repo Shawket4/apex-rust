@@ -13,6 +13,7 @@ use std::collections::HashMap;
 use std::str::FromStr;
 
 use super::registration::{self, LoanInfo, Registrable};
+use crate::classify;
 use crate::errors::{AppError, AppResult};
 use crate::parser::derive_fee;
 
@@ -46,6 +47,12 @@ pub struct TransactionView {
     pub paid_by: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub loan: Option<LoanInfo>,
+    /// A loan FalconGo already has that this payment is the money for. The
+    /// ledger shows this payment in the loan's place.
+    pub linked_loan_id: Option<i64>,
+    /// What the classifier applied or suggests, and why.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub classification: Option<ClassificationView>,
     pub principal: Option<Decimal>,
     pub fee: Option<Decimal>,
     /// Set on split children: the transaction this is a part of.
@@ -59,6 +66,22 @@ pub struct TransactionView {
     pub created_by: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ClassificationView {
+    /// applied | suggested | accepted | corrected | dismissed
+    pub status: String,
+    pub rule: String,
+    pub confidence: f64,
+    pub reason: String,
+    pub category: Option<String>,
+    pub driver_id: Option<i64>,
+    pub employee_id: Option<i64>,
+    pub linked_loan_id: Option<i64>,
+    /// The other side: the internal-transfer partner, or the transfer a
+    /// refund returns.
+    pub pair_id: Option<i64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -88,6 +111,9 @@ pub struct ListQuery {
     /// Export only: render the sheet right-to-left for Arabic locales.
     #[serde(default)]
     pub rtl: Option<String>,
+    /// Only bank rows with a suggestion waiting for review.
+    #[serde(default)]
+    pub review: Option<String>,
 }
 
 fn flag(v: &Option<String>, default: bool) -> bool {
@@ -112,15 +138,20 @@ impl ListQuery {
             Some(other) => Err(AppError::BadRequest(format!("unknown sort: {other}"))),
         }
     }
+    fn review_only(&self) -> bool {
+        flag(&self.review, false)
+    }
     fn wants_fuel(&self) -> bool {
         // A bank-only filter prunes the fuel branch outright.
         flag(&self.include_fuel, true)
+            && !self.review_only()
             && self.source.is_none()
             && self.category.as_deref().map_or(true, |c| c == "Fuel")
             && self.direction.as_deref().map_or(true, |d| d == "out")
     }
     fn wants_loans(&self) -> bool {
         flag(&self.include_loans, true)
+            && !self.review_only()
             && self.source.is_none()
             && self.category.as_deref().map_or(true, |c| c == "Loan")
             && self.company.is_none()
@@ -141,11 +172,18 @@ fn push_union<'a>(qb: &mut QueryBuilder<'a, Postgres>, f: &'a ListQuery) {
          t.reference, t.category, t.description, t.payment_method, t.company, \
          t.car_id, t.car_no_plate, t.driver_id, t.employee_id, t.loan_id, t.paid_by, \
          t.parent_id, par.amount AS parent_amount, \
-         t.version, t.created_by, t.edited_by, t.edited_at, t.created_at, t.updated_at \
+         t.version, t.created_by, t.edited_by, t.edited_at, t.created_at, t.updated_at, \
+         t.linked_loan_id \
          FROM banksms.transactions t \
          LEFT JOIN banksms.transactions par ON par.id = t.parent_id \
          WHERE t.deleted_at IS NULL AND t.split_at IS NULL",
     );
+    if f.review_only() {
+        qb.push(
+            " AND EXISTS (SELECT 1 FROM banksms.classifications cl \
+             WHERE cl.transaction_id = t.id AND cl.status = 'suggested')",
+        );
+    }
     if let Some(from) = &f.from {
         qb.push(" AND t.occurred_at >= ").push_bind(from);
     }
@@ -198,7 +236,7 @@ fn push_union<'a>(qb: &mut QueryBuilder<'a, Postgres>, f: &'a ListQuery) {
              fe.transporter, NULL::bigint, fe.car_no_plate, NULL::bigint, NULL::bigint, \
              NULL::bigint, fe.driver_name, NULL::bigint, NULL::numeric, \
              1, NULL, NULL, NULL::timestamptz, \
-             fe.created_at AT TIME ZONE 'UTC', fe.updated_at AT TIME ZONE 'UTC' \
+             fe.created_at AT TIME ZONE 'UTC', fe.updated_at AT TIME ZONE 'UTC', NULL::bigint \
              FROM public.fuel_events fe \
              WHERE fe.deleted_at IS NULL AND fe.date IS NOT NULL AND fe.created_at IS NOT NULL \
              AND fe.petroapp_bill_id IS NOT NULL",
@@ -231,7 +269,8 @@ fn push_union<'a>(qb: &mut QueryBuilder<'a, Postgres>, f: &'a ListQuery) {
     if f.wants_loans() {
         // Loans registered by banksms itself are excluded: the bank
         // transaction row already represents that money. Including both would
-        // double-count every advance recorded from an SMS.
+        // double-count every advance recorded from an SMS. The same goes for
+        // a FalconGo loan a bank payment is linked to.
         qb.push(
             " UNION ALL SELECT (l.id + 2000000000000)::bigint, 'loan', NULL::bigint, FALSE, \
              'out', COALESCE(l.amount, 0)::numeric, 'EGP', \
@@ -241,12 +280,14 @@ fn push_union<'a>(qb: &mut QueryBuilder<'a, Postgres>, f: &'a ListQuery) {
              l.driver_id::bigint, l.employee_id::bigint, NULL::bigint, \
              COALESCE(l.method, ''), NULL::bigint, NULL::numeric, \
              1, NULL, NULL, NULL::timestamptz, \
-             l.created_at AT TIME ZONE 'UTC', l.updated_at AT TIME ZONE 'UTC' \
+             l.created_at AT TIME ZONE 'UTC', l.updated_at AT TIME ZONE 'UTC', NULL::bigint \
              FROM public.loans l \
              LEFT JOIN public.drivers d ON d.id = l.driver_id \
              LEFT JOIN public.employees e ON e.id = l.employee_id \
              WHERE l.deleted_at IS NULL AND l.date IS NOT NULL \
-             AND COALESCE(l.method, '') <> 'banksms'",
+             AND COALESCE(l.method, '') <> 'banksms' \
+             AND NOT EXISTS (SELECT 1 FROM banksms.transactions lt \
+                 WHERE lt.linked_loan_id = l.id AND lt.deleted_at IS NULL)",
         );
         if let Some(from) = &f.from {
             qb.push(" AND (l.date::date::timestamp AT TIME ZONE 'Africa/Cairo') >= ")
@@ -309,6 +350,8 @@ fn row_to_view(r: &sqlx::postgres::PgRow, loans: &HashMap<i64, LoanInfo>) -> Tra
         parent_id: r.try_get("parent_id").ok().flatten(),
         parent_amount: r.try_get("parent_amount").ok().flatten(),
         loan: loan_id.and_then(|id| loans.get(&id).cloned()),
+        linked_loan_id: r.try_get("linked_loan_id").ok().flatten(),
+        classification: None,
         principal,
         fee,
         version: r.get("version"),
@@ -354,6 +397,45 @@ async fn loans_for(
             )
         })
         .collect())
+}
+
+/// The classifier's word on each bank row of a page, one query.
+async fn classifications_for(pool: &PgPool, views: &mut [TransactionView]) -> AppResult<()> {
+    let ids: Vec<i64> = views.iter().filter(|v| v.editable).map(|v| v.id).collect();
+    if ids.is_empty() {
+        return Ok(());
+    }
+    let rows = sqlx::query(
+        "SELECT transaction_id, status, rule, confidence, reason, category, driver_id,
+                employee_id, linked_loan_id, pair_id
+         FROM banksms.classifications WHERE transaction_id = ANY($1)",
+    )
+    .bind(&ids)
+    .fetch_all(pool)
+    .await?;
+    let mut by_id: HashMap<i64, ClassificationView> = rows
+        .into_iter()
+        .map(|r| {
+            (
+                r.get("transaction_id"),
+                ClassificationView {
+                    status: r.get("status"),
+                    rule: r.get("rule"),
+                    confidence: classify::confidence_f64(r.get("confidence")),
+                    reason: r.get("reason"),
+                    category: r.get("category"),
+                    driver_id: r.get("driver_id"),
+                    employee_id: r.get("employee_id"),
+                    linked_loan_id: r.get("linked_loan_id"),
+                    pair_id: r.get("pair_id"),
+                },
+            )
+        })
+        .collect();
+    for v in views.iter_mut().filter(|v| v.editable) {
+        v.classification = by_id.remove(&v.id);
+    }
+    Ok(())
 }
 
 /// Keyset position of the last row on a page. Date cursors are
@@ -434,7 +516,8 @@ pub async fn list(
     let rows = &rows[..rows.len().min(limit as usize)];
 
     let loans = loans_for(pool.get_ref(), rows).await?;
-    let data: Vec<TransactionView> = rows.iter().map(|r| row_to_view(r, &loans)).collect();
+    let mut data: Vec<TransactionView> = rows.iter().map(|r| row_to_view(r, &loans)).collect();
+    classifications_for(pool.get_ref(), &mut data).await?;
     let next_cursor = if has_more {
         data.last().map(|v| match sort {
             SortBy::Date => format!("{}:{}", v.occurred_at.timestamp_millis(), v.id),
@@ -483,11 +566,20 @@ struct PendingIn {
     total: Decimal,
 }
 
+/// Money out in categories that are not spending (own-account transfers,
+/// PetroApp top-ups, refunded transfers): listed, never summed.
+#[derive(Debug, Serialize)]
+struct Excluded {
+    count: i64,
+    total: Decimal,
+}
+
 #[derive(Debug, Serialize)]
 struct Statistics {
     count: i64,
     total_out: Decimal,
     total_fees: Decimal,
+    excluded: Excluded,
     pending_in: PendingIn,
     by_date: Vec<DateBucket>,
     by_category: Vec<CategoryBucket>,
@@ -512,8 +604,21 @@ pub async fn statistics(
     push_union(&mut qb, &f);
     let rows = qb.build().fetch_all(pool.get_ref()).await?;
 
+    let excluded_keys: std::collections::HashSet<String> = sqlx::query_scalar::<_, String>(
+        "SELECT lower(key) FROM banksms.categories WHERE report_group = 'excluded'",
+    )
+    .fetch_all(pool.get_ref())
+    .await?
+    .into_iter()
+    .collect();
+
     let mut total_out = Decimal::ZERO;
     let mut total_fees = Decimal::ZERO;
+    let mut counted = 0i64;
+    let mut excluded = Excluded {
+        count: 0,
+        total: Decimal::ZERO,
+    };
     let mut by_date: HashMap<String, DateBucket> = HashMap::new();
     let mut by_cat: HashMap<Option<String>, CategoryBucket> = HashMap::new();
 
@@ -522,6 +627,15 @@ pub async fn statistics(
         let category: Option<String> = r.get("category");
         let amount: Decimal = r.get("amount");
         let source: String = r.get("source");
+        if category
+            .as_deref()
+            .is_some_and(|c| excluded_keys.contains(&c.to_lowercase()))
+        {
+            excluded.count += 1;
+            excluded.total += amount;
+            continue;
+        }
+        counted += 1;
 
         let d = by_date.entry(day.clone()).or_insert_with(|| DateBucket {
             date: day,
@@ -549,10 +663,12 @@ pub async fn statistics(
     }
 
     // The badge: live incoming rows in range, awaiting switch-or-ignore.
+    // Categorised ones (an internal transfer, a refund) are decided.
     let mut qb: QueryBuilder<Postgres> = QueryBuilder::new(
         "SELECT COUNT(*) AS c, COALESCE(SUM(amount), 0)::numeric AS s \
          FROM banksms.transactions \
-         WHERE deleted_at IS NULL AND direction = 'in' AND split_at IS NULL",
+         WHERE deleted_at IS NULL AND direction = 'in' AND split_at IS NULL \
+         AND category IS NULL",
     );
     if let Some(from) = &f.from {
         qb.push(" AND occurred_at >= ").push_bind(from);
@@ -615,9 +731,10 @@ pub async fn statistics(
     by_category.sort_by(|a, b| b.out.cmp(&a.out));
 
     Ok(HttpResponse::Ok().json(Statistics {
-        count: rows.len() as i64,
+        count: counted,
         total_out,
         total_fees,
+        excluded,
         pending_in,
         by_date,
         by_category,
@@ -853,6 +970,7 @@ pub async fn create(
         driver_id: b.driver_id,
         employee_id: b.employee_id,
         loan_id: None,
+        linked_loan_id: None,
     };
     let rule = registration::load_rule(&mut tx, reg.category.as_deref()).await?;
     registration::validate(rule.as_ref(), &reg)?;
@@ -870,7 +988,8 @@ const VIEW_COLUMNS: &str = "SELECT t.id, t.source, t.raw_message_id, TRUE AS edi
      t.reference, t.category, t.description, t.payment_method, t.company, t.car_id, \
      t.car_no_plate, t.driver_id, t.employee_id, t.loan_id, t.paid_by, \
      t.parent_id, par.amount AS parent_amount, \
-     t.version, t.created_by, t.edited_by, t.edited_at, t.created_at, t.updated_at \
+     t.version, t.created_by, t.edited_by, t.edited_at, t.created_at, t.updated_at, \
+     t.linked_loan_id \
      FROM banksms.transactions t \
      LEFT JOIN banksms.transactions par ON par.id = t.parent_id";
 
@@ -884,7 +1003,10 @@ async fn fetch_view(pool: &PgPool, id: i64) -> AppResult<TransactionView> {
     .ok_or_else(|| AppError::NotFound(format!("transaction {id}")))?;
 
     let loans = loans_for(pool, std::slice::from_ref(&row)).await?;
-    Ok(row_to_view(&row, &loans))
+    let mut views = [row_to_view(&row, &loans)];
+    classifications_for(pool, &mut views).await?;
+    let [view] = views;
+    Ok(view)
 }
 
 /// One transaction as a view — the splits module's read path.
@@ -901,7 +1023,9 @@ pub async fn views_by_parent(pool: &PgPool, parent_id: i64) -> AppResult<Vec<Tra
     .fetch_all(pool)
     .await?;
     let loans = loans_for(pool, &rows).await?;
-    Ok(rows.iter().map(|r| row_to_view(r, &loans)).collect())
+    let mut views: Vec<TransactionView> = rows.iter().map(|r| row_to_view(r, &loans)).collect();
+    classifications_for(pool, &mut views).await?;
+    Ok(views)
 }
 
 #[derive(Debug, Serialize)]
@@ -997,6 +1121,9 @@ pub struct PatchBody {
     pub employee_id: Option<Option<i64>>,
     #[serde(default, with = "::serde_with::rust::double_option")]
     pub paid_by: Option<Option<String>>,
+    /// Point this payment at a loan FalconGo already has (null unlinks).
+    #[serde(default, with = "::serde_with::rust::double_option")]
+    pub linked_loan_id: Option<Option<i64>>,
 }
 
 pub async fn patch(
@@ -1015,7 +1142,8 @@ pub async fn patch(
     let row = sqlx::query(
         "SELECT direction, amount, currency, occurred_at, account, counterparty, reference,
                 category, description, payment_method, company, car_id, driver_id,
-                employee_id, paid_by, loan_id, version, source, split_at, parent_id
+                employee_id, paid_by, loan_id, linked_loan_id, version, source, split_at,
+                parent_id
          FROM banksms.transactions
          WHERE id = $1 AND deleted_at IS NULL FOR UPDATE",
     )
@@ -1070,11 +1198,16 @@ pub async fn patch(
     let driver_id: Option<i64> = b.driver_id.unwrap_or_else(|| row.get("driver_id"));
     let employee_id: Option<i64> = b.employee_id.unwrap_or_else(|| row.get("employee_id"));
     let paid_by: Option<String> = b.paid_by.unwrap_or_else(|| row.get("paid_by"));
+    let linked_before: Option<i64> = row.get("linked_loan_id");
+    let linked_loan_id: Option<i64> = b.linked_loan_id.unwrap_or(linked_before);
 
     if driver_id.is_some() && employee_id.is_some() {
         return Err(AppError::BadRequest(
             "a transaction belongs to a driver or an employee, not both".into(),
         ));
+    }
+    if let Some(loan) = linked_loan_id.filter(|l| Some(*l) != linked_before) {
+        link_target_ok(&mut tx, loan, row.get("loan_id")).await?;
     }
 
     sqlx::query(
@@ -1083,9 +1216,9 @@ pub async fn patch(
             direction = $1, amount = $2, currency = $3, occurred_at = $4,
             account = $5, counterparty = $6, reference = $7, category = $8,
             description = $9, payment_method = $10, company = $11, car_id = $12,
-            driver_id = $13, employee_id = $14, paid_by = $15,
-            version = version + 1, edited_by = $16, edited_at = now(), updated_at = now()
-        WHERE id = $17
+            driver_id = $13, employee_id = $14, paid_by = $15, linked_loan_id = $16,
+            version = version + 1, edited_by = $17, edited_at = now(), updated_at = now()
+        WHERE id = $18
         "#,
     )
     .bind(&direction)
@@ -1103,10 +1236,20 @@ pub async fn patch(
     .bind(driver_id)
     .bind(employee_id)
     .bind(&paid_by)
+    .bind(linked_loan_id)
     .bind(ctx.actor())
     .bind(id)
     .execute(&mut *tx)
-    .await?;
+    .await
+    .map_err(|e| match &e {
+        sqlx::Error::Database(d) if d.code().as_deref() == Some("23505") => {
+            AppError::Conflict(format!(
+                "loan {} is already the payment of another transaction",
+                linked_loan_id.unwrap_or(0)
+            ))
+        }
+        _ => e.into(),
+    })?;
 
     let reg = Registrable {
         id,
@@ -1117,15 +1260,66 @@ pub async fn patch(
         driver_id,
         employee_id,
         loan_id: row.get("loan_id"),
+        linked_loan_id,
     };
     let rule = registration::load_rule(&mut tx, reg.category.as_deref()).await?;
     registration::validate(rule.as_ref(), &reg)?;
     registration::reconcile(&mut tx, &reg).await?;
 
+    // Whatever the classifier applied or suggested here is now settled.
+    let before = classify::Verdict {
+        category: row.get("category"),
+        driver_id: row.get("driver_id"),
+        employee_id: row.get("employee_id"),
+        linked_loan_id: linked_before,
+    };
+    let after = classify::Verdict {
+        category: category.clone(),
+        driver_id,
+        employee_id,
+        linked_loan_id,
+    };
+    classify::record_edit(&mut tx, id, &before, &after, &ctx.actor()).await?;
+
     tx.commit().await?;
 
     let view = fetch_view(pool.get_ref(), id).await?;
     Ok(HttpResponse::Ok().json(view))
+}
+
+/// A loan a payment may point at: FalconGo's own (not one banksms
+/// registered — this payment's own registration is replaced by the link),
+/// and live.
+async fn link_target_ok(
+    tx: &mut sqlx::Transaction<'_, Postgres>,
+    loan_id: i64,
+    own_registered: Option<i64>,
+) -> AppResult<()> {
+    let row = sqlx::query(
+        "SELECT COALESCE(method, '') AS method FROM public.loans
+         WHERE id = $1 AND deleted_at IS NULL",
+    )
+    .bind(loan_id)
+    .fetch_optional(&mut **tx)
+    .await?
+    .ok_or_else(|| AppError::NotFound(format!("loan {loan_id}")))?;
+    if row.get::<String, _>("method") == "banksms" || own_registered == Some(loan_id) {
+        return Err(AppError::BadRequest(format!(
+            "loan {loan_id} was registered from a bank message; link to the loan FalconGo has"
+        )));
+    }
+    Ok(())
+}
+
+/// POST /transactions/{id}/suggestion/dismiss — not this; don't ask again.
+pub async fn dismiss_suggestion(
+    pool: web::Data<PgPool>,
+    req: HttpRequest,
+    path: web::Path<i64>,
+) -> AppResult<HttpResponse> {
+    let ctx = super::ctx(&req)?;
+    classify::dismiss(pool.get_ref(), path.into_inner(), &ctx.actor()).await?;
+    Ok(HttpResponse::NoContent().finish())
 }
 
 pub async fn delete(
@@ -1140,7 +1334,7 @@ pub async fn delete(
     let mut tx = pool.begin().await?;
     let row = sqlx::query(
         "SELECT version, amount, occurred_at, description, category, driver_id,
-                employee_id, loan_id, split_at, parent_id
+                employee_id, loan_id, linked_loan_id, split_at, parent_id
          FROM banksms.transactions WHERE id = $1 AND deleted_at IS NULL FOR UPDATE",
     )
     .bind(id)
@@ -1170,6 +1364,7 @@ pub async fn delete(
         driver_id: row.get("driver_id"),
         employee_id: row.get("employee_id"),
         loan_id: row.get("loan_id"),
+        linked_loan_id: row.get("linked_loan_id"),
     };
     registration::unregister_for_delete(&mut tx, &reg).await?;
 

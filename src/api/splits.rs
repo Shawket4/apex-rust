@@ -170,6 +170,7 @@ async fn insert_parts(
             driver_id: p.driver_id,
             employee_id: p.employee_id,
             loan_id: None,
+            linked_loan_id: None,
         };
         let rule = registration::load_rule(tx, reg.category.as_deref()).await?;
         registration::validate(rule.as_ref(), &reg)?;
@@ -202,6 +203,7 @@ async fn remove_children(tx: &mut Transaction<'_, Postgres>, parent_id: i64) -> 
             driver_id: c.get("driver_id"),
             employee_id: c.get("employee_id"),
             loan_id: c.get("loan_id"),
+            linked_loan_id: None,
         };
         registration::unregister_for_delete(tx, &reg).await?;
         sqlx::query(
@@ -242,8 +244,8 @@ pub async fn split(
             "only cash-out transactions can be split".into(),
         ));
     }
-    let has_loan: Option<i64> =
-        sqlx::query_scalar("SELECT loan_id FROM banksms.transactions WHERE id = $1")
+    let (has_loan, linked): (Option<i64>, Option<i64>) =
+        sqlx::query_as("SELECT loan_id, linked_loan_id FROM banksms.transactions WHERE id = $1")
             .bind(id)
             .fetch_one(&mut *tx)
             .await?;
@@ -253,6 +255,11 @@ pub async fn split(
              before splitting"
                 .into(),
         ));
+    }
+    if let Some(loan) = linked {
+        return Err(AppError::Conflict(format!(
+            "this transaction is the payment of loan {loan}; unlink it before splitting"
+        )));
     }
 
     insert_parts(&mut tx, &parent, &body.parts, &ctx.actor()).await?;

@@ -141,10 +141,15 @@ pub async fn fleet_revenue(
 
 /// `split_at IS NULL` everywhere: a split parent keeps its full amount AND has
 /// children summing to it, so forgetting the filter double-counts every split.
+/// Excluded categories are not spending — money between the company's own
+/// accounts, PetroApp top-ups (fuel_cash_out counts PetroApp's bills),
+/// refunded transfers — so they never reach a total.
 const LEDGER: &str =
     "deleted_at IS NULL AND split_at IS NULL AND direction = 'out' \
      AND occurred_at >= ($1::date)::timestamptz \
-     AND occurred_at < (($2::date + 1))::timestamptz";
+     AND occurred_at < (($2::date + 1))::timestamptz \
+     AND (category IS NULL OR lower(category) NOT IN \
+          (SELECT lower(key) FROM banksms.categories WHERE report_group = 'excluded'))";
 
 pub async fn cash_out_total(pool: &PgPool, from: &str, to: &str) -> Result<Decimal> {
     let row = sqlx::query(&format!(
@@ -288,12 +293,15 @@ pub async fn fuel_cash_out(pool: &PgPool, from: &str, to: &str) -> Result<f64> {
 /// Advances and loans issued (paid out) in the window — money that left the
 /// till, whatever its repayment status today. Rows registered by banksms
 /// itself are excluded, mirroring the fleet-expenses union: the bank
-/// transaction row already represents that money.
+/// transaction row already represents that money. So are loans a bank
+/// payment is linked to, for the same reason.
 pub async fn advances_issued(pool: &PgPool, from: &str, to: &str) -> Result<f64> {
     let row = sqlx::query(
         "SELECT COALESCE(SUM(amount), 0.0)::float8 AS v FROM loans \
          WHERE deleted_at IS NULL AND kind <> 'salary' AND date BETWEEN $1 AND $2 \
-           AND COALESCE(method, '') <> 'banksms'",
+           AND COALESCE(method, '') <> 'banksms' \
+           AND NOT EXISTS (SELECT 1 FROM banksms.transactions t \
+               WHERE t.linked_loan_id = loans.id AND t.deleted_at IS NULL)",
     )
     .bind(from)
     .bind(to)

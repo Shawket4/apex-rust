@@ -19,11 +19,15 @@ pub struct Category {
     pub required_party: String,
     pub sort_order: i32,
     pub enabled: bool,
+    /// operating | capital | excluded — excluded categories (own-account
+    /// transfers, PetroApp top-ups, refunds) are listed but never summed.
+    pub report_group: String,
 }
 
 pub async fn list_categories(pool: web::Data<PgPool>) -> AppResult<HttpResponse> {
     let rows = sqlx::query(
-        "SELECT id, key, label, label_ar, posting_kind, required_party, sort_order, enabled
+        "SELECT id, key, label, label_ar, posting_kind, required_party, sort_order, enabled,
+                report_group
          FROM banksms.categories WHERE enabled ORDER BY sort_order, id",
     )
     .fetch_all(pool.get_ref())
@@ -40,6 +44,51 @@ pub async fn list_categories(pool: web::Data<PgPool>) -> AppResult<HttpResponse>
             required_party: r.get("required_party"),
             sort_order: r.get("sort_order"),
             enabled: r.get("enabled"),
+            report_group: r.get("report_group"),
+        })
+        .collect();
+    Ok(HttpResponse::Ok().json(out))
+}
+
+#[derive(Debug, Serialize)]
+pub struct Payee {
+    pub id: i64,
+    pub name: String,
+    pub kind: String,
+    pub category: Option<String>,
+    pub consistency: String,
+    pub driver_id: Option<i64>,
+    pub employee_id: Option<i64>,
+    pub notes: Option<String>,
+    /// Every spelling the banks use for them.
+    pub spellings: Vec<String>,
+}
+
+/// The payee labels the classifier works from.
+pub async fn list_payees(pool: web::Data<PgPool>) -> AppResult<HttpResponse> {
+    let rows = sqlx::query(
+        "SELECT p.id, p.name, p.kind, p.category, p.consistency, p.driver_id, p.employee_id,
+                p.notes,
+                COALESCE(array_agg(a.spelling ORDER BY a.spelling)
+                         FILTER (WHERE a.spelling IS NOT NULL), '{}') AS spellings
+         FROM banksms.payees p
+         LEFT JOIN banksms.payee_aliases a ON a.payee_id = p.id
+         GROUP BY p.id ORDER BY p.name",
+    )
+    .fetch_all(pool.get_ref())
+    .await?;
+    let out: Vec<Payee> = rows
+        .iter()
+        .map(|r| Payee {
+            id: r.get("id"),
+            name: r.get("name"),
+            kind: r.get("kind"),
+            category: r.get("category"),
+            consistency: r.get("consistency"),
+            driver_id: r.get("driver_id"),
+            employee_id: r.get("employee_id"),
+            notes: r.get("notes"),
+            spellings: r.get("spellings"),
         })
         .collect();
     Ok(HttpResponse::Ok().json(out))

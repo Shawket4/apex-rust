@@ -214,6 +214,16 @@ pub async fn run(pool: PgPool, client: WhatsAppClient) {
                 consecutive_failures = 0;
                 if !created.is_empty() {
                     info!("poll cycle created {} transaction(s)", created.len());
+                    let ids: Vec<i64> = created.iter().map(|c| c.txn.id).collect();
+                    // Best effort: a classifier failure must never stall ingest.
+                    match crate::classify::run(&pool, Some(&ids), false).await {
+                        Ok(r) if r.applied + r.suggested > 0 => info!(
+                            "classified new transactions: {} applied, {} suggested",
+                            r.applied, r.suggested
+                        ),
+                        Ok(_) => {}
+                        Err(e) => error!("classifier failed on new transactions {ids:?}: {e}"),
+                    }
                     let txns: Vec<NewTransaction> = created.into_iter().map(|c| c.txn).collect();
                     notify::notify_new_transactions(txns);
                 }

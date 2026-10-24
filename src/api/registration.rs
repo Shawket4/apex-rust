@@ -12,6 +12,11 @@
 //! touched. Direction is one-way: transaction → loan. Loans edited in FalconGo
 //! are never read back as truth.
 //!
+//! A payment can instead point at a loan FalconGo already has
+//! (`linked_loan_id`): the advance was entered there and this is the money
+//! that paid it. Such a payment never registers a loan of its own — that
+//! would be the same advance twice — and the linked loan is never modified.
+//!
 //! # Sync rule (deliberate change from the old code)
 //!
 //! The old implementation never refreshed an already-posted loan, which left
@@ -47,6 +52,8 @@ pub struct Registrable {
     pub driver_id: Option<i64>,
     pub employee_id: Option<i64>,
     pub loan_id: Option<i64>,
+    /// A FalconGo loan this payment is the money for (never registered here).
+    pub linked_loan_id: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -117,7 +124,10 @@ pub async fn reconcile(
     let rule = load_rule(tx, t.category.as_deref()).await?;
     let kind = rule.as_ref().and_then(|r| r.posting_kind.clone());
     let has_party = t.driver_id.is_some() || t.employee_id.is_some();
-    let should_post = kind.is_some() && has_party && t.amount > Decimal::ZERO;
+    // Linked to a loan FalconGo already has: registering another would count
+    // the advance twice.
+    let should_post =
+        kind.is_some() && has_party && t.amount > Decimal::ZERO && t.linked_loan_id.is_none();
 
     match (should_post, t.loan_id) {
         (false, None) => Ok(None),
