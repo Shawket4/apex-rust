@@ -560,30 +560,47 @@ fn kind_word(l: &Loan) -> &'static str {
 
 const BANK_LOAN: &str = "BankLoan";
 
-/// How far from its due date an installment is paid: early when it is taken
-/// to the branch ahead of time, late when the 1st falls on a weekend.
-const DUE_WINDOW_DAYS: i64 = 7;
+/// How far from its due date an installment may be paid: up to half a month
+/// early or late, so every day of the month is in range of a monthly
+/// installment and the amount decides.
+const DUE_WINDOW_DAYS: i64 = 15;
+
+/// How far a transfer may be from what it pays: fees on top, a rounded sum,
+/// a partial payment. Exact matches are still preferred.
+fn amount_margin() -> Decimal {
+    Decimal::new(5, 2) // 5%
+}
 
 /// People also simply send round sums like 20,000 or 40,000, so a transfer
-/// matching an installment that small is a hint. From this size up it is the
-/// installment.
+/// matching an installment that small is a hint. From this size up an exact
+/// match is the installment.
 const DISTINCT_INSTALLMENT: i64 = 50_000;
 
 /// What the loan sheet says about one transfer to someone who pays loans.
 #[derive(Debug, Clone, PartialEq)]
 pub enum LoanFit {
-    /// Exactly the installment of one loan falling due near it.
-    One { loan: i64, due: NaiveDate },
-    /// The sum of several installments falling due near it: the fewest that
-    /// add up (any such sum would do; which loans it paid is not known).
-    Several(Vec<(i64, NaiveDate)>),
-    /// Nothing falling due near it adds up to it.
+    /// One loan's installment falling due near it: exactly, or within the
+    /// margin.
+    One {
+        loan: i64,
+        due: NaiveDate,
+        exact: bool,
+    },
+    /// Several installments falling due near it, whose sum (`total`) is the
+    /// transfer exactly or within the margin: the closest sum, then the
+    /// fewest installments (any such set would do; which loans it paid is
+    /// not known).
+    Several {
+        parts: Vec<(i64, NaiveDate)>,
+        total: Decimal,
+    },
+    /// Nothing falling due near it comes within the margin of it.
     Nothing,
 }
 
 /// Every transfer to a payee who pays loans, against the loan sheet, oldest
 /// first. An installment is paid once: transfers that are exactly one claim
-/// theirs, then the others are checked against what is left. Transfers
+/// theirs first, then the others are matched against what is left. Transfers
 /// already known to be something else (refunded, moved between accounts)
 /// pay nothing.
 fn loan_fits(model: &Model, decided: &BTreeMap<i64, Decision>) -> HashMap<i64, LoanFit> {
@@ -626,18 +643,15 @@ fn loan_fits(model: &Model, decided: &BTreeMap<i64, Decision>) -> HashMap<i64, L
         });
         v
     };
+    let days_off = |t: &Txn, d: &NaiveDate| (*d - t.cairo_date()).num_days().abs();
 
     let mut claimed: HashSet<(usize, NaiveDate)> = HashSet::new();
+    // Exact single installments first: the strongest evidence there is.
     for &(t, p) in &payments {
         let exact = due_near(t, p)
             .into_iter()
             .filter(|k| model.bank_loans[k.0].installment == t.amount && !claimed.contains(k))
-            .min_by_key(|(i, d)| {
-                (
-                    (*d - t.cairo_date()).num_days().abs(),
-                    model.bank_loans[*i].id,
-                )
-            });
+            .min_by_key(|(i, d)| (days_off(t, d), model.bank_loans[*i].id));
         if let Some(k) = exact {
             claimed.insert(k);
             fits.insert(
@@ -645,10 +659,12 @@ fn loan_fits(model: &Model, decided: &BTreeMap<i64, Decision>) -> HashMap<i64, L
                 LoanFit::One {
                     loan: model.bank_loans[k.0].id,
                     due: k.1,
+                    exact: true,
                 },
             );
         }
     }
+    // Then the closest installment or set of installments within the margin.
     for &(t, p) in &payments {
         if fits.contains_key(&t.id) {
             continue;
@@ -661,16 +677,25 @@ fn loan_fits(model: &Model, decided: &BTreeMap<i64, Decision>) -> HashMap<i64, L
             .iter()
             .map(|(i, _)| model.bank_loans[*i].installment)
             .collect();
-        let fit = match fewest_adding_up(&amounts, t.amount).filter(|s| s.len() >= 2) {
-            Some(parts) => {
-                let parts: Vec<(usize, NaiveDate)> = parts.into_iter().map(|j| pool[j]).collect();
+        let fit = match closest_combination(&amounts, t.amount, amount_margin()) {
+            Some(picked) => {
+                let parts: Vec<(usize, NaiveDate)> = picked.iter().map(|&j| pool[j]).collect();
                 claimed.extend(parts.iter().copied());
-                LoanFit::Several(
-                    parts
-                        .into_iter()
-                        .map(|(i, d)| (model.bank_loans[i].id, d))
-                        .collect(),
-                )
+                let total: Decimal = picked.iter().map(|&j| amounts[j]).sum();
+                match parts.as_slice() {
+                    [(i, due)] => LoanFit::One {
+                        loan: model.bank_loans[*i].id,
+                        due: *due,
+                        exact: total == t.amount,
+                    },
+                    _ => LoanFit::Several {
+                        parts: parts
+                            .into_iter()
+                            .map(|(i, d)| (model.bank_loans[i].id, d))
+                            .collect(),
+                        total,
+                    },
+                }
             }
             None => LoanFit::Nothing,
         };
@@ -684,8 +709,17 @@ fn loan_fits(model: &Model, decided: &BTreeMap<i64, Decision>) -> HashMap<i64, L
 fn installment(model: &Model, t: &Txn, p: &Payee, fit: &LoanFit) -> Option<Decision> {
     let loan = |id: i64| model.bank_loans.iter().find(|l| l.id == id);
     let day = |d: &NaiveDate| d.format("%-d %b").to_string();
+    let decision = |confidence: f64, reason: String| {
+        Decision::new(t, "loan_installment", confidence, reason)
+            .category(BANK_LOAN)
+            .payee(p)
+    };
     match fit {
-        LoanFit::One { loan: id, due } => {
+        LoanFit::One {
+            loan: id,
+            due,
+            exact: true,
+        } => {
             let l = loan(*id)?;
             let (confidence, why) = if t.amount >= Decimal::from(DISTINCT_INSTALLMENT) {
                 (0.97, format!("and {} pays the company's loans.", p.name))
@@ -698,23 +732,35 @@ fn installment(model: &Model, t: &Txn, p: &Payee, fit: &LoanFit) -> Option<Decis
                     ),
                 )
             };
-            Some(
-                Decision::new(
-                    t,
-                    "loan_installment",
-                    confidence,
-                    format!(
-                        "{} is the {} installment due {}, {why}",
-                        money(t.amount),
-                        l.name,
-                        day(due)
-                    ),
-                )
-                .category(BANK_LOAN)
-                .payee(p),
-            )
+            Some(decision(
+                confidence,
+                format!(
+                    "{} is the {} installment due {}, {why}",
+                    money(t.amount),
+                    l.name,
+                    day(due)
+                ),
+            ))
         }
-        LoanFit::Several(parts) => {
+        LoanFit::One {
+            loan: id,
+            due,
+            exact: false,
+        } => {
+            let l = loan(*id)?;
+            Some(decision(
+                0.85,
+                format!(
+                    "{} is within 5% of the {} installment ({}) due {}, and {} pays the company's loans.",
+                    money(t.amount),
+                    l.name,
+                    money(l.installment),
+                    day(due),
+                    p.name
+                ),
+            ))
+        }
+        LoanFit::Several { parts, total } => {
             let named: Vec<String> = parts
                 .iter()
                 .filter_map(|(id, _)| loan(*id))
@@ -725,57 +771,64 @@ fn installment(model: &Model, t: &Txn, p: &Payee, fit: &LoanFit) -> Option<Decis
                 0 => String::new(),
                 n => format!(" + {n} more"),
             };
-            Some(
-                Decision::new(
-                    t,
-                    "loan_installment",
-                    0.80,
-                    format!(
-                        "{} adds up to {} installments due around {}: {}{more}. {} pays the company's loans; which ones this paid isn't certain.",
-                        money(t.amount),
-                        parts.len(),
-                        fmt_date(t),
-                        named.join(" + "),
-                        p.name
-                    ),
+            let how = if *total == t.amount {
+                format!("adds up to {} installments", parts.len())
+            } else {
+                format!(
+                    "is within 5% of {} installments totalling {}",
+                    parts.len(),
+                    money(*total)
                 )
-                .category(BANK_LOAN)
-                .payee(p),
-            )
+            };
+            Some(decision(
+                0.80,
+                format!(
+                    "{} {how} due around {}: {}{more}. {} pays the company's loans; which ones this paid isn't certain.",
+                    money(t.amount),
+                    fmt_date(t),
+                    named.join(" + "),
+                    p.name
+                ),
+            ))
         }
         LoanFit::Nothing => None,
     }
 }
 
-/// The fewest of `amounts` (each used at most once) that add up to `target`
-/// exactly, as indices; ties go to the subset found first, so earlier
-/// amounts win. `None` when no subset does, or the search is too big to be
-/// worth an answer.
-fn fewest_adding_up(amounts: &[Decimal], target: Decimal) -> Option<Vec<usize>> {
-    const MAX_STATES: usize = 250_000;
-    let cents = |d: Decimal| (d * Decimal::from(100)).round().to_i64();
-    let target = cents(target)?;
-    let items: Vec<i64> = amounts.iter().map(|a| cents(*a)).collect::<Option<_>>()?;
-    if target <= 0 || items.iter().sum::<i64>() < target {
+/// The installments (indices into `amounts`, each used at most once) whose
+/// sum is closest to `target`, within `margin` of that sum
+/// (`target` ∈ [sum × (1 − margin), sum × (1 + margin)]). Ties go to the
+/// fewest installments, then the smaller sum. `None` when no set comes
+/// within the margin, or the search is too big to be worth an answer.
+fn closest_combination(
+    amounts: &[Decimal],
+    target: Decimal,
+    margin: Decimal,
+) -> Option<Vec<usize>> {
+    const MAX_STATES: usize = 400_000;
+    if amounts.len() > 128 || target <= Decimal::ZERO {
         return None;
     }
-    // Reachable sum → the fewest items reaching it.
-    let mut best: BTreeMap<i64, Vec<usize>> = BTreeMap::from([(0, Vec::new())]);
+    let cents = |d: Decimal| (d * Decimal::from(100)).round().to_i64();
+    let goal = cents(target)?;
+    // Sums that `target` is within the margin of.
+    let lo = cents(target / (Decimal::ONE + margin))?;
+    let hi = cents(target / (Decimal::ONE - margin))?;
+    let items: Vec<i64> = amounts.iter().map(|a| cents(*a)).collect::<Option<_>>()?;
+
+    // Reachable sum → the fewest items reaching it (a bit per item).
+    let mut best: BTreeMap<i64, u128> = BTreeMap::from([(0, 0)]);
     for (i, &a) in items.iter().enumerate() {
         if a <= 0 {
             continue;
         }
-        let grown: Vec<(i64, Vec<usize>)> = best
-            .range(..=target - a)
-            .map(|(s, set)| {
-                let mut set = set.clone();
-                set.push(i);
-                (s + a, set)
-            })
+        let grown: Vec<(i64, u128)> = best
+            .range(..=hi - a)
+            .map(|(s, set)| (s + a, set | (1u128 << i)))
             .collect();
         for (s, set) in grown {
             match best.get(&s) {
-                Some(have) if have.len() <= set.len() => {}
+                Some(have) if have.count_ones() <= set.count_ones() => {}
                 _ => {
                     best.insert(s, set);
                 }
@@ -785,7 +838,13 @@ fn fewest_adding_up(amounts: &[Decimal], target: Decimal) -> Option<Vec<usize>> 
             return None;
         }
     }
-    best.remove(&target)
+    best.range(lo.max(1)..=hi)
+        .min_by_key(|(s, set)| ((*s - goal).abs(), set.count_ones(), **s))
+        .map(|(_, set)| {
+            (0..items.len())
+                .filter(|i| set & (1u128 << i) != 0)
+                .collect()
+        })
 }
 
 /* --------------------------- 3-5. one row ------------------------------- */
@@ -1785,21 +1844,24 @@ mod tests {
     #[test]
     fn an_installment_falling_due_is_a_loan_payment() {
         let ds = decide(
+            // Oldest first, as the ledger loads them: earlier transfers claim
+            // installments before later ones.
             &loan_payer(vec![
                 txn(1, "out", "120000", "2026-09-01 11:15").to("samira"),
-                // Bank A's September installment is taken: a second
-                // 120,000 is not it again, and nothing else adds up to it.
-                txn(2, "out", "120000", "2026-09-02 10:00").to("samira"),
                 // Bank B + Bank C, both due in the first days of September.
                 txn(3, "out", "95000", "2026-09-01 11:25").to("samira"),
-                // Small, mid-month: savings, as the label says.
+                // Bank F was repaid in June, and Bank D alone is nowhere
+                // near.
+                txn(7, "out", "90000", "2026-09-01 12:00").to("سميرة عادل"),
+                // Bank A's September installment is taken: a second
+                // 120,000 is not it again, and nothing left comes near it.
+                txn(2, "out", "120000", "2026-09-02 10:00").to("samira"),
+                // Small: savings, as the label says.
                 txn(4, "out", "12500", "2026-09-09 09:00").to("samira"),
+                // Bank E is only ever paid through its own account.
+                txn(6, "out", "80000", "2026-10-01 12:00").to("samira"),
                 // Bank D's, but people send 22,000 for other things too.
                 txn(5, "out", "22000", "2026-10-02 15:30").to("samira"),
-                // Bank E is only ever paid through its own account, and
-                // Bank F was repaid in June.
-                txn(6, "out", "80000", "2026-10-01 12:00").to("samira"),
-                txn(7, "out", "90000", "2026-09-01 12:00").to("سميرة عادل"),
             ]),
             None,
         );
@@ -1890,31 +1952,75 @@ mod tests {
     }
 
     #[test]
-    fn the_fewest_installments_that_add_up() {
+    fn the_closest_combination_within_the_margin() {
         let d = |v: &[i64]| v.iter().map(|x| Decimal::from(*x)).collect::<Vec<_>>();
-        let amounts = d(&[50, 40, 30, 20, 10]);
-        let pick = fewest_adding_up(&amounts, Decimal::from(60)).unwrap();
-        assert_eq!(pick.len(), 2);
+        let five = Decimal::new(5, 2);
+        let amounts = d(&[50_000, 40_000, 30_000, 20_000, 10_000]);
+        let total = |pick: &[usize]| pick.iter().map(|&i| amounts[i]).sum::<Decimal>();
+        let pick = |t: i64| closest_combination(&amounts, Decimal::from(t), five);
+
+        // Exact sums, fewest installments.
+        let p = pick(60_000).unwrap();
+        assert_eq!((p.len(), total(&p)), (2, Decimal::from(60_000)));
+        assert_eq!(pick(150_000).unwrap().len(), 5);
+        // Within 5% of the closest sum, above or below.
+        assert_eq!(total(&pick(61_000).unwrap()), Decimal::from(60_000));
+        assert_eq!(total(&pick(155_000).unwrap()), Decimal::from(150_000));
+        assert_eq!(pick(9_600), Some(vec![4]));
+        // Beyond 5% of anything.
+        assert_eq!(pick(158_000), None);
+        assert_eq!(pick(9_000), None);
+        // An exact pair beats a single that is only close.
+        let amounts = d(&[100_000, 60_000, 41_000]);
         assert_eq!(
-            pick.iter().map(|&i| amounts[i]).sum::<Decimal>(),
-            Decimal::from(60)
+            closest_combination(&amounts, Decimal::from(101_000), five),
+            Some(vec![1, 2])
         );
-        assert_eq!(
-            fewest_adding_up(&amounts, Decimal::from(150))
-                .unwrap()
-                .len(),
-            5
-        );
-        assert_eq!(fewest_adding_up(&amounts, Decimal::from(55)), None);
-        assert_eq!(fewest_adding_up(&amounts, Decimal::from(151)), None);
+        // Piasters count.
         let odd = vec![
             Decimal::from_str("17430").unwrap(),
             Decimal::from_str("26110.50").unwrap(),
         ];
         assert_eq!(
-            fewest_adding_up(&odd, Decimal::from_str("43540.50").unwrap()),
+            closest_combination(&odd, Decimal::from_str("43540.50").unwrap(), Decimal::ZERO),
             Some(vec![0, 1])
         );
+    }
+
+    #[test]
+    fn installments_paid_late_or_rounded_still_match() {
+        let ds = decide(
+            &loan_payer(vec![
+                // 12 days late and 3% over Bank A's 120,000.
+                txn(1, "out", "124000", "2026-10-13 10:00").to("samira"),
+                // Bank B + Bank C (95,000), 3% under, two weeks after the 1st.
+                txn(2, "out", "98000", "2026-11-14 10:00").to("samira"),
+                // Bank A's December installment exactly, paid 13 days late.
+                txn(3, "out", "120000", "2026-12-14 10:00").to("samira"),
+                txn(4, "out", "12500", "2026-12-20 10:00").to("samira"),
+            ]),
+            None,
+        );
+        let got = |id| {
+            let d = by_id(&ds, id);
+            (d.rule, d.category.as_deref(), d.apply)
+        };
+        assert_eq!(got(1), ("loan_installment", Some("BankLoan"), false));
+        assert!(
+            by_id(&ds, 1).reason.contains("within 5% of the Bank A"),
+            "{}",
+            by_id(&ds, 1).reason
+        );
+        assert_eq!(got(2), ("loan_installment", Some("BankLoan"), false));
+        assert!(
+            by_id(&ds, 2)
+                .reason
+                .contains("within 5% of 2 installments totalling 95,000"),
+            "{}",
+            by_id(&ds, 2).reason
+        );
+        assert_eq!(got(3), ("loan_installment", Some("BankLoan"), true));
+        assert_eq!(got(4), ("payee", Some("InternalTransfer"), false));
     }
 
     #[test]

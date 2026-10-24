@@ -153,11 +153,13 @@ company's behalf. Each transfer to them is checked against the loan sheet
 ```
 
 `first_due` is optional (running since before the ledger); `paid_via` names
-the one payee a loan is always paid through, if there is one. A transfer that
-is exactly an installment due within a week of it is a Bank loan payment
-(written when it is 50,000 or more, asked below that); one that adds up to
-several installments due then is asked; anything else is judged by the label.
-Each installment is paid once.
+the one payee a loan is always paid through, if there is one. Installments
+are matched to transfers made up to 15 days before or after their due date,
+and within 5% of the amount, one installment or several together. A transfer
+that is exactly one installment of 50,000 or more is filed as a Bank loan
+payment; everything else that matches (a smaller installment, one within the
+margin, several together) is suggested; anything else is judged by the
+label. Each installment is paid once, and exact matches claim theirs first.
 
 Categories in `report_group = 'excluded'` (internal transfers, PetroApp
 top-ups, reversed transfers, personal) stay in the ledger and out of every
