@@ -44,7 +44,7 @@ pub enum AppError {
     /// cannot clean free text, so sanitizing here is what makes it safe to
     /// carry. The client never sees this: `error_response` builds its own
     /// opaque detail for 5xx.
-    #[error("upstream WhatsApp API error: {}", crate::observability::sanitize_message(.0))]
+    #[error("upstream API error: {}", crate::observability::sanitize_message(.0))]
     Upstream(String),
 
     #[error("database error")]
@@ -139,7 +139,7 @@ impl ResponseError for AppError {
             }
             // The operator gets the upstream body; nobody else does.
             AppError::Upstream(detail) => {
-                log::error!("upstream WhatsApp API error: {detail}");
+                log::error!("upstream API error: {detail}");
                 "upstream request failed".to_string()
             }
             other => other.to_string(),

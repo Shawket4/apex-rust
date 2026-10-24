@@ -2,6 +2,7 @@
 //! real modules (parser, ingest, cutover, API) against a real Postgres. The
 //! binary in `main.rs` is a thin shell over this.
 
+pub mod advisor;
 pub mod api;
 pub mod auth;
 pub mod boot;
