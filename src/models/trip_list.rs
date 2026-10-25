@@ -133,17 +133,19 @@ pub struct TripListRow {
     /// From the route's fee mapping, not stored on the trip.
     pub distance: f64,
     /// Also from the fee mapping. For Watanya this is a BAND NUMBER (1..15),
-    /// not a rate — the dashboard labels it accordingly.
+    /// not a rate — the dashboard labels it accordingly. For Petrol Arrows it
+    /// IS a rate (EGP per 1,000 L), so it reads 0 below permission 3.
     pub fee: f64,
 
     /* ---- revenue ---------------------------------------------------------
-     * `revenue` is the trip's own earnings and is a fact about the trip.
-     * The three `allocated_*` fields are a SHARE of costs the trip does not
-     * own alone: TAQA's rental is earned per car per month and Petromin's per
-     * car-day, spread across the rows that incurred them. They sum to the
-     * statistics total for the same window, and they move when the window
-     * moves — which is why they are named as allocations rather than folded
-     * silently into `revenue`.
+     * `revenue` is the trip's own earnings (FalconGo's stored base revenue,
+     * before VAT; 0 when it could not be priced) and is a fact about the trip.
+     * The three `allocated_*` fields are a SHARE of what the trip does not
+     * own alone: the car-month's stored rental (TAQA by the month, Petromin by
+     * the car-day) spread over the days the car worked and split between the
+     * day's trips, plus VAT. They sum to the statistics total for the same
+     * window — which is why they are named as allocations rather than folded
+     * silently into `revenue`. See `db::revenue`.
      *
      * All four are omitted entirely below permission 4. A caller who may not
      * see money does not receive a zero, which would read as "this trip earned

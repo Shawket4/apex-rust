@@ -48,17 +48,21 @@ async fn db(name: &str) -> PgPool {
             deleted_at TIMESTAMPTZ);
 
          INSERT INTO drivers (id, name) VALUES (1, 'أحمد'), (2, 'محمود');
-         INSERT INTO cars (id, car_no_plate, operating_company, operating_area, driver_id, latitude, longitude, etit_car_id)
-         VALUES (1, 'ق ط ر 1234', 'Watanya', 'Suez', 1, '29.97', '32.53', 'etit-1'),
-                (2, 'ع ب ج 5678', 'Mobil', 'Cairo', NULL, '', '', '');
+         INSERT INTO cars (id, car_no_plate, operating_company, operating_area, driver_id, latitude, longitude, etit_car_id, tank_capacity)
+         VALUES (1, 'ق ط ر 1234', 'Watanya', 'Suez', 1, '29.97', '32.53', 'etit-1', 38000),
+                (2, 'ع ب ج 5678', 'Mobil', 'Cairo', NULL, '', '', '', 0);
          INSERT INTO terminals (id, name, latitude, longitude) VALUES (10, 'Suez Terminal', 29.96, 32.55);
+         -- Watanya's fee is a band number; its rates are in the pricing rule.
          INSERT INTO fee_mappings (company, terminal, terminal_id, drop_off_point, distance, fee)
-         VALUES ('Watanya', 'Suez Terminal', 10, 'Station A', 50, 1500),
-                ('Watanya', 'Suez Terminal', 10, 'Station B', 200, 3000),
+         VALUES ('Watanya', 'Suez Terminal', 10, 'Station A', 50, 1),
+                ('Watanya', 'Suez Terminal', 10, 'Station B', 200, 2),
+                ('Watanya', 'Suez Terminal', 10, 'Station Z', 90, 40),
                 ('Mobil', 'Mostorod', NULL, 'Station M', 30, 900);
-         INSERT INTO trips (car_id, car_no_plate, driver_name, company, terminal, drop_off_point, date, revenue, mileage)
-         VALUES (1, 'ق ط ر 1234', 'أحمد', 'Watanya', 'Suez Terminal', 'Station A', to_char(current_date - 2, 'YYYY-MM-DD'), 1500, 100),
-                (1, 'ق ط ر 1234', 'أحمد', 'Watanya', 'Suez Terminal', 'Station B', to_char(current_date - 1, 'YYYY-MM-DD'), 3000, 400);
+         -- Revenue as FalconGo stored it (base before VAT, and its 14% VAT).
+         INSERT INTO trips (car_id, car_no_plate, driver_name, company, terminal, drop_off_point, date,
+                            revenue, base_revenue, revenue_vat, mileage)
+         VALUES (1, 'ق ط ر 1234', 'أحمد', 'Watanya', 'Suez Terminal', 'Station A', to_char(current_date - 2, 'YYYY-MM-DD'), 1500, 1500, 210, 100),
+                (1, 'ق ط ر 1234', 'أحمد', 'Watanya', 'Suez Terminal', 'Station B', to_char(current_date - 1, 'YYYY-MM-DD'), 3000, 3000, 420, 400);
          INSERT INTO fuel_events (car_id, date, price) VALUES (1, to_char(current_date - 1, 'YYYY-MM-DD'), 800);
          INSERT INTO service_invoices (id, car_id, date, plate_number) VALUES (1, 1, now(), 'ق ط ر 1234');
          INSERT INTO inspection_items (service_invoice_id, service, notes)
@@ -131,25 +135,91 @@ async fn fleet_tools_answer_from_the_data() {
     let overview = tools::run(&c, "fleet_overview", &json!({ "days": 30 })).await;
     let watanya = overview["companies"].as_array().unwrap().iter().find(|r| r["operating_company"] == "Watanya").unwrap();
     assert_eq!(watanya["trips"], 2, "{overview}");
-    assert_eq!(watanya["revenue"], 4500);
+    // Base, VAT and total are reported apart, from the stored figures.
+    assert_eq!(watanya["base_revenue"], 4500);
+    assert_eq!(watanya["vat"], 630);
+    assert_eq!(watanya["rental"], 0);
+    assert_eq!(watanya["total_revenue"], 5130);
 
     let from = (chrono::Utc::now().date_naive() - chrono::Duration::days(10)).to_string();
     let to = chrono::Utc::now().date_naive().to_string();
     let rev = tools::run(&c, "revenue_breakdown", &json!({ "from": from, "to": to, "group_by": "car" })).await;
     let row = &rev["rows"][0];
-    assert_eq!(row["revenue"], 4500, "{rev}");
+    assert_eq!(row["base_revenue"], 4500, "{rev}");
+    assert_eq!(row["total_revenue"], 5130);
     assert_eq!(row["fuel_cost"], 800);
-    assert_eq!(row["margin_before_driver"], 3700);
+    // On the total, rental and VAT included — and the tool says so.
+    assert_eq!(row["margin_before_driver"], 4330);
+    assert!(rev["margin_basis"].as_str().unwrap().contains("total_revenue"));
 
     let options = tools::run(&c, "route_options", &json!({ "car_id": 1 })).await;
     let first = &options["options"][0];
-    // 1500 / (2×50 + empty) beats 3000 / (2×200 + empty) per km.
+    // Priced from Watanya's rule for this 38,000 L tank: band 1 is
+    // 104.5 x 38 = 3971 over 2x50 km + empty, which beats band 2's
+    // 122.1 x 38 = 4639.8 over 2x200 km + empty. Never fee / km.
     assert_eq!(first["drop_off_point"], "Station A", "{options}");
+    assert_eq!(first["band"], 1);
+    assert_eq!(first["expected_base_revenue"], 3971.0);
+    assert_eq!(first["expected_vat"], 555.94);
     assert_eq!(first["empty_km_method"], "straight_line_x1.3");
     assert_eq!(options["truck_position_known"], true);
+    assert_eq!(options["tank_capacity_l"], 38000);
+    let second = &options["options"][1];
+    assert_eq!(second["expected_base_revenue"], 4639.8);
+    // A band the rule has no rate for is listed as unpriced, not ranked at 0.
+    let z = &options["unpriced_routes"][0];
+    assert_eq!(z["drop_off_point"], "Station Z", "{options}");
+    assert!(z["why"].as_str().unwrap().contains("band 40"));
+    // A company with no pricing rule cannot be priced at all.
+    let mobil = tools::run(&c, "route_options", &json!({ "car_id": 2 })).await;
+    assert!(mobil["error"].as_str().unwrap().contains("no pricing rule"), "{mobil}");
 
     let bad = tools::run(&c, "revenue_breakdown", &json!({ "from": "yesterday", "to": to, "group_by": "car" })).await;
     assert!(bad["error"].as_str().unwrap().contains("YYYY-MM-DD"));
+}
+
+/// What a company is charged, version by version.
+#[tokio::test]
+async fn pricing_rules_answer_what_we_charge() {
+    let pool = db("advisor_pricing_rules").await;
+    // A future Watanya version: band 5 goes up from 1 December.
+    sqlx::raw_sql(
+        "INSERT INTO pricing_rules (company, effective_from, method, vat_rate, notes)
+         VALUES ('Watanya', (current_date + 40), 'band_per_1000l', 0.14, 'band 5 up');
+         INSERT INTO pricing_bands (rule_id, band, rate_per_1000l)
+         SELECT id, 5, 190 FROM pricing_rules WHERE notes = 'band 5 up';",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let adv = offline_advisor("http://127.0.0.1:9");
+    let token = apex::advisor::upstream::BearerToken("t".into());
+    let c = ctx(&pool, &adv, &token);
+
+    let out = tools::run(&c, "pricing_rules", &json!({ "company": "Watanya" })).await;
+    let wa = &out["companies"][0];
+    assert_eq!(wa["company"], "Watanya", "{out}");
+    let now = &wa["in_force"];
+    assert_eq!(now["method"], "band_per_1000l");
+    assert_eq!(now["vat_rate"], 0.14);
+    let band5 = now["bands"].as_array().unwrap().iter().find(|b| b["band"] == 5).unwrap();
+    assert_eq!(band5["rate_per_1000l"], 183.7);
+    assert_eq!(wa["future"][0]["notes"], "band 5 up");
+
+    // On a date after it starts, the new version is the one in force.
+    let later = (chrono::Utc::now().date_naive() + chrono::Duration::days(60)).to_string();
+    let out = tools::run(&c, "pricing_rules", &json!({ "company": "Watanya", "on_date": later })).await;
+    assert_eq!(out["companies"][0]["in_force"]["notes"], "band 5 up");
+    assert_eq!(out["companies"][0]["history"].as_array().unwrap().len(), 1);
+
+    let all = tools::run(&c, "pricing_rules", &json!({})).await;
+    assert_eq!(all["companies"].as_array().unwrap().len(), 4, "{all}");
+    let taqa = all["companies"].as_array().unwrap().iter().find(|c| c["company"] == "TAQA").unwrap();
+    assert_eq!(taqa["in_force"]["rental_mode"], "monthly_taper");
+    assert_eq!(taqa["in_force"]["rental_amount"], 43000.0);
+
+    let none = tools::run(&c, "pricing_rules", &json!({ "company": "Mobil" })).await;
+    assert!(none["error"].is_string());
 }
 
 #[tokio::test]

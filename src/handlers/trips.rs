@@ -11,10 +11,12 @@
 //!   show revenue in aggregate, while this puts a figure against one driver's
 //!   one trip. Those are different disclosures and the stricter one wins.
 //!
-//! The money gate is enforced here rather than in the router, and
-//! [`crate::db::trip_queries::list_trips`] decides independently whether to
-//! read the columns at all. So a caller below 4 does not receive figures that
-//! some layer above was trusted to strip.
+//! The money gate is enforced in [`crate::db::trip_queries::list_trips`],
+//! which decides from the caller's permission whether to read the columns at
+//! all. So a caller below 4 does not receive figures that some layer above was
+//! trusted to strip. Below 3 the fee mapping's raw `fee` is withheld as well
+//! where it is a price (Petrol Arrows' EGP per 1,000 L); it used to reach every
+//! level.
 
 use actix_web::{web, HttpMessage, HttpRequest, HttpResponse};
 use serde::Deserialize;
@@ -25,9 +27,6 @@ use crate::db::trip_queries::{list_trips, TripListFilters, DEFAULT_LIMIT};
 use crate::models::trip_list::{TripListMeta, TripListResponse};
 use crate::utils::response;
 
-/// The permission that may see per-trip revenue.
-const FINANCIAL_PERMISSION: i32 = 4;
-
 #[derive(Debug, Deserialize)]
 pub struct TripListQuery {
     pub page: Option<i64>,
@@ -36,8 +35,7 @@ pub struct TripListQuery {
     pub missing_data: Option<String>,
     pub receipt_status: Option<String>,
     pub company: Option<String>,
-    /// `YYYY-MM-DD`, inclusive. Also scopes the revenue window — see
-    /// [`crate::db::revenue::allocation`].
+    /// `YYYY-MM-DD`, inclusive.
     pub from: Option<String>,
     pub to: Option<String>,
     /// `msgpack` to get MessagePack instead of JSON. The dashboard always asks
@@ -63,7 +61,6 @@ pub async fn get_trips(
         .get::<Claims>()
         .and_then(|c| c.permission)
         .unwrap_or(0);
-    let financial = permission >= FINANCIAL_PERMISSION;
 
     let query = query.into_inner();
     let use_msgpack = query.format.as_deref() == Some("msgpack");
@@ -79,7 +76,7 @@ pub async fn get_trips(
     }
     .normalized();
 
-    let (data, total) = list_trips(pool.get_ref(), &filters, financial)
+    let (data, total) = list_trips(pool.get_ref(), &filters, permission)
         .await
         .map_err(|e| {
             log::error!("trips list failed: {e:#}");
@@ -104,5 +101,6 @@ pub async fn get_trips(
 
 
 /// The permission needed to see the list at all, matching the FalconGo route
-/// this replaces. Money is gated separately at [`FINANCIAL_PERMISSION`].
+/// this replaces. Money is gated separately at
+/// [`crate::db::trip_queries::MONEY_PERMISSION`].
 pub const VIEW_PERMISSION: i32 = 1;

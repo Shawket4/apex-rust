@@ -67,7 +67,7 @@ pub fn tool_defs() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "fleet_overview",
-            description: "Every active truck with its operating company and area, driver, whether it is in a trip, last known location time, and its trips/revenue over the last N days; plus per-company totals. The starting point for utilisation and rebalancing questions.".into(),
+            description: "Every active truck with its operating company and area, driver, last trip date, and over the last N days: trips, base revenue (the trips' stored revenue before VAT), rental (its share of the truck-month rental TAQA/Petromin pay, spread over the days it worked), VAT, total (base + rental + VAT) and unpriced trips; plus this month's stored truck-month rental so far. Per-company totals too. The starting point for utilisation and rebalancing questions.".into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -78,16 +78,28 @@ pub fn tool_defs() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "revenue_breakdown",
-            description: "Revenue (trips.revenue, the fee for each delivery), trip count and mileage between two dates, grouped by car, company, terminal, drop_off_point, driver or day. Grouped by car it also subtracts fuel, oil-change and service costs for a per-truck margin (driver pay excluded).".into(),
+            description: "Stored revenue between two dates, grouped by car, company, terminal, drop_off_point, driver or day, from FalconGo's priced trips: base_revenue (before VAT), rental (each trip's share of its truck-month rental: a car-month's rental spread evenly over the days the car worked, a day split between that day's trips — so a part-month gets the worked days' share), vat, total_revenue (base + rental + VAT), trip count, unpriced trips (no pricing rule/fee mapping/band rate — they earn 0 until fixed) and mileage. Grouped by car it also subtracts fuel, oil-change and service costs: margin_before_driver = total_revenue − fuel − oil − service (driver pay excluded).".into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "from": date, "to": date,
+                    "from": date.clone(), "to": date.clone(),
                     "group_by": { "type": "string", "enum": ["car", "company", "terminal", "drop_off_point", "driver", "day"] },
                     "company": { "type": "string" },
                     "car_id": { "type": "integer" }
                 },
                 "required": ["from", "to", "group_by"]
+            }),
+        },
+        ToolDef {
+            name: "pricing_rules",
+            description: "What each customer company is charged: its pricing versions from FalconGo's pricing rules, effective-dated — the one in force on a date (default today), later (future) versions and the history. Each has its method (per_1000l_fee: tank litres × the route's fee / 1000, Petrol Arrows; band_per_1000l: tank litres × the band's rate / 1000, Watanya, with its band table; per_km: rate × the trip's furthest drop km, TAQA/Petromin), VAT rate and car rental (monthly_taper: per car-month, tapered below rental_full_days; per_car_day). Use it to answer \"what do we charge Watanya for band 5\" and before proposing create_pricing_rule.".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "company": { "type": "string" },
+                    "on_date": { "type": "string", "description": "YYYY-MM-DD; which version is in force on this date (default today, Cairo)" },
+                    "history": { "type": "boolean", "description": "include superseded versions (default true)" }
+                }
             }),
         },
         ToolDef {
@@ -118,7 +130,7 @@ pub fn tool_defs() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "route_options",
-            description: "Where a truck could earn the most: every (terminal, drop-off) fee mapping for a company with fee, distance and fee per km, plus the empty km from the truck's current position to each terminal (road distance when available). Rank by fee per total km to suggest better work.".into(),
+            description: "Where a truck could earn the most: every (terminal, drop-off) route of a company with its expected revenue per delivery for THIS truck's tank — priced by the company's pricing rule in force today (Petrol Arrows: route fee × litres / 1000; Watanya: band rate × litres / 1000; TAQA/Petromin: per-km rate × distance) — its VAT, distance, and the empty km from the truck's current position to the terminal (road distance when available). Ranked by base revenue per total km (empty run + there and back). Car rental is per truck-month, not per delivery, so it is not in the per-route figures.".into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -205,6 +217,7 @@ pub async fn run(ctx: &ToolCtx<'_>, name: &str, args: &Value) -> Value {
         "truck_itinerary" => truck_itinerary(ctx, args).await,
         "trip_audit" => trip_audit(ctx, args).await,
         "route_options" => route_options(ctx, args).await,
+        "pricing_rules" => pricing_rules(ctx, args).await,
         "search_service_history" => search_history(ctx, args).await,
         "maintenance_status" => maintenance_status(ctx, args).await,
         "run_sql" => {
@@ -286,53 +299,89 @@ async fn find_truck(ctx: &ToolCtx<'_>, args: &Value) -> ToolResult {
     .await
 }
 
+/// What every money figure in these tools means, for the model to quote.
+const MONEY_BASIS: &str = "base_revenue = the trips' stored revenue before VAT (FalconGo prices each trip on write); rental = the trips' share of their truck-month rental (a car-month's stored rental spread evenly over the days the car worked); vat = VAT on both; total_revenue = base + rental + VAT. EGP.";
+
 async fn fleet_overview(ctx: &ToolCtx<'_>, args: &Value) -> ToolResult {
     let days = i(args, "days").unwrap_or(30).clamp(1, 120);
     let company = s(args, "company").map(str::to_string);
+    // Per car over the window, from the stored revenue; and the car's stored
+    // truck-month rental for the current month (recomputed nightly).
+    let per_car = "
+        r AS (
+            SELECT t.car_id, count(*) AS trips,
+                   sum(COALESCE(tr.base_revenue, 0)) AS base,
+                   sum(tr.allocated_rental) AS rental,
+                   sum(tr.allocated_vat) AS vat,
+                   sum(tr.allocated_total) AS total,
+                   count(*) FILTER (WHERE tr.base_revenue IS NULL) AS unpriced,
+                   max(t.date) AS last_trip_date
+              FROM trip_revenue tr
+              JOIN trips t ON t.id = tr.trip_id
+             WHERE tr.date >= to_char(current_date - $1::int, 'YYYY-MM-DD')
+             GROUP BY t.car_id),
+        m AS (
+            SELECT car_no_plate, sum(rental) AS month_rental, max(month_days_worked) AS month_days
+              FROM truck_month_charges
+             WHERE month = date_trunc('month', (now() AT TIME ZONE 'Africa/Cairo'))::date
+             GROUP BY car_no_plate)";
     let trucks = rows(
         ctx.pool,
-        "WITH t AS (
-            SELECT car_id, count(*) AS trips, COALESCE(sum(revenue), 0) AS revenue,
-                   max(date) AS last_trip_date
-              FROM trips
-             WHERE deleted_at IS NULL
-               AND date >= to_char(current_date - $1::int, 'YYYY-MM-DD')
-             GROUP BY car_id)
-         SELECT c.id AS car_id, c.car_no_plate, c.operating_company, c.operating_area,
-                d.name AS driver_name,
-                COALESCE(t.trips, 0) AS trips, round(COALESCE(t.revenue, 0)::numeric, 0) AS revenue,
-                t.last_trip_date
-           FROM cars c
-           LEFT JOIN drivers d ON d.id = c.driver_id
-           LEFT JOIN t ON t.car_id = c.id
-          WHERE c.deleted_at IS NULL
-            AND ($2::text IS NULL OR c.operating_company = $2)
-          ORDER BY c.operating_company, revenue DESC",
+        &format!(
+            "WITH {per_car}
+             SELECT c.id AS car_id, c.car_no_plate, c.operating_company, c.operating_area,
+                    d.name AS driver_name,
+                    COALESCE(r.trips, 0) AS trips,
+                    round(COALESCE(r.base, 0)::numeric, 0) AS base_revenue,
+                    round(COALESCE(r.rental, 0)::numeric, 0) AS rental,
+                    round(COALESCE(r.vat, 0)::numeric, 0) AS vat,
+                    round(COALESCE(r.total, 0)::numeric, 0) AS total_revenue,
+                    COALESCE(r.unpriced, 0) AS unpriced_trips,
+                    r.last_trip_date,
+                    round(m.month_rental::numeric, 0) AS this_month_rental_stored,
+                    m.month_days AS this_month_days_worked
+               FROM cars c
+               LEFT JOIN drivers d ON d.id = c.driver_id
+               LEFT JOIN r ON r.car_id = c.id
+               LEFT JOIN m ON m.car_no_plate = c.car_no_plate
+              WHERE c.deleted_at IS NULL
+                AND ($2::text IS NULL OR c.operating_company = $2)
+              ORDER BY c.operating_company, total_revenue DESC"
+        ),
         vec![json!(days), json!(company)],
     )
     .await?;
     let companies = rows(
         ctx.pool,
-        "WITH t AS (
-            SELECT car_id, count(*) AS trips, COALESCE(sum(revenue), 0) AS revenue
-              FROM trips
-             WHERE deleted_at IS NULL
-               AND date >= to_char(current_date - $1::int, 'YYYY-MM-DD')
-             GROUP BY car_id)
-         SELECT COALESCE(NULLIF(c.operating_company, ''), '(none)') AS operating_company,
-                count(*) AS trucks,
-                count(*) FILTER (WHERE COALESCE(t.trips, 0) = 0) AS idle_trucks,
-                COALESCE(sum(t.trips), 0) AS trips,
-                round(COALESCE(sum(t.revenue), 0)::numeric, 0) AS revenue,
-                round((COALESCE(sum(t.revenue), 0) / NULLIF(count(*), 0))::numeric, 0) AS revenue_per_truck
-           FROM cars c LEFT JOIN t ON t.car_id = c.id
-          WHERE c.deleted_at IS NULL
-            AND ($2::text IS NULL OR c.operating_company = $2)
-          GROUP BY 1 ORDER BY revenue DESC",
+        &format!(
+            "WITH {per_car}
+             SELECT COALESCE(NULLIF(c.operating_company, ''), '(none)') AS operating_company,
+                    count(*) AS trucks,
+                    count(*) FILTER (WHERE COALESCE(r.trips, 0) = 0) AS idle_trucks,
+                    COALESCE(sum(r.trips), 0) AS trips,
+                    round(COALESCE(sum(r.base), 0)::numeric, 0) AS base_revenue,
+                    round(COALESCE(sum(r.rental), 0)::numeric, 0) AS rental,
+                    round(COALESCE(sum(r.vat), 0)::numeric, 0) AS vat,
+                    round(COALESCE(sum(r.total), 0)::numeric, 0) AS total_revenue,
+                    round((COALESCE(sum(r.total), 0) / NULLIF(count(*), 0))::numeric, 0) AS total_per_truck,
+                    COALESCE(sum(r.unpriced), 0) AS unpriced_trips,
+                    round(COALESCE(sum(m.month_rental), 0)::numeric, 0) AS this_month_rental_stored
+               FROM cars c
+               LEFT JOIN r ON r.car_id = c.id
+               LEFT JOIN m ON m.car_no_plate = c.car_no_plate
+              WHERE c.deleted_at IS NULL
+                AND ($2::text IS NULL OR c.operating_company = $2)
+              GROUP BY 1 ORDER BY total_revenue DESC"
+        ),
         vec![json!(days), json!(s(args, "company"))],
     )
     .await?;
-    Ok(json!({ "window_days": days, "companies": companies, "trucks": trucks }))
+    Ok(json!({
+        "window_days": days,
+        "money_basis": MONEY_BASIS,
+        "companies": companies,
+        "trucks": trucks,
+    }))
 }
 
 async fn revenue_breakdown(ctx: &ToolCtx<'_>, args: &Value) -> ToolResult {
@@ -348,14 +397,22 @@ async fn revenue_breakdown(ctx: &ToolCtx<'_>, args: &Value) -> ToolResult {
         "day" => "t.date",
         other => return Err(format!("unknown group_by `{other}`")),
     };
+    // The stored revenue, per row, filtered on the view's own company/date so
+    // the predicate reaches below its window.
     let base = format!(
         "SELECT {key} AS key, min(t.car_no_plate) AS plate_example,
-                count(*) AS trips, round(sum(t.revenue)::numeric, 0) AS revenue,
+                count(*) AS trips,
+                round(sum(COALESCE(tr.base_revenue, 0))::numeric, 0) AS base_revenue,
+                round(sum(tr.allocated_rental)::numeric, 0) AS rental,
+                round(sum(tr.allocated_vat)::numeric, 0) AS vat,
+                round(sum(tr.allocated_total)::numeric, 0) AS total_revenue,
+                count(*) FILTER (WHERE tr.base_revenue IS NULL) AS unpriced_trips,
                 round(sum(t.mileage)::numeric, 0) AS mileage_km,
-                round((sum(t.revenue) / NULLIF(count(*), 0))::numeric, 0) AS revenue_per_trip
-           FROM trips t
-          WHERE t.deleted_at IS NULL AND t.date BETWEEN $1 AND $2
-            AND ($3::text IS NULL OR t.company = $3)
+                round((sum(tr.allocated_total) / NULLIF(count(*), 0))::numeric, 0) AS total_per_trip
+           FROM trip_revenue tr
+           JOIN trips t ON t.id = tr.trip_id
+          WHERE tr.date BETWEEN $1 AND $2
+            AND ($3::text IS NULL OR tr.company = $3)
             AND ($4::bigint IS NULL OR t.car_id = $4::bigint)
           GROUP BY 1"
     );
@@ -373,7 +430,7 @@ async fn revenue_breakdown(ctx: &ToolCtx<'_>, args: &Value) -> ToolResult {
                     round(COALESCE(f.fuel, 0)::numeric, 0) AS fuel_cost,
                     round(COALESCE(o.oil, 0)::numeric, 0) AS oil_cost,
                     round(COALESCE(sv.service, 0)::numeric, 0) AS service_cost,
-                    round((r.revenue - COALESCE(f.fuel, 0) - COALESCE(o.oil, 0) - COALESCE(sv.service, 0))::numeric, 0) AS margin_before_driver
+                    round((r.total_revenue - COALESCE(f.fuel, 0) - COALESCE(o.oil, 0) - COALESCE(sv.service, 0))::numeric, 0) AS margin_before_driver
                FROM r
                LEFT JOIN cars c ON c.id::text = r.key
                LEFT JOIN f ON f.key = r.key
@@ -382,7 +439,7 @@ async fn revenue_breakdown(ctx: &ToolCtx<'_>, args: &Value) -> ToolResult {
               ORDER BY margin_before_driver DESC"
         )
     } else {
-        format!("{base} ORDER BY revenue DESC")
+        format!("{base} ORDER BY total_revenue DESC")
     };
     let out = rows(
         ctx.pool,
@@ -390,7 +447,66 @@ async fn revenue_breakdown(ctx: &ToolCtx<'_>, args: &Value) -> ToolResult {
         vec![json!(from), json!(to), json!(s(args, "company")), json!(i(args, "car_id"))],
     )
     .await?;
-    Ok(json!({ "from": from, "to": to, "group_by": group, "rows": out }))
+    let mut result = json!({ "from": from, "to": to, "group_by": group, "money_basis": MONEY_BASIS, "rows": out });
+    if group == "car" {
+        result["margin_basis"] = json!(
+            "margin_before_driver = total_revenue (base + rental + VAT) − fuel − oil changes − services in the period; driver pay is not subtracted"
+        );
+    }
+    Ok(result)
+}
+
+/// `pricing_rules`: each company's effective-dated versions, split into the one
+/// in force on a date, the later ones, and the history.
+async fn pricing_rules(ctx: &ToolCtx<'_>, args: &Value) -> ToolResult {
+    let on = match s(args, "on_date") {
+        Some(_) => date(args, "on_date")?,
+        None => chrono::Utc::now().with_timezone(&chrono_tz::Africa::Cairo).format("%Y-%m-%d").to_string(),
+    };
+    let history = args.get("history").and_then(Value::as_bool).unwrap_or(true);
+    let all = rows(
+        ctx.pool,
+        "SELECT r.id, r.company, to_char(r.effective_from, 'YYYY-MM-DD') AS effective_from,
+                r.method, r.per_km_rate::float8 AS per_km_rate, r.vat_rate::float8 AS vat_rate,
+                r.rental_mode, r.rental_amount::float8 AS rental_amount, r.rental_full_days,
+                r.notes, r.created_by_user_id, to_char(r.created_at, 'YYYY-MM-DD') AS created_on,
+                (SELECT COALESCE(jsonb_agg(jsonb_build_object('band', b.band,
+                                 'rate_per_1000l', b.rate_per_1000l::float8) ORDER BY b.band), '[]'::jsonb)
+                   FROM pricing_bands b WHERE b.rule_id = r.id) AS bands
+           FROM pricing_rules r
+          WHERE ($1::text IS NULL OR r.company = $1)
+          ORDER BY r.company, r.effective_from DESC",
+        vec![json!(s(args, "company"))],
+    )
+    .await?;
+    let mut companies: Vec<Value> = Vec::new();
+    for rule in all.as_array().into_iter().flatten() {
+        let company = rule["company"].as_str().unwrap_or_default();
+        if companies.last().map(|c| c["company"] != company).unwrap_or(true) {
+            companies.push(json!({ "company": company, "in_force": null, "future": [], "history": [] }));
+        }
+        let entry = companies.last_mut().expect("just pushed");
+        let starts = rule["effective_from"].as_str().unwrap_or_default();
+        // Newest first: the first version on or before the date is in force.
+        if starts > on.as_str() {
+            entry["future"].as_array_mut().expect("array").push(rule.clone());
+        } else if entry["in_force"].is_null() {
+            entry["in_force"] = rule.clone();
+        } else if history {
+            entry["history"].as_array_mut().expect("array").push(rule.clone());
+        }
+    }
+    if companies.is_empty() {
+        return Err(match s(args, "company") {
+            Some(c) => format!("no pricing rules for `{c}`; companies are named as on trips (Petrol Arrows, Watanya, TAQA, Petromin)"),
+            None => "no pricing rules exist yet".into(),
+        });
+    }
+    Ok(json!({
+        "on_date": on,
+        "how_to_read": "per_1000l_fee: base = tank litres × the route's fee_mappings.fee / 1000. band_per_1000l: base = tank litres × bands[fee_mappings.fee].rate_per_1000l / 1000. per_km: base = per_km_rate × the trip's furthest drop km. VAT = vat_rate × base (and × rental). monthly_taper: rental_amount per car-month at rental_full_days or more days worked, less rental_amount/rental_full_days per day short. per_car_day: rental_amount per distinct car-day. A trip is priced by the version in force on its date; rental by the version in force on its month's first day.",
+        "companies": companies,
+    }))
 }
 
 /// The car's ETIT tracker id, or a message the model can act on.
@@ -490,55 +606,104 @@ fn haversine_km(a: (f64, f64), b: (f64, f64)) -> f64 {
 
 async fn route_options(ctx: &ToolCtx<'_>, args: &Value) -> ToolResult {
     let car_id = i(args, "car_id").ok_or("`car_id` is required")?;
-    let car: Option<(String, Option<String>)> = sqlx::query_as(
-        "SELECT car_no_plate, operating_company FROM cars WHERE id = $1 AND deleted_at IS NULL",
+    // The tank the routes are priced for: the truck's, or what it last carried.
+    let car: Option<(String, Option<String>, Option<i64>, Option<i64>)> = sqlx::query_as(
+        "SELECT c.car_no_plate, c.operating_company, NULLIF(c.tank_capacity, 0)::bigint,
+                (SELECT NULLIF(t.tank_capacity, 0)::bigint FROM trips t
+                  WHERE t.car_id = c.id AND t.deleted_at IS NULL ORDER BY t.date DESC, t.id DESC LIMIT 1)
+           FROM cars c WHERE c.id = $1 AND c.deleted_at IS NULL",
     )
     .bind(car_id)
     .fetch_optional(ctx.pool)
     .await
     .map_err(|e| e.to_string())?;
-    let (plate, op_company) = car.ok_or(format!("no car with id {car_id}"))?;
+    let (plate, op_company, car_tank, last_tank) = car.ok_or(format!("no car with id {car_id}"))?;
+    let (tank, tank_source) = match (car_tank, last_tank) {
+        (Some(t), _) => (Some(t), "the truck's tank_capacity"),
+        (None, Some(t)) => (Some(t), "its most recent trip's tank_capacity"),
+        (None, None) => (None, "unknown"),
+    };
     let company = s(args, "company")
         .map(str::to_string)
         .or(op_company.filter(|c| !c.trim().is_empty()))
         .ok_or("the truck has no operating company; pass `company`")?;
+
+    // The company's pricing version in force today (Cairo).
+    #[derive(sqlx::FromRow)]
+    struct Rule {
+        id: i64,
+        effective_from: String,
+        method: String,
+        per_km_rate: Option<f64>,
+        vat_rate: f64,
+        rental_mode: String,
+        rental_amount: Option<f64>,
+    }
+    let rule: Rule = sqlx::query_as(
+        "SELECT id, to_char(effective_from, 'YYYY-MM-DD') AS effective_from, method,
+                per_km_rate::float8 AS per_km_rate, vat_rate::float8 AS vat_rate,
+                rental_mode, rental_amount::float8 AS rental_amount
+           FROM pricing_rules
+          WHERE company = $1 AND effective_from <= (now() AT TIME ZONE 'Africa/Cairo')::date
+          ORDER BY effective_from DESC LIMIT 1",
+    )
+    .bind(&company)
+    .fetch_optional(ctx.pool)
+    .await
+    .map_err(|e| e.to_string())?
+    .ok_or(format!("no pricing rule in force today for `{company}`; nothing to price its routes with"))?;
+
+    // Every route, priced in SQL from the rule: the same inputs FalconGo's
+    // engine prices a trip from (the route's fee or band, its distance), for
+    // this truck's tank.
+    #[derive(sqlx::FromRow)]
+    struct Route {
+        terminal: String,
+        drop_off_point: String,
+        distance: f64,
+        band: Option<i32>,
+        base: Option<f64>,
+        t_lat: Option<f64>,
+        t_lng: Option<f64>,
+    }
+    let routes: Vec<Route> = sqlx::query_as(
+        "SELECT fm.terminal, fm.drop_off_point, COALESCE(fm.distance, 0)::float8 AS distance,
+                CASE WHEN r.method = 'band_per_1000l' THEN fm.fee::int END AS band,
+                (CASE r.method
+                   WHEN 'per_1000l_fee'  THEN $3::numeric * fm.fee / 1000
+                   WHEN 'band_per_1000l' THEN $3::numeric * pb.rate_per_1000l / 1000
+                   WHEN 'per_km'         THEN r.per_km_rate * fm.distance
+                 END)::float8 AS base,
+                NULLIF(t.latitude, 0)::float8 AS t_lat, NULLIF(t.longitude, 0)::float8 AS t_lng
+           FROM fee_mappings fm
+           JOIN pricing_rules r ON r.id = $4
+           LEFT JOIN pricing_bands pb
+             ON r.method = 'band_per_1000l' AND pb.rule_id = r.id AND pb.band = fm.fee::int
+           LEFT JOIN terminals t ON t.id = fm.terminal_id AND t.deleted_at IS NULL
+          WHERE fm.deleted_at IS NULL AND fm.company = $1
+            AND ($2::text IS NULL OR fm.terminal = $2)",
+    )
+    .bind(&company)
+    .bind(s(args, "terminal"))
+    .bind(tank)
+    .bind(rule.id)
+    .fetch_all(ctx.pool)
+    .await
+    .map_err(|e| e.to_string())?;
+    if routes.is_empty() {
+        return Err(format!("no fee mappings (routes) for company `{company}`"));
+    }
+
     // Where it is now, from its tracker (cars.latitude/longitude are stale).
     let live = fleet::position(ctx, car_id).await;
     let here = live.map(|(p, _)| p);
 
-    #[derive(sqlx::FromRow)]
-    struct Mapping {
-        terminal: String,
-        drop_off_point: String,
-        distance: f64,
-        fee: f64,
-        t_lat: Option<f64>,
-        t_lng: Option<f64>,
-    }
-    let mappings: Vec<Mapping> = sqlx::query_as(
-        "SELECT fm.terminal, fm.drop_off_point, fm.distance::float8 AS distance, fm.fee::float8 AS fee,
-                NULLIF(t.latitude, 0)::float8 AS t_lat, NULLIF(t.longitude, 0)::float8 AS t_lng
-           FROM fee_mappings fm
-           LEFT JOIN terminals t ON t.id = fm.terminal_id AND t.deleted_at IS NULL
-          WHERE fm.deleted_at IS NULL AND fm.company = $1
-            AND ($2::text IS NULL OR fm.terminal = $2)
-            AND fm.fee > 0",
-    )
-    .bind(&company)
-    .bind(s(args, "terminal"))
-    .fetch_all(ctx.pool)
-    .await
-    .map_err(|e| e.to_string())?;
-    if mappings.is_empty() {
-        return Err(format!("no fee mappings for company `{company}`"));
-    }
-
     // Empty km to each terminal, once per terminal; road distance for the
     // nearest few when OSRM is configured, straight-line otherwise.
     let mut terminals: Vec<(String, Option<(f64, f64)>)> = Vec::new();
-    for m in &mappings {
-        if !terminals.iter().any(|(n, _)| n == &m.terminal) {
-            terminals.push((m.terminal.clone(), m.t_lat.zip(m.t_lng)));
+    for r in &routes {
+        if !terminals.iter().any(|(n, _)| n == &r.terminal) {
+            terminals.push((r.terminal.clone(), r.t_lat.zip(r.t_lng)));
         }
     }
     let mut empty_km: std::collections::HashMap<String, (f64, &'static str)> = Default::default();
@@ -564,35 +729,57 @@ async fn route_options(ctx: &ToolCtx<'_>, args: &Value) -> ToolResult {
         }
     }
 
-    let mut options: Vec<Value> = mappings
-        .iter()
-        .map(|m| {
-            let empty = empty_km.get(&m.terminal).copied();
-            // A delivery is terminal → drop-off and back: 2 × distance loaded
-            // and return, plus the empty run to reach the terminal.
-            let total = 2.0 * m.distance + empty.map(|e| e.0).unwrap_or(0.0);
-            json!({
-                "terminal": m.terminal,
-                "drop_off_point": m.drop_off_point,
-                "fee": m.fee,
-                "distance_km": m.distance,
-                "fee_per_km_round_trip": if m.distance > 0.0 { Some((m.fee / (2.0 * m.distance) * 100.0).round() / 100.0) } else { None },
-                "empty_km_to_terminal": empty.map(|e| (e.0 * 10.0).round() / 10.0),
-                "empty_km_method": empty.map(|e| e.1),
-                "fee_per_total_km": if total > 0.0 { Some((m.fee / total * 100.0).round() / 100.0) } else { None },
-            })
-        })
-        .collect();
+    let round2 = |v: f64| (v * 100.0).round() / 100.0;
+    let mut unpriced = Vec::new();
+    let mut options: Vec<Value> = Vec::new();
+    for r in &routes {
+        let Some(base) = r.base.filter(|b| *b > 0.0) else {
+            let why = match (rule.method.as_str(), tank, r.band) {
+                ("per_1000l_fee" | "band_per_1000l", None, _) => "the truck's tank capacity is unknown".to_string(),
+                ("band_per_1000l", _, Some(b)) => format!("band {b} has no rate in pricing rule {}", rule.id),
+                ("per_km", _, _) if r.distance <= 0.0 => "the route has no distance".to_string(),
+                _ => "the route has no fee".to_string(),
+            };
+            unpriced.push(json!({ "terminal": r.terminal, "drop_off_point": r.drop_off_point, "why": why }));
+            continue;
+        };
+        let empty = empty_km.get(&r.terminal).copied();
+        // A delivery is terminal → drop-off and back, plus the empty run to
+        // reach the terminal.
+        let total_km = 2.0 * r.distance + empty.map(|e| e.0).unwrap_or(0.0);
+        options.push(json!({
+            "terminal": r.terminal,
+            "drop_off_point": r.drop_off_point,
+            "band": r.band,
+            "distance_km": r.distance,
+            "expected_base_revenue": round2(base),
+            "expected_vat": round2(base * rule.vat_rate),
+            "expected_total": round2(base * (1.0 + rule.vat_rate)),
+            "base_per_km_round_trip": (r.distance > 0.0).then(|| round2(base / (2.0 * r.distance))),
+            "empty_km_to_terminal": empty.map(|e| (e.0 * 10.0).round() / 10.0),
+            "empty_km_method": empty.map(|e| e.1),
+            "total_km": (total_km * 10.0).round() / 10.0,
+            "base_per_total_km": (total_km > 0.0).then(|| round2(base / total_km)),
+        }));
+    }
     options.sort_by(|a, b| {
-        let f = |v: &Value| v["fee_per_total_km"].as_f64().unwrap_or(0.0);
+        let f = |v: &Value| v["base_per_total_km"].as_f64().unwrap_or(0.0);
         f(b).partial_cmp(&f(a)).unwrap_or(std::cmp::Ordering::Equal)
     });
     options.truncate(40);
     Ok(json!({
         "car_id": car_id, "plate": plate, "company": company,
+        "tank_capacity_l": tank, "tank_capacity_from": tank_source,
+        "pricing_rule": {
+            "id": rule.id, "effective_from": rule.effective_from, "method": rule.method,
+            "per_km_rate": rule.per_km_rate, "vat_rate": rule.vat_rate,
+            "rental_mode": rule.rental_mode, "rental_amount": rule.rental_amount,
+        },
+        "rental_note": "Car rental (TAQA monthly, Petromin per car-day) is earned per truck-month whichever route it runs, so it is not in these per-delivery figures; add it when comparing companies.",
         "truck_position_known": here.is_some(),
         "position_fix_cairo": live.and_then(|(_, t)| t).as_ref().map(fleet::cairo),
         "options": options,
+        "unpriced_routes": unpriced,
     }))
 }
 

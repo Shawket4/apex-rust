@@ -63,6 +63,8 @@ pub enum Ty {
     Enum(&'static [&'static str]),
     /// A list of `{service, notes}` lines (a service invoice's items).
     Items,
+    /// A list of objects, each with these fields (a pricing rule's bands).
+    List(&'static [Field]),
 }
 
 impl Ty {
@@ -78,6 +80,18 @@ impl Ty {
             Ty::Enum(vals) => json!({ "type": "string", "enum": vals }),
             Ty::Items => json!({ "type": "array", "items": { "type": "object", "properties": {
                 "service": { "type": "string" }, "notes": { "type": "string" } } } }),
+            Ty::List(fields) => {
+                let mut props = Map::new();
+                for fl in fields {
+                    let mut d = fl.ty.describe();
+                    if !fl.doc.is_empty() {
+                        d["description"] = json!(fl.doc);
+                    }
+                    props.insert(fl.name.into(), d);
+                }
+                let required: Vec<&str> = fields.iter().filter(|fl| fl.required).map(|fl| fl.name).collect();
+                json!({ "type": "array", "items": { "type": "object", "properties": props, "required": required } })
+            }
         }
     }
 
@@ -138,12 +152,37 @@ impl Ty {
                 }
                 Ok(Value::Array(out))
             }
+            Ty::List(fields) => {
+                let items = v.as_array().ok_or(format!("`{key}` must be a list"))?;
+                let mut out = Vec::new();
+                for (n, it) in items.iter().enumerate() {
+                    let obj = it.as_object().ok_or(format!("`{key}`[{n}] must be an object"))?;
+                    if let Some(extra) = obj.keys().find(|k| !fields.iter().any(|fl| fl.name == k.as_str())) {
+                        return Err(format!(
+                            "`{key}`[{n}] does not take `{extra}`; its fields are: {}",
+                            fields.iter().map(|fl| fl.name).collect::<Vec<_>>().join(", ")
+                        ));
+                    }
+                    let mut item = Map::new();
+                    for fl in fields {
+                        match obj.get(fl.name).filter(|v| !v.is_null()) {
+                            Some(v) => {
+                                item.insert(fl.name.into(), fl.ty.coerce(&format!("{key}[{n}].{}", fl.name), v)?);
+                            }
+                            None if fl.required => return Err(format!("`{key}`[{n}].{} is required", fl.name)),
+                            None => {}
+                        }
+                    }
+                    out.push(Value::Object(item));
+                }
+                Ok(Value::Array(out))
+            }
         }
     }
 }
 
 /// One body field a route accepts.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Field {
     pub name: &'static str,
     pub ty: Ty,

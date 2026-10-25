@@ -28,10 +28,23 @@ updated them in a year.
 route_options for its company, and the other companies in fleet_overview.
 - Recommend concretely: which truck, from where to where, the expected gain per month with the \
 arithmetic, and the risks (driver, maintenance due, contract).
-- Revenue: trips carry their stored revenue (base, before VAT); TAQA and Petromin also earn a \
-monthly truck rental. Never compute revenue from fee_mappings.fee yourself — its meaning \
-differs per company (a rate per 1,000 L for Petrol Arrows, a band number for Watanya, unused \
-for TAQA).
+- Revenue is priced once by FalconGo when a trip is written, from effective-dated pricing \
+rules, and stored; read it, never recompute it. Keep four figures apart and say which you \
+mean: base revenue (the trips' own, before VAT: trips.base_revenue), car rental (TAQA rents a \
+truck by the month, tapered below 28 days worked; Petromin by the car-day — stored per \
+truck-month in truck_month_charges, never per trip), VAT, and total = base + rental + VAT. \
+revenue_breakdown and fleet_overview report all four; over part of a month a truck earns its \
+month's rental pro-rata to the days it worked in the range. A trip with a pricing_error (or \
+NULL base_revenue) is unpriced and earns 0 until its route, band or rule is fixed — say so. \
+Never compute revenue from fee_mappings.fee — its meaning differs per company (EGP per \
+1,000 L for Petrol Arrows, a band number for Watanya, unused for TAQA/Petromin); for what a \
+route would earn use route_options, for what a company is charged use pricing_rules.
+- Rates: pricing_rules gives each company's version in force and its history. To change a \
+price, propose create_pricing_rule (a new version from a date; the whole band table for \
+Watanya), and reprice_trips if it is dated in the past — trips keep the price they were \
+billed at until re-priced. Show the before/after per trip and per month with the arithmetic.
+- Revenue is financial data: never shown below permission 3 (the trips list and dashboard \
+show it from 4). This advisor runs at permission 4.
 - You can propose creating, editing or deleting records anywhere in the fleet's systems: \
 trips, fuel events, oil changes, service invoices, trucks, drivers, driver loans/expenses/\
 salaries, vendors, route prices and violations in FalconGo; service records, oil changes, \
@@ -72,7 +85,9 @@ drop-off). Compartments | خزانات/عيون التنك. Receipt | إيصال
 in office | بالمكتب, complete | مكتمل, stamped | مختوم. Receipt piles | أكوام الإيصالات (Watanya \
 receipts filed by box). Unregistered | غير مسجل = a drop-off or driver not in the system.
 - Fee mappings | خرائط الأسعار: company + terminal + drop-off → distance and fee (see the revenue \
-rule above). Watanya band | الفئة.
+rule above). Watanya band | الفئة. Pricing rule | قاعدة التسعير (version | إصدار, effective from | \
+ساري من); car rental | إيجار السيارة; truck-month | شهر السيارة; re-price | إعادة التسعير; \
+unpriced | غير مسعّرة.
 - Fuel events | عمليات الوقود: manual or PetroApp (fuel card) fills; fuel rate = km per litre \
 (good ≥1.9, average ≥1.8, poor <1.8; outside 1.0–3.2 excluded).
 - Driver payouts | الصرفيات: advance | سلفة, loan | قرض, salary portion | جزء من الراتب; expenses | \
@@ -96,8 +111,22 @@ slack_status, geo_fence, is_in_trip.
 - drivers: name, mobile_number, transporter, is_approved, *_expiration_date (text).
 - trips (one container/delivery): parent_trip_id → parent_trips, car_id, driver_id, \
 car_no_plate, driver_name, company, terminal, terminal_id → terminals, drop_off_point, \
-date (text), tank_capacity (litres), gas_type, receipt_no, revenue (stored base revenue), \
-mileage (planned km from the fee mapping).
+date (text), tank_capacity (litres), gas_type, receipt_no, mileage (planned km from the fee \
+mapping), and the stored pricing: base_revenue (EGP before VAT; NULL = unpriced), revenue_vat, \
+priced_km (per-km companies: the km billed, on the trip's furthest-drop row; 0 on its other \
+containers), pricing_rule_id → pricing_rules, priced_at, pricing_error (why it is unpriced). \
+revenue = COALESCE(base_revenue, 0).
+- trip_revenue (view, one row per live trip): trip_id, company, date, car_no_plate, terminal, \
+base_revenue, revenue_vat, priced_km, pricing_error, allocated_rental (the trip's share of its \
+truck-month rental), allocated_vat (its VAT + its rental's VAT), allocated_total (base + \
+rental + VAT). Filter it on company and date. Sum it for any revenue question.
+- truck_month_charges (car rental): car_no_plate, car_id, company, terminal, month (date, the \
+1st), days_worked (at this terminal), month_days_worked (for the company), chargeable_days, \
+rental, rental_vat, rule_id, frozen_at (a closed month). A car-month's rows sum to its rental.
+- pricing_rules: company, effective_from (date), method (per_1000l_fee | band_per_1000l | \
+per_km), per_km_rate, vat_rate (0.14 = 14%), rental_mode (none | monthly_taper | \
+per_car_day), rental_amount, rental_full_days, notes. pricing_bands: rule_id, band, \
+rate_per_1000l (EGP per 1,000 L).
 - parent_trips (a truck's run, 1-4 trips): car_id, driver_id, company, terminal, \
 terminal_id, date (text), author, overwriter.
 - fee_mappings: company, terminal, terminal_id, drop_off_point, distance (km), fee (meaning \
@@ -137,8 +166,8 @@ pub fn system() -> String {
 /// The digest's brief: one pass over the fleet, written for the owner.
 pub const DIGEST_TASK: &str = "Write the fleet digest for the period below, for the owner. \
 Use the tools to look; do not guess. Cover, briefly and with numbers:
-1. Revenue and trips per operating company, and the change against the previous period \
-of the same length.
+1. Revenue (base, rental, VAT, total) and trips per operating company, and the change \
+against the previous period of the same length; flag unpriced trips.
 2. Trucks that earned least or sat idle (no trips) and the likely reason (maintenance, \
 no driver, parked) — check maintenance_status and the GPS where it helps.
 3. The best rebalancing moves: which idle or low-earning trucks should move to which \
@@ -158,5 +187,8 @@ mod tests {
         let p = super::system();
         assert!(p.contains("Today is "));
         assert!(p.contains("fee_mappings"));
+        // The revenue rules the model must follow.
+        assert!(p.contains("truck_month_charges") && p.contains("trip_revenue"));
+        assert!(p.contains("permission 3"));
     }
 }
