@@ -41,6 +41,26 @@ fn cap(v: Value) -> Value {
 }
 
 /// Run one user turn on top of `history`.
+/// Thinking from turns stored by EARLIER requests is dropped before replay.
+///
+/// Claude binds each thinking block's signature to the exact system prompt it
+/// was produced under, and the system prompt carries today's date and the
+/// Cairo time, so a conversation continued a minute later (or after a deploy
+/// changed the prompt) was refused with "Invalid `signature` in `thinking`
+/// block … bound to a different conversation". Earlier turns are complete, so
+/// their thinking is not needed; only the current request's own tool loop
+/// must keep its blocks, and that loop runs under one system prompt.
+fn forget_old_thinking(mut history: Vec<Message>) -> Vec<Message> {
+    for m in &mut history {
+        if let Message::Assistant { calls, .. } = m {
+            for c in calls {
+                c.signature = None;
+            }
+        }
+    }
+    history
+}
+
 pub async fn run(
     provider: &dyn LlmProvider,
     system: &str,
@@ -50,7 +70,7 @@ pub async fn run(
 ) -> Result<Outcome, ProviderError> {
     let defs = tools::tool_defs();
     let start = history.len();
-    let mut messages = history;
+    let mut messages = forget_old_thinking(history);
     messages.push(Message::User(user_text.to_string()));
     let mut trace = Vec::new();
 
@@ -113,5 +133,30 @@ mod tests {
         assert!(c["partial"].as_str().unwrap().len() <= MAX_RESULT_CHARS);
         let small = json!({ "rows": [1, 2] });
         assert_eq!(cap(small.clone()), small);
+    }
+
+    #[test]
+    fn stored_turns_replay_without_their_thinking() {
+        use super::super::llm::ToolCall;
+        let history = vec![
+            Message::User("which truck earned most".into()),
+            Message::Assistant {
+                text: None,
+                calls: vec![ToolCall {
+                    id: "a".into(),
+                    name: "fleet_overview".into(),
+                    args: json!({}),
+                    signature: Some(r#"[{"type":"thinking","signature":"EqQB"}]"#.into()),
+                }],
+            },
+        ];
+        let out = forget_old_thinking(history);
+        match &out[1] {
+            Message::Assistant { calls, .. } => {
+                assert_eq!(calls[0].name, "fleet_overview");
+                assert!(calls[0].signature.is_none());
+            }
+            other => panic!("{other:?}"),
+        }
     }
 }
