@@ -10,10 +10,11 @@ pub mod templates_admin;
 pub mod splits;
 pub mod transactions;
 
+use actix_web::middleware::from_fn;
 use actix_web::{web, HttpMessage, HttpRequest, HttpResponse};
 
 use crate::auth::permissions::AuthContext;
-use crate::auth::JwtAuth;
+use crate::auth::{ai_audit, JwtAuth};
 use crate::errors::{AppError, AppResult};
 
 /// The verified caller, placed in request extensions by JwtAuth.
@@ -24,15 +25,16 @@ pub fn ctx(req: &HttpRequest) -> AppResult<AuthContext> {
         .ok_or(AppError::Unauthenticated)
 }
 
+/// Every bank-SMS route is permission 4 (`AuthContext::can_read`/`can_write`),
+/// enforced here so no handler can forget it.
 fn admin() -> JwtAuth {
-    JwtAuth {
-        required_permission: Some(4),
-    }
+    JwtAuth::at_least(4)
 }
 
 pub fn configure(cfg: &mut web::ServiceConfig) {
     cfg.service(
         web::scope("/api/v1/transactions")
+            .wrap(from_fn(ai_audit::record))
             // Literal segments before the {id} matcher.
             .route(
                 "/statistics",
@@ -81,6 +83,7 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
     )
     .service(
         web::scope("/api/v1/templates")
+            .wrap(from_fn(ai_audit::record))
             .route("", web::get().to(templates_admin::list).wrap(admin()))
             .route("", web::post().to(templates_admin::create).wrap(admin()))
             .route(

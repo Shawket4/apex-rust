@@ -333,7 +333,214 @@ pub async fn fresh_db(name: &str) -> PgPool {
     .await
     .expect("public tables");
 
+    sqlx::raw_sql(FALCON_PRICING_DDL)
+        .execute(&pool)
+        .await
+        .expect("FalconGo stored-pricing schema");
+
     pool
+}
+
+/// FalconGo's stored-pricing schema (stage A, `Models/pricing.go`
+/// `MigratePricing`, startup phase 15), copied verbatim: the pricing tables,
+/// the stored columns on trips, the seed rules and the `trip_revenue` view.
+/// apex-rust reads revenue from these and computes none of it, so the tests
+/// need the exact view FalconGo serves — a hand-simplified copy would test a
+/// different allocation than production runs.
+///
+/// Keep in step with FalconGo when the view changes.
+pub const FALCON_PRICING_DDL: &str = r#"
+CREATE TABLE IF NOT EXISTS pricing_rules (
+    id                 bigserial   PRIMARY KEY,
+    company            text        NOT NULL,
+    effective_from     date        NOT NULL,
+    method             text        NOT NULL
+        CHECK (method IN ('per_1000l_fee', 'band_per_1000l', 'per_km')),
+    per_km_rate        numeric,
+    vat_rate           numeric     NOT NULL,
+    rental_mode        text        NOT NULL DEFAULT 'none'
+        CHECK (rental_mode IN ('none', 'monthly_taper', 'per_car_day')),
+    rental_amount      numeric,
+    rental_full_days   integer,
+    notes              text        NOT NULL DEFAULT '',
+    created_by_user_id bigint      NOT NULL DEFAULT 0,
+    created_at         timestamptz NOT NULL DEFAULT now(),
+    UNIQUE (company, effective_from)
+);
+CREATE TABLE IF NOT EXISTS pricing_bands (
+    id             bigserial PRIMARY KEY,
+    rule_id        bigint    NOT NULL REFERENCES pricing_rules(id) ON DELETE CASCADE,
+    band           integer   NOT NULL,
+    rate_per_1000l numeric   NOT NULL,
+    UNIQUE (rule_id, band)
+);
+CREATE TABLE IF NOT EXISTS truck_month_charges (
+    id                bigserial   PRIMARY KEY,
+    car_no_plate      text        NOT NULL,
+    car_id            bigint,
+    company           text        NOT NULL,
+    terminal          text        NOT NULL,
+    month             date        NOT NULL,
+    days_worked       integer     NOT NULL,
+    month_days_worked integer     NOT NULL,
+    chargeable_days   numeric     NOT NULL,
+    rental            numeric     NOT NULL,
+    rental_vat        numeric     NOT NULL,
+    rule_id           bigint      REFERENCES pricing_rules(id),
+    computed_at       timestamptz NOT NULL DEFAULT now(),
+    frozen_at         timestamptz,
+    UNIQUE (car_no_plate, company, terminal, month)
+);
+CREATE INDEX IF NOT EXISTS idx_truck_month_charges_month
+    ON truck_month_charges (month, company);
+CREATE TABLE IF NOT EXISTS pricing_jobs (
+    name        text        PRIMARY KEY,
+    finished_at timestamptz NOT NULL DEFAULT now(),
+    detail      text        NOT NULL DEFAULT ''
+);
+ALTER TABLE trips ADD COLUMN IF NOT EXISTS base_revenue numeric;
+ALTER TABLE trips ADD COLUMN IF NOT EXISTS revenue_vat numeric;
+ALTER TABLE trips ADD COLUMN IF NOT EXISTS priced_km numeric;
+ALTER TABLE trips ADD COLUMN IF NOT EXISTS pricing_rule_id bigint;
+ALTER TABLE trips ADD COLUMN IF NOT EXISTS priced_at timestamptz;
+ALTER TABLE trips ADD COLUMN IF NOT EXISTS pricing_error text;
+DO $$ BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_trips_pricing_rule_id') THEN
+        ALTER TABLE trips ADD CONSTRAINT fk_trips_pricing_rule_id
+            FOREIGN KEY (pricing_rule_id) REFERENCES pricing_rules(id);
+    END IF;
+END $$;
+CREATE INDEX IF NOT EXISTS idx_trips_logical_trip
+    ON trips ((COALESCE(NULLIF(parent_trip_id, 0), -id)));
+CREATE INDEX IF NOT EXISTS idx_trips_company_date
+    ON trips (company, date) WHERE deleted_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_trips_unpriced
+    ON trips (date) WHERE deleted_at IS NULL AND pricing_error IS NOT NULL;
+INSERT INTO pricing_rules
+    (company, effective_from, method, per_km_rate, vat_rate,
+     rental_mode, rental_amount, rental_full_days, notes)
+ VALUES
+    ('Petrol Arrows', '2000-01-01', 'per_1000l_fee', NULL, 0,
+     'none', NULL, NULL, 'seed: apex-rust revenue.rs (fee = EGP per 1,000 L, no VAT)'),
+    ('Watanya', '2000-01-01', 'band_per_1000l', NULL, 0.14,
+     'none', NULL, NULL, 'seed: apex-rust revenue.rs WATANYA_BAND_RATES'),
+    ('TAQA', '2000-01-01', 'per_km', 50.5, 0.14,
+     'monthly_taper', 43000, 28, 'seed: apex-rust revenue.rs TAQA_*'),
+    ('Petromin', '2000-01-01', 'per_km', 42.5, 0.14,
+     'per_car_day', 2000, NULL, 'seed: apex-rust revenue.rs PETROMIN_*')
+ ON CONFLICT (company, effective_from) DO NOTHING;
+INSERT INTO pricing_bands (rule_id, band, rate_per_1000l)
+ SELECT r.id, b.band, b.rate
+   FROM pricing_rules r
+   CROSS JOIN (VALUES
+        (1, 104.5), (2, 122.1), (3, 129.8), (4, 156.2), (5, 183.7),
+        (6, 196.9), (7, 210.1), (8, 235.4), (9, 261.8), (10, 288.2),
+        (11, 314.6), (12, 341.0), (13, 367.4), (14, 393.8), (15, 420.2)) AS b(band, rate)
+  WHERE r.company = 'Watanya' AND r.effective_from = '2000-01-01'
+ ON CONFLICT (rule_id, band) DO NOTHING;
+
+CREATE OR REPLACE VIEW trip_revenue AS
+WITH car_months AS (
+    SELECT car_no_plate, company, to_char(month, 'YYYY-MM') AS ym,
+           SUM(rental)::numeric     AS rental,
+           SUM(rental_vat)::numeric AS rental_vat,
+           MAX(month_days_worked)   AS month_days
+      FROM truck_month_charges
+     GROUP BY car_no_plate, company, to_char(month, 'YYYY-MM')
+),
+rows AS (
+    SELECT t.id, t.company, t.date, t.car_no_plate, t.terminal,
+           t.base_revenue, t.revenue_vat, t.priced_km, t.pricing_error,
+           COUNT(*) OVER (PARTITION BY t.company, t.car_no_plate, t.date) AS rows_that_day
+      FROM trips t
+     WHERE t.deleted_at IS NULL
+)
+SELECT r.id AS trip_id, r.company, r.date, r.car_no_plate, r.terminal,
+       r.base_revenue, r.revenue_vat, r.priced_km, r.pricing_error,
+       COALESCE(cm.rental     / NULLIF(cm.month_days, 0) / r.rows_that_day, 0) AS allocated_rental,
+       COALESCE(r.revenue_vat, 0)
+         + COALESCE(cm.rental_vat / NULLIF(cm.month_days, 0) / r.rows_that_day, 0) AS allocated_vat,
+       COALESCE(r.base_revenue, 0)
+         + COALESCE(cm.rental     / NULLIF(cm.month_days, 0) / r.rows_that_day, 0)
+         + COALESCE(r.revenue_vat, 0)
+         + COALESCE(cm.rental_vat / NULLIF(cm.month_days, 0) / r.rows_that_day, 0) AS allocated_total
+  FROM rows r
+  LEFT JOIN car_months cm
+    ON cm.car_no_plate = r.car_no_plate
+   AND cm.company      = r.company
+   AND cm.ym           = left(r.date, 7);
+"#;
+
+/// Store a trip's priced figures the way FalconGo's engine writes them:
+/// `base_revenue`, `revenue_vat`, `priced_km`, the rule, `priced_at`, and
+/// `revenue = COALESCE(base, 0)`. `base = None` is an unpriced trip, which the
+/// engine stores with a `pricing_error`. Matches rows by receipt number.
+///
+/// The figures are literals the caller states, never computed here: these
+/// tests check that apex-rust READS what FalconGo stored, so the expected
+/// values come from FalconGo's own parity run, not from a formula on this
+/// side.
+pub async fn store_priced(pool: &PgPool, rows: &[(&str, Option<f64>, f64, Option<f64>)]) {
+    for (receipt, base, vat, km) in rows {
+        sqlx::query(
+            "UPDATE trips t SET
+                 base_revenue    = $2::float8::numeric,
+                 revenue_vat     = CASE WHEN $2::float8 IS NULL THEN NULL ELSE $3::float8::numeric END,
+                 priced_km       = $4::float8::numeric,
+                 pricing_error   = CASE WHEN $2::float8 IS NULL
+                                        THEN 'no fee mapping for ' || t.company || ' / ' || t.terminal
+                                             || ' -> ' || t.drop_off_point END,
+                 pricing_rule_id = (SELECT id FROM pricing_rules r WHERE r.company = t.company
+                                     ORDER BY effective_from DESC LIMIT 1),
+                 priced_at       = now(),
+                 revenue         = COALESCE($2::float8, 0)::numeric
+             WHERE t.receipt_no = $1 AND t.deleted_at IS NULL",
+        )
+        .bind(receipt)
+        .bind(base)
+        .bind(vat)
+        .bind(km)
+        .execute(pool)
+        .await
+        .unwrap_or_else(|e| panic!("store priced {receipt}: {e}"));
+    }
+}
+
+/// Store one truck-month of car rental, as FalconGo's engine writes it
+/// (rental and its VAT rounded to 6 dp).
+pub async fn store_truck_month(
+    pool: &PgPool,
+    car: &str,
+    company: &str,
+    terminal: &str,
+    month: &str,
+    days_worked: i32,
+    month_days_worked: i32,
+    chargeable_days: f64,
+    rental: f64,
+    rental_vat: f64,
+) {
+    sqlx::query(
+        "INSERT INTO truck_month_charges
+             (car_no_plate, company, terminal, month, days_worked, month_days_worked,
+              chargeable_days, rental, rental_vat, rule_id, frozen_at)
+         VALUES ($1, $2, $3, $4::date, $5, $6, ROUND($7::numeric, 6), ROUND($8::numeric, 6),
+                 ROUND($9::numeric, 6),
+                 (SELECT id FROM pricing_rules WHERE company = $2 ORDER BY effective_from DESC LIMIT 1),
+                 now())",
+    )
+    .bind(car)
+    .bind(company)
+    .bind(terminal)
+    .bind(month)
+    .bind(days_worked)
+    .bind(month_days_worked)
+    .bind(chargeable_days)
+    .bind(rental)
+    .bind(rental_vat)
+    .execute(pool)
+    .await
+    .unwrap_or_else(|e| panic!("store truck-month {car} {month}: {e}"));
 }
 
 /// Apply the archived legacy migrations (the pre-rebuild schema) — the
@@ -488,4 +695,60 @@ pub async fn seed_trip_fixture(pool: &PgPool) {
     .execute(pool)
     .await
     .expect("seed revenue fixture");
+
+    store_fixture_pricing(pool).await;
+}
+
+/// What FalconGo's pricing engine stored for [`seed_trip_fixture`].
+///
+/// These are the figures FalconGo PR #4 (`pricing/pricing_test.go`,
+/// `TestParityWithApexRustGolden`) reports its backfill writing for this exact
+/// fixture — copied in as literals, not recomputed: PA-Near 1220 + 1098 =
+/// 2318.00, PA-Far 2212.50; Watanya band 1 4180 + 3 x 1045 = 7315.00 with VAT
+/// 1024.10; every TAQA row 210 km x 50.5 = 10605.00; every Petromin row 180 km
+/// x 42.5 = 7650.00; the two unmapped routes unpriced (NULL, with a
+/// pricing_error); and the five truck-months PM-A 4000, PM-B 2000, TQ-A May
+/// 43000, TQ-B May 15357.142857, TQ-A June 4607.142857.
+///
+/// So the golden snapshot passing means apex-rust reads FalconGo's stored
+/// values and aggregates them to the same statistics the old formulas
+/// produced — not that two copies of a formula agree.
+pub async fn store_fixture_pricing(pool: &PgPool) {
+    let none = None;
+    let mut rows: Vec<(&str, Option<f64>, f64, Option<f64>)> = vec![
+        ("PA1", Some(1220.0), 0.0, none),
+        ("PA2", Some(1098.0), 0.0, none),
+        ("PA3", Some(2212.5), 0.0, none),
+        ("PA4", None, 0.0, none),
+        ("WA1", Some(4180.0), 585.2, none),
+        ("WA2", Some(4884.0), 683.76, none),
+        ("WA3", Some(12606.0), 1764.84, none),
+        ("WA4", None, 0.0, none),
+        ("WAC1", Some(1045.0), 146.3, none),
+        ("WAC2", Some(1045.0), 146.3, none),
+        ("WAC3", Some(1045.0), 146.3, none),
+        ("PM1", Some(7650.0), 1071.0, Some(180.0)),
+        ("PM2", Some(7650.0), 1071.0, Some(180.0)),
+        ("PM3", Some(7650.0), 1071.0, Some(180.0)),
+        ("PM4", Some(7650.0), 1071.0, Some(180.0)),
+    ];
+    let taqa: Vec<String> = (0..28)
+        .map(|n| format!("TQA{n}"))
+        .chain((0..10).map(|n| format!("TQB{n}")))
+        .chain((0..3).map(|n| format!("TQAJ{n}")))
+        .collect();
+    for r in &taqa {
+        rows.push((r.as_str(), Some(10605.0), 1484.7, Some(210.0)));
+    }
+    store_priced(pool, &rows).await;
+
+    for (car, company, terminal, month, days, rental, vat) in [
+        ("TQ-A", "TAQA", "TQ-T1", "2025-05-01", 28, 43000.0, 6020.0),
+        ("TQ-B", "TAQA", "TQ-T1", "2025-05-01", 10, 15357.142857, 2150.0),
+        ("TQ-A", "TAQA", "TQ-T1", "2025-06-01", 3, 4607.142857, 645.0),
+        ("PM-A", "Petromin", "PM-T1", "2025-05-01", 2, 4000.0, 560.0),
+        ("PM-B", "Petromin", "PM-T1", "2025-05-01", 1, 2000.0, 280.0),
+    ] {
+        store_truck_month(pool, car, company, terminal, month, days, days, days as f64, rental, vat).await;
+    }
 }

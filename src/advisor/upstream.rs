@@ -99,30 +99,91 @@ pub async fn maint_get(
 pub enum Target {
     Falcon,
     Maint,
+    /// apex-rust's own routes, over loopback.
+    Apex,
 }
 
-/// Is FalconGo's AI audit log live? Checked before every apply: without it
-/// FalconGo would accept the change but drop the `X-Via-AI` flag, breaking
+impl Target {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Target::Falcon => "falcon",
+            Target::Maint => "maint",
+            Target::Apex => "apex",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "falcon" => Some(Target::Falcon),
+            "maint" => Some(Target::Maint),
+            "apex" => Some(Target::Apex),
+            _ => None,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Target::Falcon => "FalconGo",
+            Target::Maint => "maint-rust",
+            Target::Apex => "apex-rust",
+        }
+    }
+}
+
+/// Is the target's AI audit log live? Checked before every apply: without it
+/// the service would accept the change but drop the `X-Via-AI` flag, breaking
 /// the owner's rule that every AI change records its approver and the chat.
-pub async fn falcon_audit_ready(
+/// apex-rust's own log ships in this binary, so it is always ready.
+pub async fn audit_ready(
     http: &reqwest::Client,
     cfg: &AdvisorConfig,
     token: &BearerToken,
+    target: Target,
 ) -> Result<(), String> {
+    let base = match target {
+        Target::Falcon => &cfg.falcon_api_url,
+        Target::Maint => &cfg.maint_api_url,
+        Target::Apex => return Ok(()),
+    };
+    let name = target.label();
     let resp = http
-        .get(format!("{}/ai-audit", cfg.falcon_api_url))
+        .get(format!("{base}/ai-audit"))
         .bearer_auth(&token.0)
         .query(&[("limit", "1")])
         .send()
         .await
-        .map_err(|e| format!("FalconGo unreachable: {e}"))?;
+        .map_err(|e| format!("{name} unreachable: {e}"))?;
     match resp.status().as_u16() {
         200..=299 => Ok(()),
-        404 => Err("FalconGo's AI audit log is not deployed yet, so the change cannot be recorded as \
-                    coming from the AI chat; the suggestion stays pending"
-            .into()),
-        code => Err(format!("FalconGo's AI audit check answered {code}; the suggestion stays pending")),
+        404 => Err(format!(
+            "{name}'s AI audit log is not deployed yet, so the change cannot be recorded as \
+             coming from the AI chat; the suggestion stays pending"
+        )),
+        code => Err(format!("{name}'s AI audit check answered {code}; the suggestion stays pending")),
     }
+}
+
+/// A maint-rust row and its `sync_version`, through its records API.
+/// `Ok(None)` when it does not exist.
+pub async fn maint_record(
+    http: &reqwest::Client,
+    cfg: &AdvisorConfig,
+    token: &BearerToken,
+    entity_type: &str,
+    entity_id: &str,
+) -> Result<Option<(Value, i64)>, UpstreamError> {
+    let resp = http
+        .get(format!("{}/records/{entity_type}/{entity_id}", cfg.maint_api_url))
+        .bearer_auth(&token.0)
+        .send()
+        .await
+        .map_err(|e| UpstreamError(format!("maint-rust unreachable: {e}")))?;
+    if resp.status().as_u16() == 404 {
+        return Ok(None);
+    }
+    let v = read_json(resp, "maint-rust").await?;
+    let version = v.get("sync_version").and_then(Value::as_i64).unwrap_or(0);
+    Ok(v.get("row").filter(|r| !r.is_null()).cloned().map(|r| (r, version)))
 }
 
 /// One approved change, ready to send.
@@ -131,11 +192,13 @@ pub struct ApplyCall<'a> {
     pub method: &'a str,
     pub path: &'a str,
     pub body: &'a Value,
+    /// `encoding` ("json" | "form") and `if_match`, from the plan.
+    pub meta: &'a Value,
     pub suggestion_id: uuid::Uuid,
 }
 
 /// Apply an approved suggestion: the approver's token plus the two headers
-/// FalconGo's audit log keys on. Returns (HTTP status, body).
+/// each service's audit log keys on. Returns (HTTP status, body).
 pub async fn apply(
     http: &reqwest::Client,
     cfg: &AdvisorConfig,
@@ -145,18 +208,32 @@ pub async fn apply(
     let base = match call.target {
         Target::Falcon => &cfg.falcon_api_url,
         Target::Maint => &cfg.maint_api_url,
+        Target::Apex => &cfg.apex_api_url,
     };
     let method = reqwest::Method::from_bytes(call.method.as_bytes())
         .map_err(|_| UpstreamError(format!("bad method {}", call.method)))?;
-    let resp = http
+    let mut req = http
         .request(method, format!("{base}{}", call.path))
         .bearer_auth(&token.0)
         .header("X-Via-AI", "advisor")
-        .header("X-AI-Suggestion-Id", call.suggestion_id.to_string())
-        .json(call.body)
+        .header("X-AI-Suggestion-Id", call.suggestion_id.to_string());
+    if let Some(v) = call.meta.get("if_match").filter(|v| !v.is_null()) {
+        let v = v.as_i64().map(|n| n.to_string()).or_else(|| v.as_str().map(str::to_string));
+        if let Some(v) = v {
+            req = req.header("If-Match", v);
+        }
+    }
+    // FalconGo handlers that read `c.FormValue("request")` take the JSON as one
+    // url-encoded field (which FalconGo's audit stores readably).
+    let req = if call.meta.get("encoding").and_then(Value::as_str) == Some("form") {
+        req.form(&[("request", call.body.to_string())])
+    } else {
+        req.json(call.body)
+    };
+    let resp = req
         .send()
         .await
-        .map_err(|e| UpstreamError(format!("{:?} unreachable: {e}", call.target)))?;
+        .map_err(|e| UpstreamError(format!("{} unreachable: {e}", call.target.label())))?;
     let status = resp.status().as_u16();
     let text = resp.text().await.unwrap_or_default();
     let body = serde_json::from_str(&text).unwrap_or_else(|_| json!({ "raw": text }));

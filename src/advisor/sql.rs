@@ -44,6 +44,20 @@ pub fn check(sql: &str) -> Result<(), String> {
     if let Some(w) = words.iter().find(|w| SECRET.contains(w)) {
         return Err(format!("`{w}` is off limits"));
     }
+    // Columns with no live writer since the ETIT scraper went: a query on them
+    // answers "where is it now" with a position from a year ago.
+    const STALE: &[&str] = &[
+        "location_time_stamp", "slack_status", "geo_fence", "engine_status", "is_in_trip",
+        "last_updated_slack_status", "speed_alerts", "start_odometer", "end_odometer",
+    ];
+    if let Some(w) = words.iter().find(|w| STALE.contains(w)) {
+        return Err(format!(
+            "`{w}` is stale (nothing has updated it since the ETIT scraper was removed); use fleet_status for live position/status, truck_itinerary for history"
+        ));
+    }
+    if body.contains("cars.latitude") || body.contains("cars.longitude") || body.contains("c.latitude") || body.contains("c.longitude") {
+        return Err("cars.latitude/longitude are stale; use fleet_status for where trucks are now".into());
+    }
     if let Some(w) = words.iter().find(|w| {
         w.starts_with("pg_")
             || w.starts_with("lo_")
@@ -117,6 +131,15 @@ mod tests {
         assert!(check("select pg_read_file('/etc/passwd')").is_err());
         assert!(check("select current_setting('data_directory')").is_err());
         assert!(check("select * from information_schema.columns").is_err());
+    }
+
+    #[test]
+    fn stale_location_columns_point_at_the_live_tool() {
+        let e = check("select slack_status from cars").unwrap_err();
+        assert!(e.contains("fleet_status"), "{e}");
+        assert!(check("select c.latitude from cars c").is_err());
+        // Terminals' pins are real.
+        assert!(check("select name, latitude, longitude from terminals").is_ok());
     }
 
     #[test]

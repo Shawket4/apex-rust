@@ -1,3 +1,4 @@
+pub mod ai_audit;
 pub mod claims;
 pub mod middleware;
 pub mod permissions;
