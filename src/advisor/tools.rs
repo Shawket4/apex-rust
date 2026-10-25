@@ -14,7 +14,7 @@ use uuid::Uuid;
 
 use super::llm::ToolDef;
 use super::upstream::{self, BearerToken};
-use super::{actions, falcon_actions, search, sql, store, Advisor};
+use super::{actions, falcon_actions, fleet, search, sql, store, Advisor};
 
 /// Everything a tool may touch during one turn.
 pub struct ToolCtx<'a> {
@@ -40,6 +40,29 @@ pub fn tool_defs() -> Vec<ToolDef> {
                 "type": "object",
                 "properties": { "text": { "type": "string" } },
                 "required": ["text"]
+            }),
+        },
+        ToolDef {
+            name: "fleet_status",
+            description: "Where every truck is NOW and what it is doing, from the live trackers (ETIT via etit-proxy, refreshed every minute): status (moving / idling / stopped / offline / no_signal when the last fix is over 30 min old / geofence_violation), speed, last fix time (Cairo), the terminal or drop-off point it is at (by the same geofences the trip audit uses), whether it is inside a dead zone, and the driver logged in on its tablet. Use this — never cars.latitude/longitude/slack_status, which are a year stale — for any question about current location, status or signal.".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "car_id": { "type": "integer" },
+                    "company": { "type": "string", "description": "only trucks assigned to this operating company" },
+                    "status": { "type": "string", "enum": ["moving", "idling", "stopped", "offline", "no_signal", "geofence_violation", "unknown", "in_dead_zone"] }
+                }
+            }),
+        },
+        ToolDef {
+            name: "dead_zones",
+            description: "Dead zones (المناطق الميتة / المناطق المحظورة) are restricted areas trucks must not enter: circles an operator defines on the Dead Zones page. A violation is a stay of 2+ minutes inside one. Returns the active zones and which trucks are inside one right now; with from/to (Cairo days, max 92 days) it also lists every violation in that range from the GPS history (a report-only scan — nobody is alerted). This is NOT about lost GPS signal; for that use fleet_status (no_signal) or truck_itinerary (disconnected time).".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "from": date.clone(), "to": date.clone(),
+                    "car_id": { "type": "integer", "description": "only this truck's violations" }
+                }
             }),
         },
         ToolDef {
@@ -176,6 +199,8 @@ pub async fn run(ctx: &ToolCtx<'_>, name: &str, args: &Value) -> Value {
     let result = match name {
         "find_truck" => find_truck(ctx, args).await,
         "fleet_overview" => fleet_overview(ctx, args).await,
+        "fleet_status" => fleet::fleet_status(ctx, args).await,
+        "dead_zones" => fleet::dead_zones(ctx, args).await,
         "revenue_breakdown" => revenue_breakdown(ctx, args).await,
         "truck_itinerary" => truck_itinerary(ctx, args).await,
         "trip_audit" => trip_audit(ctx, args).await,
@@ -247,8 +272,8 @@ async fn find_truck(ctx: &ToolCtx<'_>, args: &Value) -> ToolResult {
     rows(
         ctx.pool,
         "SELECT c.id AS car_id, c.car_no_plate, c.car_type, c.operating_company, c.operating_area,
-                c.is_in_trip, c.driver_id, d.name AS driver_name, c.etit_car_id,
-                c.slack_status, c.geo_fence
+                c.driver_id, d.name AS driver_name, NULLIF(c.etit_car_id, '') AS etit_car_id,
+                c.tank_capacity
            FROM cars c
            LEFT JOIN drivers d ON d.id = c.driver_id
           WHERE c.deleted_at IS NULL
@@ -274,8 +299,7 @@ async fn fleet_overview(ctx: &ToolCtx<'_>, args: &Value) -> ToolResult {
                AND date >= to_char(current_date - $1::int, 'YYYY-MM-DD')
              GROUP BY car_id)
          SELECT c.id AS car_id, c.car_no_plate, c.operating_company, c.operating_area,
-                c.is_in_trip, d.name AS driver_name, c.location_time_stamp,
-                c.slack_status, c.geo_fence,
+                d.name AS driver_name,
                 COALESCE(t.trips, 0) AS trips, round(COALESCE(t.revenue, 0)::numeric, 0) AS revenue,
                 t.last_trip_date
            FROM cars c
@@ -446,7 +470,7 @@ async fn trip_audit(ctx: &ToolCtx<'_>, args: &Value) -> ToolResult {
         .map_err(|e| e.to_string())?;
     let mut mq = q.clone();
     mq.push(("per_page", "25".into()));
-    mq.push(("sort", "excess".into()));
+    mq.push(("sort", "severity".into()));
     if args.get("flagged_only").and_then(Value::as_bool).unwrap_or(true) {
         mq.push(("flagged", "true".into()));
     }
@@ -466,23 +490,21 @@ fn haversine_km(a: (f64, f64), b: (f64, f64)) -> f64 {
 
 async fn route_options(ctx: &ToolCtx<'_>, args: &Value) -> ToolResult {
     let car_id = i(args, "car_id").ok_or("`car_id` is required")?;
-    type CarPosition = (String, Option<String>, Option<String>, Option<String>);
-    let car: Option<CarPosition> = sqlx::query_as(
-        "SELECT car_no_plate, operating_company, latitude, longitude FROM cars WHERE id = $1 AND deleted_at IS NULL",
+    let car: Option<(String, Option<String>)> = sqlx::query_as(
+        "SELECT car_no_plate, operating_company FROM cars WHERE id = $1 AND deleted_at IS NULL",
     )
     .bind(car_id)
     .fetch_optional(ctx.pool)
     .await
     .map_err(|e| e.to_string())?;
-    let (plate, op_company, lat, lng) = car.ok_or(format!("no car with id {car_id}"))?;
+    let (plate, op_company) = car.ok_or(format!("no car with id {car_id}"))?;
     let company = s(args, "company")
         .map(str::to_string)
         .or(op_company.filter(|c| !c.trim().is_empty()))
         .ok_or("the truck has no operating company; pass `company`")?;
-    let here = match (lat.and_then(|v| v.parse::<f64>().ok()), lng.and_then(|v| v.parse::<f64>().ok())) {
-        (Some(a), Some(b)) if a != 0.0 && b != 0.0 => Some((a, b)),
-        _ => None,
-    };
+    // Where it is now, from its tracker (cars.latitude/longitude are stale).
+    let live = fleet::position(ctx, car_id).await;
+    let here = live.map(|(p, _)| p);
 
     #[derive(sqlx::FromRow)]
     struct Mapping {
@@ -569,6 +591,7 @@ async fn route_options(ctx: &ToolCtx<'_>, args: &Value) -> ToolResult {
     Ok(json!({
         "car_id": car_id, "plate": plate, "company": company,
         "truck_position_known": here.is_some(),
+        "position_fix_cairo": live.and_then(|(_, t)| t).as_ref().map(fleet::cairo),
         "options": options,
     }))
 }
@@ -917,7 +940,23 @@ fn review_views(planned: &actions::Planned, before: &Value) -> (Value, Value) {
     let is_delete = planned.method == "DELETE" || planned.kind.starts_with("delete_");
     let empty = before.as_object().map_or(true, |m| m.is_empty());
     if is_delete {
-        return (before.clone(), json!({ "deleted": true }));
+        // The record that goes, without bookkeeping columns or empty values.
+        let gone: serde_json::Map<String, Value> = before
+            .as_object()
+            .into_iter()
+            .flatten()
+            .filter(|(k, v)| {
+                !matches!(k.as_str(), "id" | "ID" | "created_at" | "updated_at" | "deleted_at" | "version" | "sync_version")
+                    && !k.ends_with("_image_name")
+                    && !k.ends_with("_image_name_back")
+                    && !v.is_null()
+                    && v.as_str() != Some("")
+                    && !v.is_object()
+                    && !v.is_array()
+            })
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        return (Value::Object(gone), json!({}));
     }
     if empty {
         changed.retain(|k, _| k != "ID" && k != "ref_id");
@@ -926,7 +965,7 @@ fn review_views(planned: &actions::Planned, before: &Value) -> (Value, Value) {
     let mut b = serde_json::Map::new();
     let mut a = serde_json::Map::new();
     for label in LABELS {
-        if let Some(v) = before.get(*label) {
+        if let Some(v) = before.get(*label).filter(|v| !v.is_null() && v.as_str() != Some("")) {
             b.insert((*label).into(), v.clone());
             a.insert((*label).into(), v.clone());
         }

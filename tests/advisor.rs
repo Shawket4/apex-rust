@@ -25,7 +25,8 @@ async fn db(name: &str) -> PgPool {
             ADD COLUMN operating_area TEXT DEFAULT '', ADD COLUMN is_in_trip BOOLEAN DEFAULT false,
             ADD COLUMN driver_id INTEGER, ADD COLUMN latitude TEXT DEFAULT '',
             ADD COLUMN longitude TEXT DEFAULT '', ADD COLUMN location_time_stamp TEXT DEFAULT '',
-            ADD COLUMN slack_status TEXT DEFAULT '', ADD COLUMN geo_fence TEXT DEFAULT '';
+            ADD COLUMN slack_status TEXT DEFAULT '', ADD COLUMN geo_fence TEXT DEFAULT '',
+            ADD COLUMN tank_capacity INTEGER DEFAULT 0;
          ALTER TABLE fee_mappings ADD COLUMN terminal_id INTEGER;
          CREATE TABLE terminals (
             id SERIAL PRIMARY KEY, name TEXT, address TEXT,
@@ -117,7 +118,9 @@ async fn sql_reads_and_cannot_write() {
 #[tokio::test]
 async fn fleet_tools_answer_from_the_data() {
     let pool = db("advisor_tools").await;
-    let adv = offline_advisor("http://127.0.0.1:9");
+    let mut adv = offline_advisor("http://127.0.0.1:9");
+    // The truck's position comes from its tracker.
+    adv.cfg.etit_proxy_url = fake_etit(Arc::new(Mutex::new(Vec::new()))).await;
     let token = apex::advisor::upstream::BearerToken("t".into());
     let c = ctx(&pool, &adv, &token);
 
@@ -541,4 +544,79 @@ async fn a_ledger_edit_goes_through_apex_routes_with_its_version_and_is_audited(
         .await
         .unwrap();
     assert_eq!(desc.as_deref(), Some("human wording"));
+}
+
+/// A stand-in etit-proxy: one live truck parked at the Suez terminal and one
+/// inside a dead zone; the zone scan records the body it was sent.
+async fn fake_etit(scans: Arc<Mutex<Vec<Value>>>) -> String {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = HttpServer::new(move || {
+        let scans = scans.clone();
+        App::new().default_service(web::to(move |req: HttpRequest, body: web::Bytes| {
+            let scans = scans.clone();
+            async move {
+                let now = chrono::Utc::now();
+                match req.path() {
+                    "/api/v1/vehicles/live" => HttpResponse::Ok().json(json!([
+                        { "id": "etit-1", "lat": 29.9602, "lng": 32.5503, "speed": 0, "status": 13,
+                          "timestamp": now.to_rfc3339(), "event": "Ignition On" },
+                        { "id": "etit-2", "lat": 30.5, "lng": 31.5, "speed": 0, "status": 3,
+                          "timestamp": (now - chrono::Duration::hours(3)).to_rfc3339() }
+                    ])),
+                    "/api/v1/zones" => HttpResponse::Ok().json(json!([
+                        { "id": 7, "name": "Quarry road", "lat": 30.5, "lng": 31.5, "radius_m": 800, "active": true }
+                    ])),
+                    "/api/v1/zones/scan" => {
+                        scans.lock().unwrap().push(serde_json::from_slice::<Value>(&body).unwrap_or(Value::Null));
+                        HttpResponse::Ok().json(json!({
+                            "days_scanned": 3, "vehicles_scanned": 2,
+                            "violations": [{ "vehicle_id": "etit-1", "codename": "X/1234", "zone_name": "Quarry road",
+                                             "entry_local": "2026-10-20 14:02:00", "exit_local": "2026-10-20 14:20:00", "dwell_secs": 1080 }]
+                        }))
+                    }
+                    _ => HttpResponse::NotFound().finish(),
+                }
+            }
+        }))
+    })
+    .listen(listener)
+    .unwrap()
+    .run();
+    tokio::spawn(server);
+    format!("http://127.0.0.1:{port}")
+}
+
+#[actix_web::test]
+async fn fleet_status_reads_the_trackers_not_the_stale_columns() {
+    let pool = db("advisor_fleet").await;
+    sqlx::query("UPDATE cars SET etit_car_id = 'etit-2' WHERE id = 2").execute(&pool).await.unwrap();
+    let scans = Arc::new(Mutex::new(Vec::new()));
+    let etit = fake_etit(scans.clone()).await;
+    let mut adv = offline_advisor("http://127.0.0.1:9");
+    adv.cfg.etit_proxy_url = etit;
+    let token = apex::advisor::upstream::BearerToken("t".into());
+    let c = ctx(&pool, &adv, &token);
+
+    let status = tools::run(&c, "fleet_status", &json!({})).await;
+    let trucks = status["trucks"].as_array().unwrap_or_else(|| panic!("{status}"));
+    let one = trucks.iter().find(|t| t["car_id"] == 1).unwrap();
+    assert_eq!(one["status"], "idling", "{one}");
+    assert_eq!(one["at_place"]["name"], "Suez Terminal");
+    let two = trucks.iter().find(|t| t["car_id"] == 2).unwrap();
+    // Three hours since its last fix: no signal, whatever the status code says.
+    assert_eq!(two["status"], "no_signal", "{two}");
+    assert_eq!(two["in_dead_zone"]["name"], "Quarry road");
+    assert_eq!(status["trucks_in_dead_zones"], 1);
+
+    let zones = tools::run(&c, "dead_zones", &json!({ "from": "2026-10-18", "to": "2026-10-20" })).await;
+    assert_eq!(zones["inside_now"][0]["car_id"], 2, "{zones}");
+    assert_eq!(zones["violations"][0]["plate"], "ق ط ر 1234");
+    assert_eq!(zones["violations"][0]["dwell_min"], 18.0);
+    // Always a range: an empty body would be the alerting round.
+    assert_eq!(scans.lock().unwrap()[0], json!({ "from": "2026-10-18", "to": "2026-10-20" }));
+
+    // The stale columns are refused with a pointer to the live tool.
+    let stale = tools::run(&c, "run_sql", &json!({ "query": "SELECT car_no_plate, slack_status FROM cars" })).await;
+    assert!(stale["error"].as_str().unwrap().contains("fleet_status"), "{stale}");
 }

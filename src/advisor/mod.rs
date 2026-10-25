@@ -17,6 +17,7 @@ pub mod agent;
 pub mod anthropic;
 pub mod digest;
 pub mod falcon_actions;
+pub mod fleet;
 pub mod handlers;
 pub mod llm;
 pub mod prompt;
