@@ -38,17 +38,25 @@ jobs:
 
           COPY . .
 
-          RUN cargo build --release --verbose
+          # x86-64-v4 (AVX-512): the VPS is an AMD EPYC 9354P (checked 2026-10-25,
 
-          RUN strip target/release/apex-rust || true
+          # `ld.so --help` lists v4 as supported). The explicit --target keeps the
 
-          RUN ls -lh target/release/apex-rust
+          # flag off build scripts and proc macros, which run on the CI machine.
+
+          ENV RUSTFLAGS="-C target-cpu=x86-64-v4"
+
+          RUN cargo build --release --target x86_64-unknown-linux-gnu --verbose
+
+          RUN strip target/x86_64-unknown-linux-gnu/release/apex-rust || true
+
+          RUN ls -lh target/x86_64-unknown-linux-gnu/release/apex-rust
           EOF
 
           docker build -t apex-rust-builder -f Dockerfile.build .
 
           docker create --name temp-container apex-rust-builder
-          docker cp temp-container:/app/target/release/apex-rust ./apex-rust
+          docker cp temp-container:/app/target/x86_64-unknown-linux-gnu/release/apex-rust ./apex-rust
           docker rm temp-container
 
           ls -la apex-rust
