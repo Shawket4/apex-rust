@@ -32,6 +32,21 @@ fn validation() -> Validation {
 
 pub struct JwtAuth {
     pub required_permission: Option<i32>,
+    /// Refuse callers below `required_permission` with 403. Off for the
+    /// dashboard and trip routes, whose handlers serve reduced data to lower
+    /// levels and so own the ladder themselves; on for modules where the level
+    /// is a hard floor (bank SMS, the advisor).
+    pub enforce: bool,
+}
+
+impl JwtAuth {
+    /// A hard floor: callers below `level` get 403 before the handler runs.
+    pub fn at_least(level: i32) -> Self {
+        Self {
+            required_permission: Some(level),
+            enforce: true,
+        }
+    }
 }
 
 impl<S, B> Transform<S, ServiceRequest> for JwtAuth
@@ -50,12 +65,14 @@ where
         ready(Ok(JwtAuthMiddleware {
             service,
             required_permission: self.required_permission,
+            enforce: self.enforce,
         }))
     }
 }
 
 pub struct JwtAuthMiddleware<S> {
     service: S,
+    enforce: bool,
     required_permission: Option<i32>,
 }
 
@@ -115,10 +132,22 @@ where
                     });
                 }
 
+                if self.enforce {
+                    let floor = self.required_permission.unwrap_or(0);
+                    if claims.permission.unwrap_or(0) < floor {
+                        return Box::pin(async move {
+                            Err(actix_web::error::ErrorForbidden(format!(
+                                "permission {floor} or higher required"
+                            )))
+                        });
+                    }
+                }
+
                 // Resolved authorization for the bank-SMS handlers, which read
                 // AuthContext and never touch Claims. Existing handlers keep
                 // reading Claims, so nothing changes for them.
-                if let Some(ctx) = AuthContext::from_claims(&claims) {
+                if let Some(mut ctx) = AuthContext::from_claims(&claims) {
+                    ctx.via_ai = super::ai_audit::via_ai(req.headers());
                     req.extensions_mut().insert(ctx);
                 }
 

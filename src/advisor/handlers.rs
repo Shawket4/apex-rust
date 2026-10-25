@@ -18,15 +18,13 @@ use uuid::Uuid;
 use super::llm::Message;
 use super::tools::ToolCtx;
 use super::upstream::{self, BearerToken, Target};
-use super::{agent, digest, prompt, search, store, Advisor};
+use super::{actions, agent, digest, prompt, search, store, Advisor};
 use crate::auth::permissions::AuthContext;
 use crate::auth::JwtAuth;
 use crate::errors::{AppError, AppResult};
 
 fn admin() -> JwtAuth {
-    JwtAuth {
-        required_permission: Some(4),
-    }
+    JwtAuth::at_least(4)
 }
 
 pub fn configure(cfg: &mut web::ServiceConfig) {
@@ -42,7 +40,7 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
             .route("/suggestions/{id}/reject", web::post().to(reject).wrap(admin()))
             // Read-only, like FalconGo's own invoice search (Verify(1)): any
             // admin user may search; only the chat and approvals need 4.
-            .route("/search", web::post().to(search_history).wrap(JwtAuth { required_permission: Some(1) }))
+            .route("/search", web::post().to(search_history).wrap(JwtAuth::at_least(1)))
             .route("/digests", web::get().to(list_digests).wrap(admin()))
             .route("/digests/run", web::post().to(run_digest).wrap(admin())),
     );
@@ -271,7 +269,7 @@ async fn list_suggestions(
 }
 
 /// Approve and apply: through the owning service's API, with the approver's
-/// own token, marked `X-Via-AI: advisor` — FalconGo logs the human and the AI.
+/// own token, marked `X-Via-AI: advisor` — that service logs the human and the AI.
 async fn approve(
     pool: web::Data<PgPool>,
     adv: web::Data<Advisor>,
@@ -282,8 +280,10 @@ async fn approve(
     let token = bearer(&req)?;
     let id = path.into_inner();
     if let Some(pending) = store::suggestion(&pool, id).await? {
-        if pending.status == "pending" && pending.target == "falcon" {
-            upstream::falcon_audit_ready(&adv.http, &adv.cfg, &token)
+        if pending.status == "pending" {
+            let target = Target::parse(&pending.target)
+                .ok_or_else(|| AppError::Conflict(format!("unknown target {}", pending.target)))?;
+            upstream::audit_ready(&adv.http, &adv.cfg, &token, target)
                 .await
                 .map_err(AppError::Conflict)?;
         }
@@ -297,18 +297,27 @@ async fn approve(
             }
         }
     };
-    let target = if s.target == "maint" { Target::Maint } else { Target::Falcon };
+    let target = Target::parse(&s.target).unwrap_or(Target::Falcon);
     let call = upstream::ApplyCall {
         target,
         method: &s.method,
         path: &s.path,
         body: &s.body,
+        meta: &s.apply_meta,
         suggestion_id: s.id,
     };
     let applied = upstream::apply(&adv.http, &adv.cfg, &token, call).await;
     let row = match applied {
         Ok((code, body)) => {
-            let ok = (200..300).contains(&code);
+            let mut ok = (200..300).contains(&code);
+            let mut body = body;
+            // maint-rust answers a batch with 200 and a result per operation.
+            if ok && s.apply_meta.get("check").and_then(Value::as_str) == Some("sync_push") {
+                if let Err(why) = actions::maint::all_applied(&body) {
+                    ok = false;
+                    body = json!({ "error": why, "response": body });
+                }
+            }
             store::record_result(&pool, s.id, ok, Some(code), &body).await?
         }
         Err(e) => store::record_result(&pool, s.id, false, None, &json!({ "error": e.to_string() })).await?,

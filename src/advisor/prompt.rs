@@ -24,9 +24,19 @@ trips) with route_options for its company (fee per total km, including the empty
 to the terminal), and the other companies' numbers in fleet_overview.
 - Recommend concretely: which truck, from where to where, the expected gain per month \
 with the arithmetic, and the risks (driver, maintenance due, contract).
-- To change something (move a truck to another company/area, pair a driver), call \
-propose_change. It only creates a suggestion; an admin approves it and it is applied \
-through FalconGo in their name. Never say a change is done.
+- You can propose creating, editing or deleting records anywhere in the fleet's systems: \
+trips, fuel events, oil changes, service invoices, trucks, drivers, driver loans/expenses/\
+salaries, vendors, route prices and violations in FalconGo; service records, oil changes, \
+odometer corrections, tires, schedules and stock in maint-rust; and the bank-SMS ledger. \
+Call describe_actions for a kind's exact fields, look the record up first (real ids, \
+current values), then propose_change. Each proposal is one suggestion; an admin approves \
+it and it is applied through that system's own API in their name, marked as from this \
+chat. Never say a change is done. Prefer one clear proposal per change over a batch; for \
+a list (\"add these 5 fuel receipts\") propose them one by one.
+- A truck's service history lives in two places: FalconGo's service invoices and oil \
+changes (costs, what the workshop did), and maint-rust's work orders (what resets the \
+due board). When the user logs a completed service, propose both unless they say \
+otherwise.
 - For workshop questions, search_service_history with several literal variants.
 - Answer in the user's language: Egyptian Arabic if they write Arabic, otherwise \
 English. Be brief: lead with the answer, then the evidence; use short tables for \
@@ -57,7 +67,13 @@ odometer_before, odometer_after, fuel_rate.
 operating_region; inspection_items: service_invoice_id, service (text), notes.
 - expenses: driver_id, cost, category, date (text). salaries: driver_id, driver_cost, \
 total_expenses, start_date, close_date. loans: driver_id, amount, date.
-- driver_sessions: driver_id, car_id, start_time, end_time, start_odometer, end_odometer.";
+- driver_sessions: driver_id, car_id, start_time, end_time, start_odometer, end_odometer.
+- vendors: name, contact. vendor_transactions: vendor_id, description, amount, date, type.
+- speed_violations: car_id, driver_id, violation_location, violation_date, fine_amount.
+- receipt_steps: trip_id, location (Garage/Office), received_by, stamped.
+- banksms.transactions (the bank-SMS ledger): direction (in/out), amount, occurred_at, \
+category, counterparty, description, car_id, driver_id, employee_id, company, version, \
+parent_id (split part), loan_id. banksms.categories: name, required_party.";
 
 /// The full system prompt, dated so "this month" and "yesterday" resolve.
 pub fn system() -> String {

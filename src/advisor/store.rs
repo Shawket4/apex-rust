@@ -126,6 +126,7 @@ pub struct SuggestionRow {
     pub method: String,
     pub path: String,
     pub body: Value,
+    pub apply_meta: Value,
     pub status: String,
     pub proposed_for_user_id: i64,
     pub decided_by_user_id: Option<i64>,
@@ -148,15 +149,12 @@ pub struct NewSuggestion<'a> {
 
 pub async fn insert_suggestion(pool: &PgPool, s: NewSuggestion<'_>) -> sqlx::Result<Uuid> {
     let id = Uuid::new_v4();
-    let target = match s.planned.target {
-        super::upstream::Target::Falcon => "falcon",
-        super::upstream::Target::Maint => "maint",
-    };
+    let target = s.planned.target.as_str();
     sqlx::query(
         "INSERT INTO advisor.suggestions
            (id, conversation_id, kind, title, rationale, before, after,
-            target, method, path, body, proposed_for_user_id)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)",
+            target, method, path, body, proposed_for_user_id, apply_meta)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)",
     )
     .bind(id)
     .bind(s.conversation_id)
@@ -170,6 +168,7 @@ pub async fn insert_suggestion(pool: &PgPool, s: NewSuggestion<'_>) -> sqlx::Res
     .bind(&s.planned.path)
     .bind(&s.planned.body)
     .bind(s.user_id)
+    .bind(&s.planned.meta)
     .execute(pool)
     .await?;
     Ok(id)

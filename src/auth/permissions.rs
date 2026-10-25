@@ -31,6 +31,10 @@ pub struct AuthContext {
     /// `sub` at all, and `iss` is the same id rendered as a string.
     pub user_id: i64,
     pub permission: i32,
+    /// Set when the request came through the AI advisor (`X-Via-AI`): the
+    /// human is still `user_id` (the approver's own token), and every actor
+    /// column records both, so a ledger row shows it was an AI suggestion.
+    pub via_ai: Option<String>,
 }
 
 impl AuthContext {
@@ -47,6 +51,7 @@ impl AuthContext {
         Some(Self {
             user_id,
             permission: claims.permission.unwrap_or(0),
+            via_ai: None,
         })
     }
 
@@ -78,7 +83,10 @@ impl AuthContext {
 
     /// Value recorded in `created_by` / `author` / `actor` columns.
     pub fn actor(&self) -> String {
-        self.user_id.to_string()
+        match &self.via_ai {
+            Some(via) => format!("{} via AI {via}", self.user_id),
+            None => self.user_id.to_string(),
+        }
     }
 }
 

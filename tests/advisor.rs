@@ -71,6 +71,10 @@ async fn db(name: &str) -> PgPool {
 
 /// An advisor with no model and neighbours at a closed port.
 fn offline_advisor(falcon: &str) -> Advisor {
+    advisor_with(falcon, "http://127.0.0.1:9", "http://127.0.0.1:9")
+}
+
+fn advisor_with(falcon: &str, maint: &str, apex: &str) -> Advisor {
     Advisor {
         provider: None,
         http: reqwest::Client::new(),
@@ -78,7 +82,8 @@ fn offline_advisor(falcon: &str) -> Advisor {
             falcon_api_url: falcon.to_string(),
             etit_proxy_url: "http://127.0.0.1:9".into(),
             etit_admin_token: None,
-            maint_api_url: "http://127.0.0.1:9".into(),
+            maint_api_url: maint.to_string(),
+            apex_api_url: apex.to_string(),
             tei_url: "http://127.0.0.1:9/embed".into(),
             digest_enabled: false,
         },
@@ -242,13 +247,18 @@ async fn an_approved_suggestion_is_applied_through_falcon_in_the_approvers_name(
     )
     .await;
 
-    // Permission 3 cannot approve.
+    // Permission 3 cannot approve: the route's floor refuses it before the
+    // handler runs (a middleware error, which a server sends as 403).
     let manager = support::token_with_permission(42, 3);
     let req = test::TestRequest::post()
         .uri(&format!("/api/v1/advisor/suggestions/{id}/approve"))
         .insert_header(("Authorization", format!("Bearer {manager}")))
         .to_request();
-    assert_eq!(test::call_service(&app, req).await.status(), 403);
+    let refused = match test::try_call_service(&app, req).await {
+        Ok(resp) => resp.status(),
+        Err(e) => e.as_response_error().status_code(),
+    };
+    assert_eq!(refused, 403);
     assert!(seen.lock().unwrap().is_empty());
 
     // An admin approves: the change goes to FalconGo with their token.
@@ -337,4 +347,198 @@ async fn without_falcon_audit_nothing_is_applied() {
     assert_eq!(test::call_service(&app, req).await.status(), 409);
     assert!(seen.lock().unwrap().is_empty(), "no write reached FalconGo");
     assert_eq!(store::suggestion(&pool, id).await.unwrap().unwrap().status, "pending");
+}
+
+/// A stand-in maint-rust: one oil change at sync_version 3, its audit log, and
+/// a sync endpoint that answers each batch with `outcome` per operation.
+async fn fake_maint(seen: Arc<Mutex<Vec<Value>>>, row_id: String, outcome: &'static str) -> String {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = HttpServer::new(move || {
+        let seen = seen.clone();
+        let row_id = row_id.clone();
+        App::new().default_service(web::to(move |req: HttpRequest, body: web::Bytes| {
+            let seen = seen.clone();
+            let row_id = row_id.clone();
+            async move {
+                let path = req.path().to_string();
+                if path == "/api/maint/ai-audit" {
+                    return HttpResponse::Ok().json(json!([]));
+                }
+                if path == format!("/api/maint/records/oil_changes/{row_id}") {
+                    return HttpResponse::Ok().json(json!({
+                        "entity_type": "oil_changes", "entity_id": row_id, "sync_version": 3,
+                        "row": { "id": row_id, "vehicle_id": 1, "liters": 30, "oil_type": "15W40" }
+                    }));
+                }
+                if path.starts_with("/api/maint/records/") {
+                    return HttpResponse::NotFound().finish();
+                }
+                let b: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+                let h = |k: &str| req.headers().get(k).and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
+                seen.lock().unwrap().push(json!({ "path": path, "via": h("x-via-ai"), "body": b }));
+                let results: Vec<Value> = b["operations"].as_array().map(|ops| ops.iter().map(|o| json!({
+                    "status": outcome, "entity_id": o["entity_id"], "new_sync_version": 4
+                })).collect()).unwrap_or_default();
+                HttpResponse::Ok().json(json!({ "results": results }))
+            }
+        }))
+    })
+    .listen(listener)
+    .unwrap()
+    .run();
+    tokio::spawn(server);
+    format!("http://127.0.0.1:{port}/api/maint")
+}
+
+async fn approve(pool: &PgPool, adv: &Advisor, id: uuid::Uuid) -> Value {
+    let app = test::init_service(
+        App::new()
+            .app_data(web::Data::new(pool.clone()))
+            .app_data(web::Data::new(adv.clone()))
+            .configure(apex::advisor::handlers::configure),
+    )
+    .await;
+    let admin = support::admin_token(42);
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/advisor/suggestions/{id}/approve"))
+        .insert_header(("Authorization", format!("Bearer {admin}")))
+        .to_request();
+    test::call_and_read_body_json(&app, req).await
+}
+
+#[actix_web::test]
+async fn a_maint_edit_carries_the_row_version_and_fails_on_a_conflict() {
+    let pool = db("advisor_maint").await;
+    let row_id = uuid::Uuid::new_v4().to_string();
+    let token = apex::advisor::upstream::BearerToken("t".into());
+
+    for (outcome, want) in [("applied", "applied"), ("conflict", "failed")] {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let maint = fake_maint(seen.clone(), row_id.clone(), outcome).await;
+        let adv = advisor_with("http://127.0.0.1:9", &maint, "http://127.0.0.1:9");
+        let c = ctx(&pool, &adv, &token);
+        let proposed = tools::run(&c, "propose_change", &json!({
+            "kind": "maint_record",
+            "params": { "entity_type": "oil_changes", "operation": "update", "entity_id": row_id, "fields": { "liters": 35 } },
+            "title": "Fix liters", "rationale": "The receipt says 35 L"
+        })).await;
+        let id: uuid::Uuid = serde_json::from_value(proposed["suggestion_id"].clone()).unwrap_or_else(|_| panic!("{proposed}"));
+        let s = store::suggestion(&pool, id).await.unwrap().unwrap();
+        assert_eq!(s.target, "maint");
+        assert_eq!(s.before["liters"], 30, "{}", s.before);
+        assert_eq!(s.after["liters"], 35);
+
+        let row = approve(&pool, &adv, id).await;
+        assert_eq!(row["status"], want, "{row}");
+        let calls = seen.lock().unwrap().clone();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0]["path"], "/api/maint/sync/push");
+        assert_eq!(calls[0]["via"], "advisor");
+        assert_eq!(calls[0]["body"]["operations"][0]["sync_version"], 3);
+        if want == "failed" {
+            assert!(row["result"]["error"].as_str().unwrap().contains("changed"), "{row}");
+        }
+    }
+
+    // A record that is not there is refused at proposal time.
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let maint = fake_maint(seen, row_id.clone(), "applied").await;
+    let adv = advisor_with("http://127.0.0.1:9", &maint, "http://127.0.0.1:9");
+    let c = ctx(&pool, &adv, &token);
+    let missing = tools::run(&c, "propose_change", &json!({
+        "kind": "maint_record",
+        "params": { "entity_type": "oil_changes", "operation": "delete", "entity_id": uuid::Uuid::new_v4().to_string() },
+        "title": "x", "rationale": "y"
+    })).await;
+    assert!(missing["error"].as_str().unwrap().contains("no maint-rust"), "{missing}");
+}
+
+#[actix_web::test]
+async fn a_ledger_edit_goes_through_apex_routes_with_its_version_and_is_audited() {
+    let pool = db("advisor_ledger").await;
+
+    // apex-rust's own bank-SMS routes, served for real on a loopback port.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let served = pool.clone();
+    let server = HttpServer::new(move || {
+        App::new()
+            .app_data(web::Data::new(served.clone()))
+            .configure(apex::api::configure)
+    })
+    .listen(listener)
+    .unwrap()
+    .run();
+    tokio::spawn(server);
+    let apex_url = format!("http://127.0.0.1:{port}");
+
+    let http = reqwest::Client::new();
+    let admin = support::admin_token(42);
+    // The permission floor: a manager (3) can no longer write the ledger.
+    let manager = support::token_with_permission(43, 3);
+    let body = json!({ "direction": "out", "amount": "500", "occurred_at": "2026-10-20T09:00:00Z", "description": "toll" });
+    let r = http.post(format!("{apex_url}/api/v1/transactions")).bearer_auth(&manager).json(&body).send().await.unwrap();
+    assert_eq!(r.status(), 403);
+    let r = http.post(format!("{apex_url}/api/v1/transactions")).bearer_auth(&admin).json(&body).send().await.unwrap();
+    assert_eq!(r.status(), 201);
+    let txn: Value = r.json().await.unwrap();
+    let txn_id = txn["id"].as_i64().unwrap();
+
+    let adv = advisor_with("http://127.0.0.1:9", "http://127.0.0.1:9", &apex_url);
+    let token = apex::advisor::upstream::BearerToken(admin.clone());
+    let c = ctx(&pool, &adv, &token);
+    let propose = |desc: &'static str| {
+        json!({ "kind": "edit_transaction", "params": { "id": txn_id, "description": desc },
+                "title": "Describe the toll", "rationale": "SMS says Suez road" })
+    };
+    let proposed = tools::run(&c, "propose_change", &propose("Suez road toll")).await;
+    let id: uuid::Uuid = serde_json::from_value(proposed["suggestion_id"].clone()).unwrap_or_else(|_| panic!("{proposed}"));
+    let s = store::suggestion(&pool, id).await.unwrap().unwrap();
+    assert_eq!(s.target, "apex");
+    assert_eq!(s.before["description"], "toll");
+    assert!(s.apply_meta["if_match"].is_number(), "{}", s.apply_meta);
+
+    let row = approve(&pool, &adv, id).await;
+    assert_eq!(row["status"], "applied", "{row}");
+    let (desc, edited_by): (Option<String>, Option<String>) =
+        sqlx::query_as("SELECT description, edited_by FROM banksms.transactions WHERE id = $1")
+            .bind(txn_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(desc.as_deref(), Some("Suez road toll"));
+    assert_eq!(edited_by.as_deref(), Some("42 via AI advisor"));
+    let (user, status, via): (Option<i64>, Option<i32>, String) = sqlx::query_as(
+        "SELECT user_id, status, via FROM advisor.ai_audit_log WHERE suggestion_id = $1",
+    )
+    .bind(id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!((user, status, via.as_str()), (Some(42), Some(200), "advisor"));
+
+    // Proposed, then someone edits the row by hand: the stale version is
+    // refused and nothing is overwritten.
+    let stale = tools::run(&c, "propose_change", &propose("AI wording")).await;
+    let stale_id: uuid::Uuid = serde_json::from_value(stale["suggestion_id"].clone()).unwrap();
+    let current: Value = http.get(format!("{apex_url}/api/v1/transactions/{txn_id}")).bearer_auth(&admin).send().await.unwrap().json().await.unwrap();
+    let r = http
+        .patch(format!("{apex_url}/api/v1/transactions/{txn_id}"))
+        .bearer_auth(&admin)
+        .header("If-Match", current["version"].to_string())
+        .json(&json!({ "description": "human wording" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let row = approve(&pool, &adv, stale_id).await;
+    assert_eq!(row["status"], "failed", "{row}");
+    assert_eq!(row["result_status"], 409);
+    let desc: Option<String> = sqlx::query_scalar("SELECT description FROM banksms.transactions WHERE id = $1")
+        .bind(txn_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(desc.as_deref(), Some("human wording"));
 }

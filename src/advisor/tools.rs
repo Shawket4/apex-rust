@@ -1,5 +1,5 @@
 //! The advisor's tools: what Claude can look at, and the one thing it can do
-//! (propose a change for an admin to approve).
+//! (propose a change, in any of the fleet's systems, for an admin to approve).
 //!
 //! Curated tools cover the questions the owner asked for — where a truck went,
 //! what each truck/company/terminal earns, where it could have earned more,
@@ -14,7 +14,7 @@ use uuid::Uuid;
 
 use super::llm::ToolDef;
 use super::upstream::{self, BearerToken};
-use super::{actions, search, sql, store, Advisor};
+use super::{actions, falcon_actions, search, sql, store, Advisor};
 
 /// Everything a tool may touch during one turn.
 pub struct ToolCtx<'a> {
@@ -141,16 +141,27 @@ pub fn tool_defs() -> Vec<ToolDef> {
             }),
         },
         ToolDef {
+            name: "describe_actions",
+            description: "The exact parameters of one or more change kinds, before proposing them. Call it for any kind you have not used in this conversation.".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "kinds": { "type": "array", "items": { "type": "string", "enum": actions::kind_names() } }
+                },
+                "required": ["kinds"]
+            }),
+        },
+        ToolDef {
             name: "propose_change",
             description: format!(
-                "Propose ONE change for an admin to approve. Nothing changes until they approve it; then it is applied through FalconGo's API in their name, marked as coming from this chat. Only propose what the data supports, and say why. Kinds: {}",
-                actions::kinds_schema()
+                "Propose ONE change for an admin to approve: creating, editing or deleting a record in FalconGo (trips, fuel, oil changes, service invoices, trucks, drivers, driver money, vendors, prices, violations), maint-rust (service records, oil changes, odometer, tires, schedules, stock) or the bank-SMS ledger. Nothing changes until an admin with permission 4 approves it; then it is applied through that system's own API in their name, marked as coming from this chat. Check the record first (find_truck, run_sql) and use real ids. Only propose what the data supports, and say why. Kinds:\n{}",
+                actions::summary()
             ),
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "kind": { "type": "string", "enum": ["reassign_car", "assign_driver"] },
-                    "params": { "type": "object" },
+                    "kind": { "type": "string", "enum": actions::kind_names() },
+                    "params": { "type": "object", "description": "as describe_actions lists them" },
                     "title": { "type": "string", "description": "One line, in the user's language" },
                     "rationale": { "type": "string", "description": "The evidence, with numbers" }
                 },
@@ -174,6 +185,14 @@ pub async fn run(ctx: &ToolCtx<'_>, name: &str, args: &Value) -> Value {
         "run_sql" => {
             let q = args.get("query").and_then(Value::as_str).unwrap_or("");
             Ok(sql::run(ctx.pool, q).await)
+        }
+        "describe_actions" => {
+            let kinds: Vec<String> = args
+                .get("kinds")
+                .and_then(Value::as_array)
+                .map(|a| a.iter().filter_map(|k| k.as_str().map(str::to_string)).collect())
+                .unwrap_or_default();
+            Ok(actions::describe(&kinds))
         }
         "propose_change" => propose_change(ctx, args).await,
         other => Err(format!("unknown tool `{other}`")),
@@ -599,71 +618,18 @@ async fn propose_change(ctx: &ToolCtx<'_>, args: &Value) -> ToolResult {
     let params = args.get("params").cloned().unwrap_or_else(|| json!({}));
     let title = s(args, "title").ok_or("`title` is required")?;
     let rationale = s(args, "rationale").ok_or("`rationale` is required")?;
-    let planned = actions::plan(kind, &params)?;
+    let mut planned = actions::plan(kind, &params)?;
 
-    // Check the targets exist and capture what the reviewer will see change.
-    let car_id = i(&params, "car_id").unwrap_or(0);
-    type CarAssignment = (String, Option<String>, Option<String>, Option<i64>);
-    let car: Option<CarAssignment> = sqlx::query_as(
-        "SELECT car_no_plate, operating_company, operating_area, driver_id::bigint
-           FROM cars WHERE id = $1 AND deleted_at IS NULL",
-    )
-    .bind(car_id)
-    .fetch_optional(ctx.pool)
-    .await
-    .map_err(|e| e.to_string())?;
-    let (plate, company, area, driver_id) = car.ok_or(format!("no car with id {car_id}"))?;
-    let (before, after) = match planned.kind {
-        "reassign_car" => {
-            let new_company = planned.body.get("operating_company").cloned();
-            if let Some(c) = new_company.as_ref().and_then(Value::as_str) {
-                let known: bool = sqlx::query_scalar(
-                    "SELECT EXISTS (SELECT 1 FROM fee_mappings WHERE company = $1 AND deleted_at IS NULL)
-                         OR EXISTS (SELECT 1 FROM cars WHERE operating_company = $1 AND deleted_at IS NULL)",
-                )
-                .bind(c)
-                .fetch_one(ctx.pool)
-                .await
-                .map_err(|e| e.to_string())?;
-                if !known {
-                    return Err(format!("`{c}` is not a company in fee_mappings or on any truck; check the spelling"));
-                }
-            }
-            (
-                json!({ "plate": plate, "operating_company": company, "operating_area": area }),
-                json!({
-                    "plate": plate,
-                    "operating_company": new_company.unwrap_or(json!(company)),
-                    "operating_area": planned.body.get("operating_area").cloned().unwrap_or(json!(area)),
-                }),
-            )
-        }
-        "assign_driver" => {
-            let new_driver = i(&params, "driver_id").unwrap_or(0);
-            let name: Option<String> = sqlx::query_scalar(
-                "SELECT name FROM drivers WHERE id = $1 AND deleted_at IS NULL",
-            )
-            .bind(new_driver)
-            .fetch_optional(ctx.pool)
-            .await
-            .map_err(|e| e.to_string())?;
-            let name = name.ok_or(format!("no driver with id {new_driver}"))?;
-            let old: Option<String> = match driver_id {
-                Some(d) => sqlx::query_scalar("SELECT name FROM drivers WHERE id = $1")
-                    .bind(d)
-                    .fetch_optional(ctx.pool)
-                    .await
-                    .map_err(|e| e.to_string())?,
-                None => None,
-            };
-            (
-                json!({ "plate": plate, "driver_id": driver_id, "driver": old }),
-                json!({ "plate": plate, "driver_id": new_driver, "driver": name }),
-            )
-        }
-        _ => (json!({}), json!({})),
-    };
+    // The record as it is now: for the reviewer, for the version guard, and
+    // for full-row edits, the fields the proposal leaves alone.
+    let before = read_record(ctx, &mut planned).await?;
+    if planned.meta.get("merge").is_some() {
+        falcon_actions::merge_into(&mut planned.body, &planned.meta, &before);
+    }
+    enrich(ctx, &mut planned).await?;
+    check_references(ctx.pool, &planned.body).await?;
 
+    let (before_view, after_view) = review_views(&planned, &before);
     let id = store::insert_suggestion(
         ctx.pool,
         store::NewSuggestion {
@@ -671,8 +637,8 @@ async fn propose_change(ctx: &ToolCtx<'_>, args: &Value) -> ToolResult {
             user_id: ctx.user_id,
             title,
             rationale,
-            before,
-            after,
+            before: before_view,
+            after: after_view,
             planned: &planned,
         },
     )
@@ -684,8 +650,295 @@ async fn propose_change(ctx: &ToolCtx<'_>, args: &Value) -> ToolResult {
     Ok(json!({
         "suggestion_id": id,
         "status": "pending",
+        "service": planned.target.as_str(),
         "note": "Shown to the user with Approve / Reject. Do not claim it is done."
     }))
+}
+
+/// Keys never shown to the model or the reviewer.
+fn is_secret(key: &str) -> bool {
+    let k = key.to_ascii_lowercase();
+    k == "pin" || k.contains("password") || k.contains("token") || k.contains("secret") || k == "embedding"
+}
+
+fn scrub(v: Value) -> Value {
+    match v {
+        Value::Object(m) => Value::Object(m.into_iter().filter(|(k, _)| !is_secret(k)).collect()),
+        other => other,
+    }
+}
+
+async fn read_record(ctx: &ToolCtx<'_>, planned: &mut actions::Planned) -> Result<Value, String> {
+    match planned.record.clone() {
+        actions::Record::None => Ok(json!({})),
+        actions::Record::Falcon { table, id } => {
+            // `table` comes from the static catalog, never from the model.
+            let row: Option<Value> = sqlx::query_scalar(&format!(
+                "SELECT to_jsonb(t) FROM {table} t WHERE id = $1 AND deleted_at IS NULL"
+            ))
+            .bind(id)
+            .fetch_optional(ctx.pool)
+            .await
+            .map_err(|e| e.to_string())?;
+            let mut row = scrub(row.ok_or(format!("no {table} row with id {id}"))?);
+            if table == "service_invoices" {
+                let items: Value = sqlx::query_scalar(
+                    "SELECT COALESCE(jsonb_agg(jsonb_build_object('service', service, 'notes', notes)
+                                               ORDER BY item_order, id), '[]'::jsonb)
+                       FROM inspection_items WHERE service_invoice_id = $1 AND deleted_at IS NULL",
+                )
+                .bind(id)
+                .fetch_one(ctx.pool)
+                .await
+                .map_err(|e| e.to_string())?;
+                row["inspection_items"] = items;
+            }
+            Ok(row)
+        }
+        actions::Record::ApexTransaction { id } => {
+            let row: Option<Value> = sqlx::query_scalar(
+                "SELECT to_jsonb(t) FROM banksms.transactions t WHERE id = $1 AND deleted_at IS NULL",
+            )
+            .bind(id)
+            .fetch_optional(ctx.pool)
+            .await
+            .map_err(|e| e.to_string())?;
+            let row = row.ok_or(format!("no ledger transaction with id {id}"))?;
+            // A split part's parent carries the version the split routes check.
+            let version = match (planned.kind, row.get("parent_id").and_then(Value::as_i64)) {
+                ("split_transaction", Some(_)) => {
+                    return Err("that transaction is a split part; split its parent instead".into())
+                }
+                _ => row.get("version").cloned().unwrap_or(Value::Null),
+            };
+            planned.meta["if_match"] = version;
+            Ok(scrub(row))
+        }
+        actions::Record::Maint { entity_type, entity_id } => {
+            let found = upstream::maint_record(&ctx.adv.http, &ctx.adv.cfg, ctx.token, &entity_type, &entity_id)
+                .await
+                .map_err(|e| e.to_string())?;
+            let ops_need_row = planned.body["operations"]
+                .as_array()
+                .is_some_and(|ops| ops.iter().any(|o| o["entity_id"] == entity_id.as_str() && o["operation"] != "insert"));
+            match found {
+                Some((row, version)) => {
+                    actions::maint::set_version(planned, &entity_id, version);
+                    Ok(scrub(row))
+                }
+                None if ops_need_row => Err(format!("no maint-rust {entity_type} with id {entity_id}")),
+                None => Ok(json!({})),
+            }
+        }
+    }
+}
+
+/// Fill what the database knows better than the model: plates and driver
+/// names for trips, an invoice's plate, the readings an odometer correction
+/// outranks; and check a company name before moving a truck to it.
+async fn enrich(ctx: &ToolCtx<'_>, planned: &mut actions::Planned) -> Result<(), String> {
+    let pool = ctx.pool;
+    let plate = |car: i64| async move {
+        sqlx::query_scalar::<_, String>("SELECT car_no_plate FROM cars WHERE id = $1 AND deleted_at IS NULL")
+            .bind(car)
+            .fetch_optional(pool)
+            .await
+            .map_err(|e| e.to_string())?
+            .ok_or(format!("no truck with car id {car}"))
+    };
+    let driver = |id: i64| async move {
+        sqlx::query_scalar::<_, String>("SELECT name FROM drivers WHERE id = $1 AND deleted_at IS NULL")
+            .bind(id)
+            .fetch_optional(pool)
+            .await
+            .map_err(|e| e.to_string())?
+            .ok_or(format!("no driver with id {id}"))
+    };
+
+    if planned.meta.get("enrich").and_then(Value::as_str) == Some("trip") {
+        let parent = &mut planned.body["parent_trip"];
+        if let Some(car) = parent.get("car_id").and_then(Value::as_i64) {
+            parent["car_no_plate"] = json!(plate(car).await?);
+        }
+        if let Some(d) = parent.get("driver_id").and_then(Value::as_i64) {
+            parent["driver_name"] = json!(driver(d).await?);
+        }
+    }
+    match planned.kind {
+        "update_trip" => {
+            if let Some(car) = planned.body.get("car_id").and_then(Value::as_i64) {
+                if planned.body.get("car_no_plate").is_none() {
+                    planned.body["car_no_plate"] = json!(plate(car).await?);
+                }
+            }
+            if let Some(d) = planned.body.get("driver_id").and_then(Value::as_i64) {
+                if planned.body.get("driver_name").is_none() {
+                    planned.body["driver_name"] = json!(driver(d).await?);
+                }
+            }
+        }
+        "create_service_invoice" => {
+            if planned.body.get("plate_number").is_none() {
+                let car = planned.body["car_id"].as_i64().unwrap_or(0);
+                planned.body["plate_number"] = json!(plate(car).await?);
+            }
+        }
+        "reassign_car" => {
+            if let Some(c) = planned.body.get("operating_company").and_then(Value::as_str) {
+                let known: bool = sqlx::query_scalar(
+                    "SELECT EXISTS (SELECT 1 FROM fee_mappings WHERE company = $1 AND deleted_at IS NULL)
+                         OR EXISTS (SELECT 1 FROM cars WHERE operating_company = $1 AND deleted_at IS NULL)",
+                )
+                .bind(c)
+                .fetch_one(pool)
+                .await
+                .map_err(|e| e.to_string())?;
+                if !known {
+                    return Err(format!("`{c}` is not a company in fee_mappings or on any truck; check the spelling"));
+                }
+            }
+        }
+        "set_odometer" | "log_oil_change" | "record_service" => {
+            let car = planned.body["operations"][0]["payload"]["vehicle_id"]
+                .as_i64()
+                .or_else(|| planned.body["operations"][0]["entity_id"].as_str().and_then(|s| s.parse().ok()))
+                .unwrap_or(0);
+            plate(car).await?;
+            if planned.kind == "set_odometer" {
+                // The automatic readings this correction outranks: Falcon's
+                // latest fuel odometer and its mileage (the max of fuel, oil
+                // and service readings), as maint-rust's view compares them.
+                let seen: i64 = sqlx::query_scalar(
+                    "SELECT GREATEST(COALESCE(last_fuel_odometer, 0)::bigint,
+                                     COALESCE(mileage, 0)::bigint)
+                       FROM cars WHERE id = $1",
+                )
+                .bind(car)
+                .fetch_one(pool)
+                .await
+                .map_err(|e| e.to_string())?;
+                planned.body["operations"][0]["payload"]["superseded_km"] = json!(seen);
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Every car_id / driver_id a body names must exist: several FalconGo
+/// handlers would otherwise write a row pointing at nothing.
+async fn check_references(pool: &PgPool, body: &Value) -> Result<(), String> {
+    fn walk(v: &Value, cars: &mut Vec<i64>, drivers: &mut Vec<i64>) {
+        match v {
+            Value::Object(m) => {
+                for (k, v) in m {
+                    match (k.as_str(), v.as_i64()) {
+                        ("car_id", Some(id)) => cars.push(id),
+                        ("driver_id", Some(id)) => drivers.push(id),
+                        _ => walk(v, cars, drivers),
+                    }
+                }
+            }
+            Value::Array(a) => a.iter().for_each(|v| walk(v, cars, drivers)),
+            _ => {}
+        }
+    }
+    let (mut cars, mut drivers) = (Vec::new(), Vec::new());
+    walk(body, &mut cars, &mut drivers);
+    for (table, ids) in [("cars", cars), ("drivers", drivers)] {
+        for id in ids {
+            let ok: bool = sqlx::query_scalar(&format!(
+                "SELECT EXISTS (SELECT 1 FROM {table} WHERE id = $1 AND deleted_at IS NULL)"
+            ))
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .map_err(|e| e.to_string())?;
+            if !ok {
+                return Err(format!("no {} with id {id}", if table == "cars" { "truck" } else { "driver" }));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// What the reviewer sees: for an edit, only the fields that change (and the
+/// record's name), before and after; for a create, what will be written; for
+/// a delete, the record that goes.
+fn review_views(planned: &actions::Planned, before: &Value) -> (Value, Value) {
+    const LABELS: &[&str] = &["car_no_plate", "plate_number", "name", "driver_name", "date", "company", "receipt_no"];
+    let mut changed = serde_json::Map::new();
+    let flatten = |v: &Value, out: &mut serde_json::Map<String, Value>| {
+        if let Value::Object(m) = v {
+            for (k, v) in m {
+                match v {
+                    Value::Object(inner) if k != "payload" => {
+                        for (ik, iv) in inner {
+                            out.insert(ik.clone(), iv.clone());
+                        }
+                    }
+                    _ => {
+                        out.insert(k.clone(), v.clone());
+                    }
+                }
+            }
+        }
+    };
+    // A maint batch is reviewed by its first operation's payload, plus the
+    // categories of a service record's tasks.
+    match planned.body["operations"].as_array() {
+        Some(ops) if !ops.is_empty() => {
+            flatten(&ops[0]["payload"], &mut changed);
+            let tasks: Vec<&str> = ops[1..].iter().filter_map(|o| o["payload"]["category_id"].as_str()).collect();
+            if !tasks.is_empty() {
+                changed.insert("tasks".into(), json!(tasks.join(", ")));
+            }
+        }
+        _ => flatten(&planned.body, &mut changed),
+    }
+    // Lists (a trip's containers, an invoice's lines) read as one line each.
+    for v in changed.values_mut() {
+        if let Value::Array(items) = v {
+            let lines: Vec<String> = items
+                .iter()
+                .map(|it| match it {
+                    Value::Object(m) => m
+                        .values()
+                        .filter(|x| !x.is_null() && x.as_str() != Some(""))
+                        .map(|x| x.as_str().map(str::to_string).unwrap_or_else(|| x.to_string()))
+                        .collect::<Vec<_>>()
+                        .join(" · "),
+                    other => other.as_str().map(str::to_string).unwrap_or_else(|| other.to_string()),
+                })
+                .collect();
+            *v = json!(lines.join(" | "));
+        }
+    }
+    let is_delete = planned.method == "DELETE" || planned.kind.starts_with("delete_");
+    let empty = before.as_object().map_or(true, |m| m.is_empty());
+    if is_delete {
+        return (before.clone(), json!({ "deleted": true }));
+    }
+    if empty {
+        changed.retain(|k, _| k != "ID" && k != "ref_id");
+        return (json!({}), Value::Object(changed));
+    }
+    let mut b = serde_json::Map::new();
+    let mut a = serde_json::Map::new();
+    for label in LABELS {
+        if let Some(v) = before.get(*label) {
+            b.insert((*label).into(), v.clone());
+            a.insert((*label).into(), v.clone());
+        }
+    }
+    for (k, v) in changed {
+        if k == "ID" || k == "id" || before.get(&k) == Some(&v) {
+            continue;
+        }
+        b.insert(k.clone(), before.get(&k).cloned().unwrap_or(Value::Null));
+        a.insert(k, v);
+    }
+    (Value::Object(b), Value::Object(a))
 }
 
 #[cfg(test)]

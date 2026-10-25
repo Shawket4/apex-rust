@@ -5,8 +5,9 @@
 //! vectors — and it *suggests*. It never writes to another system's database:
 //! a suggestion becomes a change only when an admin (permission 4) approves it,
 //! and the change is then made through that system's own HTTP API with the
-//! approver's token and `X-Via-AI: advisor`, so FalconGo records both the human
-//! and the AI chat (the owner's rule, 2026-10-24).
+//! approver's token and `X-Via-AI: advisor`, so the owning service (FalconGo,
+//! maint-rust, or apex-rust's own ledger) records both the human and the AI
+//! chat (the owner's rule, 2026-10-24).
 //!
 //! The module is self-contained (its own config, schema `advisor`, routes under
 //! `/api/v1/advisor`) so it can move to its own service later without surgery.
@@ -15,6 +16,7 @@ pub mod actions;
 pub mod agent;
 pub mod anthropic;
 pub mod digest;
+pub mod falcon_actions;
 pub mod handlers;
 pub mod llm;
 pub mod prompt;
@@ -41,6 +43,9 @@ pub struct AdvisorConfig {
     pub etit_admin_token: Option<String>,
     /// maint-rust root, including `/api/maint`.
     pub maint_api_url: String,
+    /// apex-rust itself, for approved changes to its own bank-SMS ledger: they
+    /// go through the same HTTP routes (and audit) as a person's would.
+    pub apex_api_url: String,
     /// The text-embeddings-inference endpoint FalconGo embeds invoices with.
     pub tei_url: String,
     /// Off by default in tests and on machines without the key.
@@ -56,6 +61,10 @@ impl AdvisorConfig {
                 .ok()
                 .filter(|s| !s.trim().is_empty()),
             maint_api_url: env_or("ADVISOR_MAINT_API_URL", "http://127.0.0.1:8095/api/maint"),
+            apex_api_url: env_or(
+                "ADVISOR_APEX_API_URL",
+                &format!("http://127.0.0.1:{}", crate::config::CONFIG.server_port),
+            ),
             tei_url: env_or("ADVISOR_TEI_URL", "http://127.0.0.1:8080/embed"),
             digest_enabled: env_or("ADVISOR_DIGEST", "on") != "off",
         }

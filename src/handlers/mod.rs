@@ -28,6 +28,7 @@ use crate::auth::JwtAuth;
 pub fn configure_api_v1(cfg: &mut web::ServiceConfig) {
     let at = |level: i32| JwtAuth {
         required_permission: Some(level),
+        enforce: false,
     };
 
     cfg.service(
