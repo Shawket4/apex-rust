@@ -75,6 +75,24 @@ pub async fn osrm_route(
     Some((v.get("distanceKm")?.as_f64()?, v.get("durationMin")?.as_f64()?))
 }
 
+/// GET from FalconGo (`/api/…`).
+pub async fn falcon_get(
+    http: &reqwest::Client,
+    cfg: &AdvisorConfig,
+    token: &BearerToken,
+    path: &str,
+    query: &[(&str, String)],
+) -> Result<Value, UpstreamError> {
+    let resp = http
+        .get(format!("{}{}", cfg.falcon_api_url, path))
+        .bearer_auth(&token.0)
+        .query(query)
+        .send()
+        .await
+        .map_err(|e| UpstreamError(format!("FalconGo unreachable: {e}")))?;
+    read_json(resp, "FalconGo").await
+}
+
 /// GET from maint-rust (`/api/maint/…`).
 pub async fn maint_get(
     http: &reqwest::Client,

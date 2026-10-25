@@ -130,7 +130,7 @@ pub fn tool_defs() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "route_options",
-            description: "Where a truck could earn the most: every (terminal, drop-off) route of a company with its expected revenue per delivery for THIS truck's tank — priced by the company's pricing rule in force today (Petrol Arrows: route fee × litres / 1000; Watanya: band rate × litres / 1000; TAQA/Petromin: per-km rate × distance) — its VAT, distance, and the empty km from the truck's current position to the terminal (road distance when available). Ranked by base revenue per total km (empty run + there and back). Car rental is per truck-month, not per delivery, so it is not in the per-route figures.".into(),
+            description: "Where a truck could earn the most: every (terminal, drop-off) route of a company with its expected revenue per delivery for THIS truck's tank — priced by FalconGo's pricing engine on the company's rule in force today (Petrol Arrows: route fee × litres / 1000; Watanya: band rate × litres / 1000; TAQA/Petromin: per-km rate × distance) — its VAT, distance, and the empty km from the truck's current position to the terminal (road distance when available). Ranked by base revenue per total km (empty run + there and back). Car rental is per truck-month, not per delivery, so it is not in the per-route figures.".into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -653,45 +653,67 @@ async fn route_options(ctx: &ToolCtx<'_>, args: &Value) -> ToolResult {
     .map_err(|e| e.to_string())?
     .ok_or(format!("no pricing rule in force today for `{company}`; nothing to price its routes with"))?;
 
-    // Every route, priced in SQL from the rule: the same inputs FalconGo's
-    // engine prices a trip from (the route's fee or band, its distance), for
-    // this truck's tank.
+    // Every route of the company: what it is and where its terminal is. Its
+    // price comes from FalconGo's engine below — never re-derived here.
     #[derive(sqlx::FromRow)]
     struct Route {
         terminal: String,
         drop_off_point: String,
         distance: f64,
         band: Option<i32>,
-        base: Option<f64>,
         t_lat: Option<f64>,
         t_lng: Option<f64>,
     }
     let routes: Vec<Route> = sqlx::query_as(
         "SELECT fm.terminal, fm.drop_off_point, COALESCE(fm.distance, 0)::float8 AS distance,
-                CASE WHEN r.method = 'band_per_1000l' THEN fm.fee::int END AS band,
-                (CASE r.method
-                   WHEN 'per_1000l_fee'  THEN $3::numeric * fm.fee / 1000
-                   WHEN 'band_per_1000l' THEN $3::numeric * pb.rate_per_1000l / 1000
-                   WHEN 'per_km'         THEN r.per_km_rate * fm.distance
-                 END)::float8 AS base,
+                CASE WHEN $3::text = 'band_per_1000l' THEN fm.fee::int END AS band,
                 NULLIF(t.latitude, 0)::float8 AS t_lat, NULLIF(t.longitude, 0)::float8 AS t_lng
            FROM fee_mappings fm
-           JOIN pricing_rules r ON r.id = $4
-           LEFT JOIN pricing_bands pb
-             ON r.method = 'band_per_1000l' AND pb.rule_id = r.id AND pb.band = fm.fee::int
            LEFT JOIN terminals t ON t.id = fm.terminal_id AND t.deleted_at IS NULL
           WHERE fm.deleted_at IS NULL AND fm.company = $1
             AND ($2::text IS NULL OR fm.terminal = $2)",
     )
     .bind(&company)
     .bind(s(args, "terminal"))
-    .bind(tank)
-    .bind(rule.id)
+    .bind(&rule.method)
     .fetch_all(ctx.pool)
     .await
     .map_err(|e| e.to_string())?;
     if routes.is_empty() {
         return Err(format!("no fee mappings (routes) for company `{company}`"));
+    }
+
+    // What each route earns, from FalconGo's pricing engine — the same one
+    // that prices and stores every trip. A per-km rule ignores the tank, so it
+    // is quoted even when the tank is unknown.
+    let quote_tank = match (tank, rule.method.as_str()) {
+        (Some(t), _) => Some(t),
+        (None, "per_km") => Some(1),
+        (None, _) => None,
+    };
+    let mut quotes: std::collections::HashMap<(String, String), (Option<f64>, Option<f64>, Option<String>)> =
+        Default::default();
+    if let Some(t) = quote_tank {
+        let mut query = vec![("company", company.clone()), ("tank_capacity", t.to_string())];
+        if let Some(term) = s(args, "terminal") {
+            query.push(("terminal", term.to_string()));
+        }
+        let body = upstream::falcon_get(&ctx.adv.http, &ctx.adv.cfg, ctx.token, "/pricing/quote", &query)
+            .await
+            .map_err(|e| format!("could not price the routes: {e}"))?;
+        for q in body["quotes"].as_array().into_iter().flatten() {
+            quotes.insert(
+                (
+                    q["terminal"].as_str().unwrap_or_default().to_string(),
+                    q["drop_off_point"].as_str().unwrap_or_default().to_string(),
+                ),
+                (
+                    q["base_revenue"].as_f64(),
+                    q["revenue_vat"].as_f64(),
+                    q["pricing_error"].as_str().map(str::to_string),
+                ),
+            );
+        }
     }
 
     // Where it is now, from its tracker (cars.latitude/longitude are stale).
@@ -733,12 +755,16 @@ async fn route_options(ctx: &ToolCtx<'_>, args: &Value) -> ToolResult {
     let mut unpriced = Vec::new();
     let mut options: Vec<Value> = Vec::new();
     for r in &routes {
-        let Some(base) = r.base.filter(|b| *b > 0.0) else {
-            let why = match (rule.method.as_str(), tank, r.band) {
-                ("per_1000l_fee" | "band_per_1000l", None, _) => "the truck's tank capacity is unknown".to_string(),
-                ("band_per_1000l", _, Some(b)) => format!("band {b} has no rate in pricing rule {}", rule.id),
-                ("per_km", _, _) if r.distance <= 0.0 => "the route has no distance".to_string(),
-                _ => "the route has no fee".to_string(),
+        let quote = quotes.get(&(r.terminal.clone(), r.drop_off_point.clone()));
+        let (Some(base), Some(vat)) = (
+            quote.and_then(|q| q.0).filter(|b| *b > 0.0),
+            quote.and_then(|q| q.1),
+        ) else {
+            let why = match (quote_tank, quote) {
+                (None, _) => "the truck's tank capacity is unknown".to_string(),
+                (_, Some((_, _, Some(err)))) => err.clone(),
+                (_, None) => "FalconGo returned no quote for this route".to_string(),
+                _ => "the route prices to nothing".to_string(),
             };
             unpriced.push(json!({ "terminal": r.terminal, "drop_off_point": r.drop_off_point, "why": why }));
             continue;
@@ -753,8 +779,8 @@ async fn route_options(ctx: &ToolCtx<'_>, args: &Value) -> ToolResult {
             "band": r.band,
             "distance_km": r.distance,
             "expected_base_revenue": round2(base),
-            "expected_vat": round2(base * rule.vat_rate),
-            "expected_total": round2(base * (1.0 + rule.vat_rate)),
+            "expected_vat": round2(vat),
+            "expected_total": round2(base + vat),
             "base_per_km_round_trip": (r.distance > 0.0).then(|| round2(base / (2.0 * r.distance))),
             "empty_km_to_terminal": empty.map(|e| (e.0 * 10.0).round() / 10.0),
             "empty_km_method": empty.map(|e| e.1),

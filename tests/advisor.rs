@@ -125,6 +125,9 @@ async fn fleet_tools_answer_from_the_data() {
     let mut adv = offline_advisor("http://127.0.0.1:9");
     // The truck's position comes from its tracker.
     adv.cfg.etit_proxy_url = fake_etit(Arc::new(Mutex::new(Vec::new()))).await;
+    // Route prices come from FalconGo's engine, not from SQL here.
+    let quoted = Arc::new(Mutex::new(Vec::new()));
+    adv.cfg.falcon_api_url = fake_falcon_quotes(quoted.clone()).await;
     let token = apex::advisor::upstream::BearerToken("t".into());
     let c = ctx(&pool, &adv, &token);
 
@@ -154,9 +157,13 @@ async fn fleet_tools_answer_from_the_data() {
 
     let options = tools::run(&c, "route_options", &json!({ "car_id": 1 })).await;
     let first = &options["options"][0];
-    // Priced from Watanya's rule for this 38,000 L tank: band 1 is
-    // 104.5 x 38 = 3971 over 2x50 km + empty, which beats band 2's
-    // 122.1 x 38 = 4639.8 over 2x200 km + empty. Never fee / km.
+    // Asked of FalconGo's engine for this truck's 38,000 L tank, with the
+    // caller's token: band 1 earns 3971 over 2x50 km + empty, which beats
+    // band 2's 4639.8 over 2x200 km + empty. Never fee / km.
+    let asked = quoted.lock().unwrap().clone();
+    assert_eq!(asked.len(), 1, "{asked:?}");
+    assert_eq!(asked[0]["query"], "company=Watanya&tank_capacity=38000");
+    assert_eq!(asked[0]["authorization"], "Bearer t");
     assert_eq!(first["drop_off_point"], "Station A", "{options}");
     assert_eq!(first["band"], 1);
     assert_eq!(first["expected_base_revenue"], 3971.0);
@@ -169,7 +176,7 @@ async fn fleet_tools_answer_from_the_data() {
     // A band the rule has no rate for is listed as unpriced, not ranked at 0.
     let z = &options["unpriced_routes"][0];
     assert_eq!(z["drop_off_point"], "Station Z", "{options}");
-    assert!(z["why"].as_str().unwrap().contains("band 40"));
+    assert!(z["why"].as_str().unwrap().contains("band 40"), "{z}");
     // A company with no pricing rule cannot be priced at all.
     let mobil = tools::run(&c, "route_options", &json!({ "car_id": 2 })).await;
     assert!(mobil["error"].as_str().unwrap().contains("no pricing rule"), "{mobil}");
@@ -244,6 +251,40 @@ async fn keyword_search_folds_arabic_and_fuses_variants() {
     assert!(!services.contains(&"لحام شاسيه"));
     // Found by two variants, the brake-pad line ranks first.
     assert_eq!(hits[0].service, "تغيير تيل فرامل امامي");
+}
+
+/// A stand-in FalconGo pricing engine: `GET /api/pricing/quote` answers the
+/// Watanya routes of the fixture, and records each query it was asked.
+async fn fake_falcon_quotes(seen: Arc<Mutex<Vec<Value>>>) -> String {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = HttpServer::new(move || {
+        let seen = seen.clone();
+        App::new().route(
+            "/api/pricing/quote",
+            web::get().to(move |req: HttpRequest| {
+                let seen = seen.clone();
+                async move {
+                    let auth = req.headers().get("authorization").and_then(|v| v.to_str().ok()).unwrap_or("");
+                    seen.lock().unwrap().push(json!({ "query": req.query_string(), "authorization": auth }));
+                    HttpResponse::Ok().json(json!({ "quotes": [
+                        { "terminal": "Suez Terminal", "drop_off_point": "Station A",
+                          "base_revenue": 3971.0, "revenue_vat": 555.94, "pricing_error": null },
+                        { "terminal": "Suez Terminal", "drop_off_point": "Station B",
+                          "base_revenue": 4639.8, "revenue_vat": 649.57, "pricing_error": null },
+                        { "terminal": "Suez Terminal", "drop_off_point": "Station Z",
+                          "base_revenue": null, "revenue_vat": null,
+                          "pricing_error": "band 40 has no rate in the Watanya rule in force" },
+                    ]}))
+                }
+            }),
+        )
+    })
+    .listen(listener)
+    .unwrap()
+    .run();
+    tokio::spawn(server);
+    format!("http://127.0.0.1:{port}/api")
 }
 
 /// A stand-in FalconGo that records what reached it.
