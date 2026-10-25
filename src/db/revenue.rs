@@ -1,563 +1,166 @@
-//! Every trip revenue rule Apex has, in one place.
+//! Where trip revenue comes from: FalconGo prices it, apex-rust reads it.
 //!
-//! These formulas used to live inline in four statistics queries in
-//! `stats_queries.rs` and, separately, in about thirty places in FalconGo's
-//! `Controllers/trip.go`. They had already drifted apart: Go tapered TAQA's car
-//! rental by 1433.0/day while Rust used 1535.71, so the same fleet billed two
-//! different amounts depending on which endpoint you asked. Everything below is
-//! now the single definition, and `tests/revenue_parity.rs` pins the output.
+//! This module used to be the definition of revenue — the rates, the Watanya
+//! band table, TAQA's taper, Petromin's car-day, emitted as SQL and evaluated
+//! on every read. That definition now lives in FalconGo's database as
+//! effective-dated rules (`pricing_rules`, `pricing_bands`), and FalconGo's
+//! pricing engine applies them **once, on write**, storing the result. apex-rust
+//! never computes a figure; it reads these, and nothing else:
 //!
-//! # Two kinds of revenue
+//! * **`trips.base_revenue`, `trips.revenue_vat`** — a trip's own revenue
+//!   before VAT, and the VAT on it, under the rule in force on its date. NULL
+//!   when the trip could not be priced, with the reason in
+//!   `trips.pricing_error` (no fee mapping, a band with no rate, a company
+//!   with no rule, an unregistered drop-off). Read as 0 in sums, and counted
+//!   on the dashboard as a trip earning nothing.
+//! * **`truck_month_charges`** — car rental and its VAT, one row per car,
+//!   company, terminal and calendar month. TAQA rents a car by the month,
+//!   tapered by the days it worked; Petromin by the car-day. Rental belongs to
+//!   the car-month, never to a trip.
+//! * **the `trip_revenue` view** — each row's base and VAT plus its
+//!   *allocated* share of its car-month's rental (see below). Every per-row
+//!   and every aggregate revenue figure apex-rust serves is a sum over this
+//!   view, which is what keeps the trips list, the statistics page, the route
+//!   days panel, the dashboard and the advisor reconciled by construction.
 //!
-//! The distinction that shapes this whole module:
+//! # Rental over a date range
 //!
-//! * **Base revenue is per-row.** Every trip earns it on its own, from its own
-//!   volume or distance. It can be attributed to a single trip honestly.
-//! * **Car rental is not.** TAQA's is per car per calendar month, tapered by
-//!   how many days that car worked; Petromin's is per car-day, shared by every
-//!   trip that car ran that day. Neither belongs to any individual trip.
+//! A range that is not whole months gets a share of each month's stored
+//! rental. The rule (defined by FalconGo's view, followed by everything here):
 //!
-//! So the trips list shows base revenue as fact and rental/VAT as an explicit
-//! *allocation* (see [`allocation`]), while statistics report the aggregate
-//! directly. Both are computed from the constants here, which is what keeps
-//! them reconcilable.
+//! > A car-month's stored rental is spread evenly over the days the car worked
+//! > that month — `rental / month_days_worked` per worked day — and a day's
+//! > share is split equally between the car's trips that day. A range earns
+//! > the shares of the worked days that fall inside it.
 //!
-//! # Why SQL strings
+//! So a range covering a whole month earns exactly that month's stored rental
+//! (the days sum back to it), a range covering half a car's worked days earns
+//! half, and a trip's own share never moves with the caller's range — it is
+//! the month's figure, not a figure recomputed over whatever window was asked
+//! for. Statistics' per-terminal rental is the sum of those shares over the
+//! terminal's rows. It equals the stored per-terminal `truck_month_charges`
+//! row for a whole month except on a date a car served two terminals, where
+//! the day is split by trips rather than by terminals; the car's total is
+//! exact either way.
 //!
-//! The formulas are joins and window functions over a large table; evaluating
-//! them in Rust would mean pulling the whole fleet into memory. The functions
-//! below emit SQL fragments instead. Every fragment is built from constants in
-//! this file -- no caller-supplied value is ever interpolated -- so there is no
-//! injection surface, only assembly.
+//! # Who may see it
+//!
+//! Every money figure is withheld below permission 3 (statistics, route days)
+//! and below 4 on the per-trip list and the dashboard, which put a figure
+//! against one driver's trip. A fee mapping's `fee` is a rate for Petrol
+//! Arrows (EGP per 1,000 L), so it is withheld too — see [`fee_visible`].
 
-use std::fmt::Write as _;
+/// The permission at which aggregate revenue becomes visible.
+pub const FINANCIAL_PERMISSION: i32 = 3;
 
-/* ------------------------------------------------------------------------ */
-/* Rates                                                                     */
-/* ------------------------------------------------------------------------ */
-
-/// Volume-priced companies quote their fee per 1,000 litres, while
-/// `trips.tank_capacity` is in litres. This is that divisor, named so the
-/// magic 1000.0 stops appearing loose in the SQL.
-pub const LITRES_PER_FEE_UNIT: f64 = 1000.0;
-
-/// Egyptian VAT, applied to base revenue plus car rental.
-pub const VAT_RATE: f64 = 0.14;
-
-/// TAQA bills distance at a flat rate per kilometre.
-pub const TAQA_RATE_PER_KM: f64 = 50.5;
-
-/// Petromin bills distance at a flat rate per kilometre.
-pub const PETROMIN_RATE_PER_KM: f64 = 42.5;
-
-/// A TAQA car's full monthly rental, earned at [`TAQA_FULL_RENTAL_DAYS`] days.
-pub const TAQA_MONTHLY_RENTAL: f64 = 43_000.0;
-
-/// Days of work that earn a TAQA car its full monthly rental.
-pub const TAQA_FULL_RENTAL_DAYS: f64 = 28.0;
-
-/// Deducted per day short of [`TAQA_FULL_RENTAL_DAYS`].
+/// Whether a fee mapping's raw `fee` may be shown at this access level.
 ///
-/// This is `43000 / 28` — a clean pro-rata that reaches zero at zero days
-/// worked. FalconGo used a hand-entered 1433.0, which is not derived from
-/// anything and leaves a ~2,876 floor for a car that never moved; that was a
-/// bug and it under-billed the taper. The value is computed, not typed, so the
-/// two can never drift again.
-pub const TAQA_RENTAL_PER_DAY: f64 = TAQA_MONTHLY_RENTAL / TAQA_FULL_RENTAL_DAYS;
-
-/// Petromin rents by the car-day. Two trips by one car on one day are one day.
-pub const PETROMIN_RENTAL_PER_CAR_DAY: f64 = 2_000.0;
-
-/// Watanya prices by fee band, not by distance: the `fee_mappings.fee` column
-/// holds a band NUMBER (1..15), and each band has a rate per 1,000 litres.
-///
-/// Held as data so the SQL `CASE` is generated rather than hand-written — the
-/// previous hand-written copies were 15 lines each in three separate queries.
-/// A route mapped to a band outside this table earns nothing, which is
-/// deliberate: an unpriced band is a data-entry error, and inventing a rate for
-/// it would quietly bill the customer for a guess.
-pub const WATANYA_BAND_RATES: [(i32, f64); 15] = [
-    (1, 104.5),
-    (2, 122.1),
-    (3, 129.8),
-    (4, 156.2),
-    (5, 183.7),
-    (6, 196.9),
-    (7, 210.1),
-    (8, 235.4),
-    (9, 261.8),
-    (10, 288.2),
-    (11, 314.6),
-    (12, 341.0),
-    (13, 367.4),
-    (14, 393.8),
-    (15, 420.2),
-];
-
-/* ------------------------------------------------------------------------ */
-/* Companies                                                                 */
-/* ------------------------------------------------------------------------ */
-
-/// The four companies Apex hauls for. Each has its own revenue rule; there is
-/// no default, because a company nobody has priced must not silently earn zero.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Company {
-    PetrolArrows,
-    Watanya,
-    Taqa,
-    Petromin,
+/// For Petrol Arrows it is a price (EGP per 1,000 L), so it is financial data.
+/// For Watanya it is a band NUMBER (1..15) — a route category, already visible
+/// in the statistics' group names, and the key the statistics page uses to
+/// open a band's routes — so it stays. TAQA and Petromin have no fee.
+pub fn fee_visible(company: &str, financial: bool) -> bool {
+    financial || company == "Watanya"
 }
 
-impl Company {
-    /// Exact match on the `trips.company` value. Returns `None` for anything
-    /// unrecognised so callers must decide explicitly what to do about it.
-    pub fn from_name(name: &str) -> Option<Self> {
-        match name {
-            "Petrol Arrows" => Some(Self::PetrolArrows),
-            "Watanya" => Some(Self::Watanya),
-            "TAQA" => Some(Self::Taqa),
-            "Petromin" => Some(Self::Petromin),
-            _ => None,
-        }
-    }
-
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::PetrolArrows => "Petrol Arrows",
-            Self::Watanya => "Watanya",
-            Self::Taqa => "TAQA",
-            Self::Petromin => "Petromin",
-        }
-    }
-
-    /// Does this company rent its cars in addition to billing trips?
-    pub fn has_car_rental(self) -> bool {
-        matches!(self, Self::Taqa | Self::Petromin)
-    }
-
-    /// Does this company's invoice carry VAT?
-    ///
-    /// Petrol Arrows is the exception, and it is a real one rather than an
-    /// oversight — its statistics have never carried a VAT column.
-    pub fn has_vat(self) -> bool {
-        !matches!(self, Self::PetrolArrows)
-    }
-}
-
-/* ------------------------------------------------------------------------ */
-/* Base revenue — per row                                                    */
-/* ------------------------------------------------------------------------ */
-
-/// SQL for a single trip's own revenue, as a `float8` expression.
-///
-/// `trips` and `fees` are the aliases the caller gave the `trips` table and its
-/// `LEFT JOIN fee_mappings`. The join must be LEFT: an unmapped route yields
-/// NULL, and every expression here coalesces that to 0.0 rather than letting it
-/// poison a `SUM`.
-///
-/// Volume-priced companies divide by 1000 because `tank_capacity` is in litres
-/// while the rate is per 1,000 litres.
-pub fn base_revenue_sql(company: Company, trips: &str, fees: &str) -> String {
-    match company {
-        Company::PetrolArrows => format!(
-            "({trips}.tank_capacity * COALESCE({fees}.fee::float8, 0.0) / {LITRES_PER_FEE_UNIT:?})::float8"
-        ),
-        Company::Watanya => format!(
-            "({trips}.tank_capacity * {} / {LITRES_PER_FEE_UNIT:?})::float8",
-            watanya_band_rate_sql(&format!("{fees}.fee"))
-        ),
-        // Billed on the journey, not on the paperwork. A trip that drops at two
-        // points made ONE run to the furthest of them, so the receipt for that
-        // furthest drop carries the whole distance and its siblings carry none.
-        // Summing each container's mapped distance charged the same road twice.
-        Company::Taqa => format!(
-            "({} * {TAQA_RATE_PER_KM})::float8",
-            trip_distance_sql(trips, fees)
-        ),
-        Company::Petromin => format!(
-            "({} * {PETROMIN_RATE_PER_KM})::float8",
-            trip_distance_sql(trips, fees)
-        ),
-    }
-}
-
-/// A `CASE` mapping a Watanya fee band to its rate per 1,000 litres, generated
-/// from [`WATANYA_BAND_RATES`]. Unknown or unmapped bands fall to `0.0`.
-pub fn watanya_band_rate_sql(band_expr: &str) -> String {
-    let mut sql = format!("CASE COALESCE({band_expr}::int, 0)");
-    for (band, rate) in WATANYA_BAND_RATES {
-        // `write!` to a String cannot fail; the `_ =` documents that.
-        _ = write!(sql, " WHEN {band} THEN {rate:?}");
-    }
-    sql.push_str(" ELSE 0.0 END");
-    sql
-}
-
-/* ------------------------------------------------------------------------ */
-/* Car rental — per car, never per trip                                      */
-/* ------------------------------------------------------------------------ */
-
-/// TAQA's monthly rental for a car that worked `days_expr` days that month.
-///
-/// Full rental at 28 days or more, otherwise tapered by
-/// [`TAQA_RENTAL_PER_DAY`] for each day short, floored at zero. A car with no
-/// days earns nothing.
-pub fn taqa_monthly_rental_sql(days_expr: &str) -> String {
-    format!(
-        "CASE \
-           WHEN {days_expr} >= {TAQA_FULL_RENTAL_DAYS} THEN {TAQA_MONTHLY_RENTAL:?} \
-           WHEN {days_expr} > 0 THEN GREATEST(0.0, {TAQA_MONTHLY_RENTAL:?} - \
-             (({TAQA_FULL_RENTAL_DAYS} - {days_expr}) * {TAQA_RENTAL_PER_DAY:?})) \
-           ELSE 0.0 \
-         END::float8"
+/// The per-km rate in force for `company` on `date` (YYYY-MM-DD), from the
+/// pricing rules. `None` for a company priced by volume, or with no rule.
+pub async fn per_km_rate_on(
+    pool: &sqlx::PgPool,
+    company: &str,
+    date: &str,
+) -> anyhow::Result<Option<f64>> {
+    let rate: Option<Option<f64>> = sqlx::query_scalar(
+        "SELECT per_km_rate::float8 FROM pricing_rules \
+          WHERE company = $1 AND to_char(effective_from, 'YYYY-MM-DD') <= $2 \
+          ORDER BY effective_from DESC LIMIT 1",
     )
+    .bind(company)
+    .bind(date)
+    .fetch_optional(pool)
+    .await?;
+    Ok(rate.flatten())
 }
 
-/// Petromin's rental for `car_days_expr` distinct car-days.
-pub fn petromin_rental_sql(car_days_expr: &str) -> String {
-    format!("(COALESCE({car_days_expr}, 0) * {PETROMIN_RENTAL_PER_CAR_DAY:?})::float8")
-}
-
-/// VAT on a taxable base, as SQL.
-pub fn vat_sql(taxable_expr: &str) -> String {
-    format!("(({taxable_expr}) * {VAT_RATE:?})::float8")
-}
-
-/* ------------------------------------------------------------------------ */
-/* Distance                                                                  */
-/* ------------------------------------------------------------------------ */
-
-/// A logical trip's distance, attributed to exactly one of its rows.
-///
-/// One truck makes ONE journey however many containers it carries, so adding
-/// each container's mapped distance counts the same road several times. Every
-/// multi-container TAQA group in 2026 is two containers bound for the same
-/// place, and summing simply doubled it.
-///
-/// This yields the furthest drop's distance on the row that holds it and zero
-/// on that trip's other rows, so `SUM()` over any grouping counts each journey
-/// once. Attributing it to the furthest container also means a trip whose drops
-/// span two groups lands wholly in the group it travelled furthest for, rather
-/// than being counted by both.
-///
-/// `parent_trip_id` is 0 rather than NULL on some standalone rows, so a
-/// standalone trip keys on its own negated id — always negative, and therefore
-/// never colliding with a real parent id.
-pub fn trip_distance_sql(trips: &str, fees: &str) -> String {
-    format!(
-        "CASE WHEN ROW_NUMBER() OVER (              PARTITION BY COALESCE(NULLIF({trips}.parent_trip_id, 0), -{trips}.id)              ORDER BY COALESCE({fees}.distance, 0.0) DESC, {trips}.id            ) = 1          THEN COALESCE({fees}.distance, 0.0) ELSE 0.0 END::float8"
-    )
-}
-
-/* ------------------------------------------------------------------------ */
-/* Trip counting                                                             */
-/* ------------------------------------------------------------------------ */
-
-/// Counts LOGICAL trips over a set of rows: a multi-container trip is one trip
-/// however many receipts it carries, and a standalone trip is one trip.
-///
-/// `parent_trip_id` is 0 rather than NULL for some standalone rows — GORM wrote
-/// both over the years — so both spellings mean "not a container".
-pub fn logical_trip_count_sql(parent_col: &str) -> String {
-    format!(
-        "COALESCE(COUNT(DISTINCT {parent_col}) \
-           FILTER (WHERE {parent_col} IS NOT NULL AND {parent_col} != 0), 0) \
-         + COALESCE(COUNT(*) \
-           FILTER (WHERE {parent_col} IS NULL OR {parent_col} = 0), 0)"
-    )
-}
-
-/* ------------------------------------------------------------------------ */
-/* Allocation — spreading an aggregate across the rows that produced it       */
-/* ------------------------------------------------------------------------ */
-
-/// Rules for pushing car rental and VAT down onto individual trip rows, for the
-/// trips list.
-///
-/// This is an allocation, not a measurement, and the distinction matters:
-///
-/// * Petromin's 2,000 for a car-day is split equally among that car's rows that
-///   day, because the day is genuinely shared between them.
-/// * TAQA's tapered monthly rental is split equally among that car's rows that
-///   month, for the same reason at a coarser grain.
-/// * VAT is 14% of each row's own base plus its allocated rental. VAT is
-///   linear, so allocating the base and rental first and taxing after gives the
-///   same total as taxing the aggregate.
-///
-/// The rental is computed over **the caller's filtered window**, not over all
-/// time. That is what makes the list reconcile: summing the allocated column
-/// over a filtered list equals the statistics total for identical filters. The
-/// cost is that a given trip's allocated share moves when the date range moves
-/// — it is a share of a window, and the UI labels it as one.
-///
-/// Rows are weighted equally rather than by base revenue on purpose: a trip to
-/// an unmapped route earns no base revenue but still consumes the car for the
-/// day, and revenue-weighting would hand its rental to its neighbours.
+/// The per-row revenue chain every surface reads.
 pub mod allocation {
-    /// Window definition for TAQA: rental is per car per calendar month.
-    ///
-    /// Terminal is deliberately NOT part of this. A car is rented, not a
-    /// car-at-a-terminal, and a date it served two terminals on is one day of
-    /// work. The statistics queries used to group their working-day counts by
-    /// `(terminal, car, month)`, which credited such a day to each terminal and
-    /// billed the fleet a day it had not earned — live in production, where car
-    /// "ف ع ص 4381" ran Alex and Suez on 2025-06-05. Statistics now count the
-    /// day once and split the single rental between the terminals in proportion
-    /// to the days each saw, so per-terminal reporting still works and the two
-    /// still reconcile.
-    pub const TAQA_PARTITION: &str = "car_no_plate, DATE_TRUNC('month', date::date)";
+    use crate::db::trip_shape::trip_distance_sql;
 
-    /// Window definition for Petromin: rental is per car per day, for the same
-    /// reason TAQA's is per car per month.
-    pub const PETROMIN_PARTITION: &str = "car_no_plate, date";
-
-    /// Divides `total_expr` equally across every row in `partition`.
+    /// The CTE chain that hangs the stored revenue breakdown off every trip in
+    /// a window. It ends in a CTE named `revenue`, which yields `t.*` (every
+    /// trips column, including the stored `base_revenue` NUMERIC and
+    /// `pricing_error`) plus, as float8:
     ///
-    /// `COUNT(*)` over the same partition can never be zero for a row that is
-    /// in it, so this cannot divide by zero.
-    pub fn share_sql(total_expr: &str, partition: &str) -> String {
-        format!("(({total_expr}) / COUNT(*) OVER (PARTITION BY {partition}))::float8")
-    }
-
-    /// The CTE chain that hangs a full revenue breakdown off every trip in a
-    /// window: the trip's own base revenue, its allocated share of car rental,
-    /// VAT on both, and the total.
+    /// * `fee_distance`, `fee_value` — the fee mapping's distance and raw fee;
+    /// * `trip_distance` — the logical trip's distance on its furthest row;
+    /// * `revenue_base` — stored base revenue, 0 when unpriced;
+    /// * `allocated_rental`, `allocated_vat`, `allocated_total` — from the
+    ///   `trip_revenue` view.
     ///
-    /// `window_sql` is a boolean SQL predicate over `t` scoping the window. It
-    /// must be the caller's DATE and COMPANY filter and nothing else — never
-    /// their text search or receipt-status filter. That line matters: the
-    /// allocation divides a shared cost by how many rows share it, so folding a
-    /// search into the window would make a trip's revenue change depending on
-    /// what someone typed into a search box. Scoping the window exactly the way
-    /// statistics scopes its aggregate is also what makes the two reconcile —
-    /// see `sums_reconcile_with_statistics` in tests/revenue_parity.rs.
-    ///
-    /// The chain ends in a CTE named `revenue`, which the caller selects from.
-    /// It yields `t.*` plus `fee_distance`, `fee_value`, `base_revenue`,
-    /// `allocated_rental`, `allocated_vat` and `allocated_total`.
+    /// `window_sql` is a boolean predicate over `t` using only `t.company` and
+    /// `t.date`. It is applied to the view as well as to trips, because those
+    /// are the view's partition columns: Postgres pushes the predicate below
+    /// the view's window function instead of allocating the whole table. It
+    /// must not carry a search or status filter — not because it would change
+    /// the money (the allocation is the month's, whatever the window), but
+    /// because `trip_distance` attributes a trip's distance within the window.
     pub fn per_row_revenue_cte(window_sql: &str) -> String {
-        use super::*;
-
-        // Petrol Arrows and Watanya bill on volume; TAQA and Petromin on
-        // distance. A company with no rule earns nothing rather than guessing.
-        let base_case = format!(
-            "CASE t.company \
-               WHEN '{pa}' THEN {pa_sql} \
-               WHEN '{wa}' THEN {wa_sql} \
-               WHEN '{tq}' THEN {tq_sql} \
-               WHEN '{pm}' THEN {pm_sql} \
-               ELSE 0.0 END::float8",
-            pa = Company::PetrolArrows.as_str(),
-            wa = Company::Watanya.as_str(),
-            tq = Company::Taqa.as_str(),
-            pm = Company::Petromin.as_str(),
-            pa_sql = base_revenue_sql(Company::PetrolArrows, "t", "fm"),
-            wa_sql = base_revenue_sql(Company::Watanya, "t", "fm"),
-            tq_sql = base_revenue_sql(Company::Taqa, "t", "fm"),
-            pm_sql = base_revenue_sql(Company::Petromin, "t", "fm"),
-        );
-
-        // A car's rental is earned per month (TAQA) or per day (Petromin), so
-        // the share is that whole amount divided by however many rows sit in
-        // the same bucket. COUNT(*) OVER a partition containing the row is
-        // never zero, so this cannot divide by zero.
-        // A DAY of rental, then that day split between the trips that used it.
-        //
-        // Not the month split across the month's trips: that spread one busy
-        // day's dilution across every other trip the car made, so a trip on a
-        // day it had the truck to itself still carried less because of what
-        // happened a fortnight later. A day is shared only by the trips on it.
-        //
-        // The daily rate falls out as a constant for any month under 28 days:
-        // monthly is days * (43000/28), so monthly / days is 43000/28 exactly.
-        // That is why this figure does not move with the caller's date range,
-        // and the sum still comes back to the month's rental — d days at M/d.
-        let taqa_day_rate = format!(
-            "(COALESCE({}, 0.0) / NULLIF(COALESCE(tm.working_days, 0), 0))",
-            taqa_monthly_rental_sql("COALESCE(tm.working_days, 0)")
-        );
-        let taqa_share = share_sql(&taqa_day_rate, "s.company, s.car_no_plate, s.date");
-        let petromin_share = share_sql(
-            &format!("{PETROMIN_RENTAL_PER_CAR_DAY:?}"),
-            "s.company, s.car_no_plate, s.date",
-        );
-
-        // VAT is linear, so taxing each row's own allocated subtotal sums to
-        // the same figure as taxing the aggregate. Petrol Arrows is VAT-free.
-        let vat = vat_sql("a.base_revenue + a.allocated_rental");
-
         format!(
             r#"
-        scoped AS (
+        priced AS (
+            SELECT t.trip_id,
+                   t.base_revenue::float8     AS stored_base,
+                   t.allocated_rental::float8 AS allocated_rental,
+                   t.allocated_vat::float8    AS allocated_vat,
+                   t.allocated_total::float8  AS allocated_total
+              FROM trip_revenue t
+             WHERE {window_sql}
+        ),
+        revenue AS (
             SELECT
                 t.*,
                 COALESCE(fm.distance, 0.0)::float8 AS fee_distance,
                 {trip_distance} AS trip_distance,
                 COALESCE(fm.fee::float8, 0.0)      AS fee_value,
-                {base_case} AS base_revenue
+                COALESCE(p.stored_base, 0.0)::float8 AS revenue_base,
+                p.allocated_rental,
+                p.allocated_vat,
+                p.allocated_total
             FROM trips t
+            JOIN priced p ON p.trip_id = t.id
             LEFT JOIN fee_mappings fm
                 ON  fm.company        = t.company
                 AND fm.terminal       = t.terminal
                 AND fm.drop_off_point = t.drop_off_point
                 AND fm.deleted_at IS NULL
             WHERE t.deleted_at IS NULL AND ({window_sql})
-        ),
-        taqa_months AS (
-            SELECT
-                car_no_plate,
-                DATE_TRUNC('month', date::date) AS month,
-                COUNT(DISTINCT date)::float8    AS working_days
-            FROM scoped
-            WHERE company = '{taqa}'
-            GROUP BY car_no_plate, DATE_TRUNC('month', date::date)
-        ),
-        allocated AS (
-            SELECT
-                s.*,
-                CASE s.company
-                    WHEN '{taqa}'     THEN {taqa_share}
-                    WHEN '{petromin}' THEN {petromin_share}
-                    ELSE 0.0
-                END::float8 AS allocated_rental
-            FROM scoped s
-            LEFT JOIN taqa_months tm
-                ON  s.company       = '{taqa}'
-                AND tm.car_no_plate = s.car_no_plate
-                AND tm.month        = DATE_TRUNC('month', s.date::date)
-        ),
-        priced AS (
-            SELECT
-                a.*,
-                CASE WHEN a.company = '{petrol_arrows}' THEN 0.0
-                     ELSE {vat} END::float8 AS allocated_vat
-            FROM allocated a
-        ),
-        revenue AS (
-            SELECT
-                p.*,
-                (p.base_revenue + p.allocated_rental + p.allocated_vat)::float8
-                    AS allocated_total
-            FROM priced p
         )"#,
             trip_distance = trip_distance_sql("t", "fm"),
-            taqa = Company::Taqa.as_str(),
-            petromin = Company::Petromin.as_str(),
-            petrol_arrows = Company::PetrolArrows.as_str(),
         )
     }
 }
-
-/* ------------------------------------------------------------------------ */
-/* Tests                                                                     */
-/* ------------------------------------------------------------------------ */
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// The constant FalconGo got wrong. Pinned as an exact figure so a "tidy-up"
-    /// that rounds it to 1535.71 is caught: that rounding leaves a car that
-    /// never worked owing -0.12, which `GREATEST` hides, and a car that worked
-    /// one day over-credited by a few piastres.
     #[test]
-    fn taqa_taper_is_exact_pro_rata() {
-        assert_eq!(TAQA_RENTAL_PER_DAY, 43_000.0 / 28.0);
-        // A car that worked zero days owes exactly nothing.
-        let at_zero = TAQA_MONTHLY_RENTAL - (TAQA_FULL_RENTAL_DAYS * TAQA_RENTAL_PER_DAY);
-        assert!(at_zero.abs() < 1e-9, "taper must reach zero, got {at_zero}");
-    }
-
-    /// A full month must pay exactly the headline rental, not a rounded
-    /// approximation of it.
-    #[test]
-    fn full_month_pays_the_headline_rental() {
-        let days = 28.0_f64;
-        let rental = if days >= TAQA_FULL_RENTAL_DAYS {
-            TAQA_MONTHLY_RENTAL
-        } else {
-            TAQA_MONTHLY_RENTAL - ((TAQA_FULL_RENTAL_DAYS - days) * TAQA_RENTAL_PER_DAY)
-        };
-        assert_eq!(rental, 43_000.0);
-    }
-
-    #[test]
-    fn watanya_bands_are_contiguous_1_to_15() {
-        for (i, (band, rate)) in WATANYA_BAND_RATES.iter().enumerate() {
-            assert_eq!(*band, i as i32 + 1, "bands must be 1..15 in order");
-            assert!(*rate > 0.0, "band {band} has no rate");
+    fn the_chain_reads_the_view_and_computes_nothing() {
+        let sql = allocation::per_row_revenue_cte("t.date BETWEEN $1 AND $2");
+        assert!(sql.contains("FROM trip_revenue t"));
+        // No rate, band or taper survives anywhere in the read path.
+        for formula in ["50.5", "42.5", "104.5", "43000", "0.14", "/ 1000", "CASE t.company"] {
+            assert!(!sql.contains(formula), "a revenue formula crept back in: {formula}");
         }
-        // Rates rise with the band; a decrease would mean a longer haul paying
-        // less, which is always a typo.
-        for pair in WATANYA_BAND_RATES.windows(2) {
-            assert!(
-                pair[1].1 > pair[0].1,
-                "band {} pays less than band {}",
-                pair[1].0,
-                pair[0].0
-            );
-        }
-    }
-
-    /// The generated CASE must cover every band and still have an ELSE, so an
-    /// unmapped route yields 0.0 rather than NULL.
-    #[test]
-    fn generated_band_case_covers_every_band() {
-        let sql = watanya_band_rate_sql("fm.fee");
-        for (band, rate) in WATANYA_BAND_RATES {
-            assert!(
-                sql.contains(&format!("WHEN {band} THEN {rate:?}")),
-                "band {band} missing from generated SQL"
-            );
-        }
-        assert!(sql.contains("ELSE 0.0 END"));
-        assert!(sql.contains("COALESCE(fm.fee::int, 0)"));
-    }
-
-    /// Each company's base revenue must reference the columns it actually bills
-    /// on — volume for the fee-priced pair, distance for the per-km pair. A
-    /// swap here would be invisible in review and wrong in production.
-    #[test]
-    fn base_revenue_bills_on_the_right_column() {
-        let pa = base_revenue_sql(Company::PetrolArrows, "t", "fm");
-        assert!(pa.contains("t.tank_capacity") && pa.contains("fm.fee"));
-        assert!(!pa.contains("distance"));
-
-        let wa = base_revenue_sql(Company::Watanya, "t", "fm");
-        assert!(wa.contains("t.tank_capacity") && wa.contains("WHEN 15 THEN 420.2"));
-        assert!(!wa.contains("distance"));
-
-        let tq = base_revenue_sql(Company::Taqa, "t", "fm");
-        assert!(tq.contains("fm.distance") && tq.contains("50.5"));
-        assert!(!tq.contains("tank_capacity"));
-
-        let pm = base_revenue_sql(Company::Petromin, "t", "fm");
-        assert!(pm.contains("fm.distance") && pm.contains("42.5"));
-        assert!(!pm.contains("tank_capacity"));
+        // The window reaches the view as well as trips (pushdown).
+        assert_eq!(sql.matches("t.date BETWEEN $1 AND $2").count(), 2);
     }
 
     #[test]
-    fn company_names_round_trip() {
-        for c in [
-            Company::PetrolArrows,
-            Company::Watanya,
-            Company::Taqa,
-            Company::Petromin,
-        ] {
-            assert_eq!(Company::from_name(c.as_str()), Some(c));
-        }
-        assert_eq!(Company::from_name("Petrolarrows"), None);
-        assert_eq!(Company::from_name(""), None);
-    }
-
-    /// Only TAQA and Petromin rent cars; only Petrol Arrows is VAT-free. These
-    /// pair up in a way that is easy to conflate.
-    #[test]
-    fn rental_and_vat_apply_to_the_right_companies() {
-        assert!(Company::Taqa.has_car_rental() && Company::Petromin.has_car_rental());
-        assert!(!Company::PetrolArrows.has_car_rental() && !Company::Watanya.has_car_rental());
-
-        assert!(!Company::PetrolArrows.has_vat());
-        assert!(Company::Watanya.has_vat() && Company::Taqa.has_vat() && Company::Petromin.has_vat());
+    fn a_petrol_arrows_rate_is_money_but_a_watanya_band_is_not() {
+        assert!(!fee_visible("Petrol Arrows", false));
+        assert!(fee_visible("Petrol Arrows", true));
+        assert!(fee_visible("Watanya", false));
+        assert!(!fee_visible("TAQA", false));
     }
 }

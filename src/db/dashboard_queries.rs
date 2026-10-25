@@ -5,9 +5,9 @@
 //! the whole set runs concurrently on the pool so the endpoint costs roughly
 //! its slowest member (~11 ms on production data) rather than the sum.
 //!
-//! Money reuses [`crate::db::revenue`], which is what makes the dashboard agree
-//! with the statistics page by construction instead of drifting from it the way
-//! the old Go dashboard did.
+//! Money is the stored revenue FalconGo prices on write, read through the same
+//! per-row chain as the trips list and the statistics page
+//! ([`crate::db::revenue`]), so the three agree by construction.
 
 use anyhow::Result;
 use rust_decimal::Decimal;
@@ -413,9 +413,16 @@ pub async fn fleet(pool: &PgPool) -> Result<Vec<FleetCar>> {
 /* Exceptions                                                                */
 /* ------------------------------------------------------------------------ */
 
-/// Trips in the window that earn nothing: no fee mapping for their route, or a
-/// driver / drop-off still carrying the «غير مسجل» sentinel. They bill zero and
-/// say nothing, which is why they are a dashboard item and not just a filter.
+/// Trips in the window that earn nothing: FalconGo could not price them
+/// (`pricing_error` — no fee mapping for the route, a band with no rate, no
+/// rule for the company), they have not been priced at all yet (NULL
+/// `base_revenue`), or a driver / drop-off still carries the «غير مسجل»
+/// sentinel. They bill zero and say nothing, which is why they are a dashboard
+/// item and not just a filter.
+///
+/// A per-km container that rode along with its trip's furthest drop has a
+/// stored base of 0, not NULL, and is not counted: its trip earned, on the
+/// sibling that carried the distance.
 pub async fn trips_earning_zero(
     pool: &PgPool,
     from: &str,
@@ -426,12 +433,10 @@ pub async fn trips_earning_zero(
         r#"
         SELECT COUNT(*) AS n
         FROM trips t
-        LEFT JOIN fee_mappings fm
-            ON  fm.company = t.company AND fm.terminal = t.terminal
-            AND fm.drop_off_point = t.drop_off_point AND fm.deleted_at IS NULL
         WHERE t.deleted_at IS NULL AND t.date BETWEEN $1 AND $2
           AND ($3::text IS NULL OR t.company = $3)
-          AND (fm.id IS NULL OR t.driver_name = 'غير مسجل' OR t.drop_off_point = 'غير مسجل')
+          AND (t.pricing_error IS NOT NULL OR t.base_revenue IS NULL
+               OR t.driver_name = 'غير مسجل' OR t.drop_off_point = 'غير مسجل')
         "#,
     )
     .bind(from)

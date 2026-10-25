@@ -4,10 +4,10 @@
 //! — same filters, same ordering, same pagination envelope, same sibling
 //! backfill — with three deliberate differences:
 //!
-//! 1. **Revenue is on every row.** That is the point of the move: the formulas
-//!    live in [`crate::db::revenue`] and are now reachable from the list
-//!    without a second copy. See [`crate::db::revenue::allocation`] for what
-//!    "allocated" means and why the totals reconcile with statistics.
+//! 1. **Revenue is on every row.** It is the revenue FalconGo stored when the
+//!    trip was written, read through the same chain as statistics — see
+//!    [`crate::db::revenue`] for what "allocated" means and why the totals
+//!    reconcile.
 //! 2. **The fee mapping is joined, not looked up per row.** FalconGo issued one
 //!    `SELECT` per trip after fetching the page; a 200-row page cost 201 round
 //!    trips. Here it is one join inside the revenue CTE.
@@ -92,8 +92,9 @@ impl TripListFilters {
 /// Scopes the revenue window: date range and company only.
 ///
 /// Deliberately excludes search and receipt status — see the contract on
-/// [`per_row_revenue_cte`]. Folding those in would make a trip's allocated
-/// rental depend on what the user typed in a search box.
+/// [`per_row_revenue_cte`]. The money would not move (a row's rental share is
+/// its month's), but a trip's furthest-drop distance is attributed within the
+/// window, so a search must narrow the listed rows, not the window.
 fn window_predicate() -> String {
     use params::*;
     format!(
@@ -180,9 +181,12 @@ fn bind_filters<'q>(
 
 /// One page of trips, plus the total matching the filters.
 ///
-/// `financial` gates every money field. When false the revenue columns are not
-/// merely zeroed for display — they are left off the payload entirely, so a
-/// caller without permission never receives a figure to begin with.
+/// `permission` gates the money. Below [`MONEY_PERMISSION`] the revenue
+/// columns are not merely zeroed for display — they are left off the payload
+/// entirely, so a caller without permission never receives a figure to begin
+/// with. Below [`crate::db::revenue::FINANCIAL_PERMISSION`] the fee mapping's
+/// raw `fee` is withheld too where it is a price (see
+/// [`crate::db::revenue::fee_visible`]); it reads 0, keeping the shape.
 ///
 /// The returned vector can be LONGER than `limit`: if the page contains a
 /// container of a multi-container trip, every sibling container comes with it.
@@ -193,8 +197,12 @@ fn bind_filters<'q>(
 pub async fn list_trips(
     pool: &PgPool,
     filters: &TripListFilters,
-    financial: bool,
+    permission: i32,
 ) -> Result<(Vec<TripListRow>, i64)> {
+    let access = Access {
+        money: permission >= MONEY_PERMISSION,
+        rates: permission >= crate::db::revenue::FINANCIAL_PERMISSION,
+    };
     let search = filters.search_pattern();
     let cte = per_row_revenue_cte(&window_predicate());
     let rows_where = row_predicate();
@@ -222,15 +230,14 @@ pub async fn list_trips(
         .fetch_all(pool)
         .await?;
 
-    let mut trips: Vec<TripListRow> = page.iter().map(|r| map_trip(r, financial)).collect();
+    let mut trips: Vec<TripListRow> = page.iter().map(|r| map_trip(r, access)).collect();
 
     /* ---- sibling containers ---- */
     //
     // Any parent represented on this page brings ALL of its containers, even
-    // ones the page boundary cut off. The revenue CTE is rebuilt over the same
-    // window so the siblings' allocated shares match their page-mates exactly;
-    // computing them over a narrower window would give two containers of one
-    // trip two different shares of the same car-day.
+    // ones the page boundary cut off. The chain is rebuilt over the same
+    // window, so a sibling's furthest-drop distance is attributed exactly as
+    // its page-mates' were.
     let parent_ids: Vec<i64> = trips
         .iter()
         .filter_map(|t| t.parent_trip_id.filter(|id| *id > 0))
@@ -260,7 +267,7 @@ pub async fn list_trips(
             .await?;
 
         for row in &siblings {
-            let trip = map_trip(row, financial);
+            let trip = map_trip(row, access);
             if !seen.contains(&trip.id) {
                 trips.push(trip);
             }
@@ -288,11 +295,29 @@ pub async fn list_trips(
 /* Row mapping                                                               */
 /* ------------------------------------------------------------------------ */
 
-fn map_trip(row: &sqlx::postgres::PgRow, financial: bool) -> TripListRow {
+/// The per-trip money gate. The list itself is open at 1; a figure against
+/// one driver's one trip is a level-4 disclosure, stricter than statistics.
+pub const MONEY_PERMISSION: i32 = 4;
+
+#[derive(Debug, Clone, Copy)]
+struct Access {
+    /// Revenue and its allocations.
+    money: bool,
+    /// The fee mapping's raw fee, where it is a price.
+    rates: bool,
+}
+
+fn map_trip(row: &sqlx::postgres::PgRow, access: Access) -> TripListRow {
     // Financial columns are read only when the caller may see them, so an
     // unauthorised response has no field rather than a zero that would read as
     // "this trip earned nothing".
-    let money = |name: &str| financial.then(|| row.try_get::<f64, _>(name).unwrap_or(0.0));
+    let money = |name: &str| access.money.then(|| row.try_get::<f64, _>(name).unwrap_or(0.0));
+    let company = opt_str(row, "company");
+    let fee = if crate::db::revenue::fee_visible(&company, access.rates) {
+        row.try_get::<f64, _>("fee_value").unwrap_or(0.0)
+    } else {
+        0.0
+    };
 
     TripListRow {
         id: row.get::<i32, _>("id") as i64,
@@ -316,7 +341,7 @@ fn map_trip(row: &sqlx::postgres::PgRow, financial: bool) -> TripListRow {
             .flatten()
             .unwrap_or(0),
 
-        company: opt_str(row, "company"),
+        company,
         terminal: opt_str(row, "terminal"),
         drop_off_point: opt_str(row, "drop_off_point"),
         location_name: opt_str(row, "location_name"),
@@ -332,9 +357,9 @@ fn map_trip(row: &sqlx::postgres::PgRow, financial: bool) -> TripListRow {
         mileage: numeric_f64(row, "mileage"),
 
         distance: row.try_get::<f64, _>("fee_distance").unwrap_or(0.0),
-        fee: row.try_get::<f64, _>("fee_value").unwrap_or(0.0),
+        fee,
 
-        revenue: money("base_revenue"),
+        revenue: money("revenue_base"),
         allocated_rental: money("allocated_rental"),
         allocated_vat: money("allocated_vat"),
         allocated_total: money("allocated_total"),

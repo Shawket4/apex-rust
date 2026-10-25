@@ -1,5 +1,6 @@
 pub mod dashboard_queries;
 pub mod revenue;
+pub mod trip_shape;
 pub mod trip_queries;
 pub mod stats_queries;
 pub use stats_queries::*;

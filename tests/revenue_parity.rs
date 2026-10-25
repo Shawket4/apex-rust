@@ -1,28 +1,31 @@
 //! The parity lock for trip revenue.
 //!
-//! Every company's revenue formula is about to be lifted out of four
-//! hand-written statistics queries into one shared module, and then reused by a
-//! new trips-list endpoint. The whole point of that refactor is that the
-//! numbers do not move. This file is what makes that claim checkable: a
-//! deterministic fixture built to hit the awkward parts of each formula, and a
-//! golden snapshot of what the CURRENT code produces from it.
+//! Revenue used to be computed here, at read time, from rates in
+//! `db::revenue`. It is now priced once by FalconGo on write and stored
+//! (`trips.base_revenue`, `revenue_vat`, `truck_month_charges`, the
+//! `trip_revenue` view), and apex-rust only reads it. This file pins that
+//! the read path still produces, to the cent, the statistics the old formulas
+//! produced on the same fixture.
+//!
+//! How the test database gets its stored revenue matters, because it decides
+//! what is being tested. `support::store_fixture_pricing` writes the figures
+//! FalconGo's own parity test reports its engine storing for this fixture, as
+//! literals — no formula on this side. So a pass here means apex-rust's
+//! queries aggregate FalconGo's stored rows into the golden statistics, not
+//! that a second copy of a formula agrees with the first.
 //!
 //! The fixture is small but deliberately nasty:
 //!
 //!   * a TAQA car that works exactly 28 days (full rental) and one that works
-//!     10 (tapered), so the `43000 - (28-d) * 43000/28` branch is exercised on
-//!     both sides of its boundary;
-//!   * a TAQA car whose month straddles a boundary, because the rental is
-//!     computed PER MONTH and a range-wide count would silently differ;
+//!     10 (tapered);
+//!   * a TAQA car whose work straddles a month boundary, so two separately
+//!     stored truck-months fall in one range;
 //!   * a Petromin car with two trips on one day, because a car-day is shared —
 //!     charging it twice is the obvious bug and the one worth pinning;
-//!   * Watanya rows at fee bands 1, 2 and 15, plus an unmapped route that must
-//!     fall through the CASE to 0.0 rather than to NULL;
+//!   * Watanya rows at fee bands 1, 2 and 15, plus an unmapped route that is
+//!     stored unpriced (NULL, with a pricing_error) and must read as 0.0;
 //!   * a multi-container trip, so the "count a trip once, not once per
 //!     container" logic stays honest.
-//!
-//! If a change to the revenue module moves any number here, the diff shows
-//! exactly which company and which component moved.
 
 mod support;
 
@@ -89,8 +92,8 @@ fn render(company: &str, rows: &[TripStatisticsDetails]) -> String {
 /* The golden snapshot                                                       */
 /* ------------------------------------------------------------------------ */
 
-/// What the statistics endpoints produce from the fixture. Centralizing the
-/// formulas must not change a single figure below.
+/// What the statistics endpoints produce from the fixture. Reading the stored
+/// revenue instead of computing it must not change a single figure below.
 ///
 /// Distance is the furthest drop per logical trip, not the sum of a trip's
 /// drops: one truck makes one journey however many containers it carries. On
@@ -272,7 +275,7 @@ async fn per_row_revenue_sums_to_the_statistics_aggregate() {
         // this date range. Nothing else — see per_row_revenue_cte's contract.
         let sql = format!(
             "WITH {} SELECT \
-               COALESCE(SUM(base_revenue), 0.0)::float8     AS base, \
+               COALESCE(SUM(revenue_base), 0.0)::float8     AS base, \
                COALESCE(SUM(allocated_rental), 0.0)::float8 AS rental, \
                COALESCE(SUM(allocated_vat), 0.0)::float8    AS vat, \
                COALESCE(SUM(allocated_total), 0.0)::float8  AS total \
@@ -479,4 +482,72 @@ async fn every_statistics_query_executes() {
             .unwrap_or_else(|e| panic!("stats by date, filtered (financial={financial}): {e}"));
     }
 
+}
+
+/// A range that is not whole months gets each month's stored rental pro-rated
+/// by the share of the car's worked days inside it, and a whole month gets the
+/// stored figure exactly.
+///
+/// TQ-A worked 1–28 May (stored 43,000) and TQ-B 1–10 May (stored 15,357.14).
+/// Over 1–14 May, TQ-A has 14 of its 28 days in range and TQ-B all 10:
+/// 21,500 + 15,357.14. The trips list over the same range adds up to the same.
+#[tokio::test]
+async fn rental_over_part_of_a_month_is_its_worked_days_share() {
+    use apex::db::trip_queries::{list_trips, TripListFilters, MAX_LIMIT};
+
+    let pool = support::fresh_db("apex_revenue_partial_month").await;
+    seed(&pool).await;
+
+    let rental = |rows: &[TripStatisticsDetails]| -> f64 { rows.iter().filter_map(|d| d.car_rental).sum() };
+
+    let half = stats_queries::get_taqa_stats(&pool, "2025-05-01", "2025-05-14", true).await.unwrap();
+    let expected = 43_000.0 * 14.0 / 28.0 + 15_357.142857;
+    assert!((rental(&half) - expected).abs() < 0.01, "1–14 May rental {} != {expected}", rental(&half));
+
+    let may = stats_queries::get_taqa_stats(&pool, "2025-05-01", "2025-05-31", true).await.unwrap();
+    assert!((rental(&may) - (43_000.0 + 15_357.142857)).abs() < 0.01, "May is not its stored rental");
+
+    // June's three days are TQ-A's whole June: the stored 4,607.14.
+    let june = stats_queries::get_taqa_stats(&pool, "2025-06-01", "2025-06-30", true).await.unwrap();
+    assert!((rental(&june) - 4_607.142857).abs() < 0.01);
+
+    let filters = TripListFilters {
+        page: 1,
+        limit: MAX_LIMIT,
+        company: Some("TAQA".into()),
+        from: Some("2025-05-01".into()),
+        to: Some("2025-05-14".into()),
+        ..Default::default()
+    }
+    .normalized();
+    let (rows, _) = list_trips(&pool, &filters, 4).await.unwrap();
+    let listed: f64 = rows.iter().filter_map(|r| r.allocated_rental).sum();
+    assert!((listed - rental(&half)).abs() < 0.01, "list {listed} != statistics {}", rental(&half));
+    let listed_vat: f64 = rows.iter().filter_map(|r| r.allocated_vat).sum();
+    let stat_vat: f64 = half.iter().filter_map(|d| d.vat).sum();
+    assert!((listed_vat - stat_vat).abs() < 0.01, "list VAT {listed_vat} != statistics {stat_vat}");
+}
+
+/// Statistics withhold every price below permission 3: the revenue columns
+/// (already pinned above) and Petrol Arrows' fee, which is a rate per 1,000 L.
+/// Watanya's fee is a band number the page groups on, and stays.
+#[tokio::test]
+async fn prices_are_withheld_below_3() {
+    use apex::db::stats_queries::get_route_details;
+
+    let pool = support::fresh_db("apex_revenue_fee_gate").await;
+    seed(&pool).await;
+
+    let pa = stats_queries::get_petrol_arrows_stats(&pool, FROM, TO, false).await.unwrap();
+    assert!(pa.iter().all(|g| g.fee.is_none()), "a Petrol Arrows rate leaked");
+    let wa = stats_queries::get_watanya_stats(&pool, FROM, TO, false).await.unwrap();
+    assert!(wa.iter().any(|g| g.fee == Some(15.0)), "the Watanya band is gone");
+
+    for company in ["Petrol Arrows", "TAQA", "Petromin"] {
+        let routes = get_route_details(&pool, company, FROM, TO, false).await.unwrap();
+        assert!(routes.iter().all(|r| r.fee.is_none()), "{company}: a rate leaked");
+    }
+    // At 3 the per-km rate in force at the end of the range is shown.
+    let taqa = get_route_details(&pool, "TAQA", FROM, TO, true).await.unwrap();
+    assert_eq!(taqa[0].fee, Some(50.5));
 }

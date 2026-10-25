@@ -16,6 +16,12 @@ use super::actions::{f, int, req, Kind, Planned, Record, Source, Ty, BASE};
 use super::upstream::Target;
 
 const GAS: Ty = Ty::Str;
+
+/// One band of a band_per_1000l pricing rule, as FalconGo's RuleInput reads it.
+const BAND_FIELDS: &[super::actions::Field] = &[
+    req("band", Ty::Int, "the band number, 1, 2, …"),
+    req("rate_per_1000l", Ty::Num, "EGP per 1,000 L"),
+];
 const SLACK_STATUS: Ty = Ty::Str;
 
 const FUEL_FIELDS: &[(&str, &str)] = &[
@@ -48,7 +54,7 @@ pub const KINDS: &[Kind] = &[
     // ── Trips ────────────────────────────────────────────────────────────
     Kind {
         name: "update_trip",
-        what: "Edit one trip container: drop-off point (re-priced from fee mappings), receipt number, company, terminal, date, capacity, revenue or mileage. Only the fields sent change.",
+        what: "Edit one trip container: drop-off point, receipt number, company, terminal, date, capacity or mileage. Only the fields sent change. FalconGo re-prices the trip itself from its pricing rules; revenue cannot be set by hand — to correct one, fix its inputs or its pricing rule (create_pricing_rule, reprice_trips).",
         method: "PUT",
         path: "/trips/{id}",
         source: Source::Falcon("trips"),
@@ -61,7 +67,6 @@ pub const KINDS: &[Kind] = &[
             f("date", Ty::Date, ""),
             f("tank_capacity", Ty::Int, "not on compartment trips"),
             f("gas_type", GAS, "not on compartment trips"),
-            f("revenue", Ty::Num, "> 0"),
             f("mileage", Ty::Num, "> 0"),
             f("car_id", Ty::Int, "send with car_no_plate"),
             f("car_no_plate", Ty::Str, ""),
@@ -524,7 +529,7 @@ pub const KINDS: &[Kind] = &[
     // ── Pricing ──────────────────────────────────────────────────────────
     Kind {
         name: "create_fee_mapping",
-        what: "Add a route price: what a company pays per trip from a terminal to a drop-off point, and its distance.",
+        what: "Add a route: a company's terminal → drop-off point, with its distance and fee. The fee means: Petrol Arrows EGP per 1,000 L; Watanya the band number (its rate is in the pricing rule); TAQA/Petromin unused (0). Trips on the route are priced from it by the pricing rules.",
         method: "POST",
         path: "/mappings",
         fields: &[
@@ -532,13 +537,13 @@ pub const KINDS: &[Kind] = &[
             req("terminal", Ty::Str, ""),
             req("drop_off_point", Ty::Str, ""),
             req("distance", Ty::Num, "km"),
-            req("fee", Ty::Num, "per trip"),
+            req("fee", Ty::Num, "Petrol Arrows: EGP per 1,000 L; Watanya: band number; TAQA/Petromin: 0"),
         ],
         ..BASE
     },
     Kind {
         name: "update_fee_mapping",
-        what: "Change a route's price or distance (future trips; existing trips keep their price).",
+        what: "Change a route's fee or distance. Trips written after it are priced with it; trips already priced keep their stored revenue until reprice_trips is approved over their dates.",
         method: "PUT",
         path: "/mappings/{id}",
         source: Source::Falcon("fee_mappings"),
@@ -558,6 +563,46 @@ pub const KINDS: &[Kind] = &[
         method: "DELETE",
         path: "/mappings/{id}",
         source: Source::Falcon("fee_mappings"),
+        ..BASE
+    },
+    Kind {
+        name: "create_pricing_rule",
+        what: "Add a new effective-dated pricing version for a company: how its trips are priced, its VAT and its car rental. Versions are append-only; trips are priced by the newest version effective on their date as they are written. Trips already priced keep their figures until reprice_trips is approved over their dates — so a version dated in the past needs a reprice to take effect. Rental is per calendar month: date a rental change to a month's first day.",
+        method: "POST",
+        path: "/pricing/rules",
+        fields: &[
+            req("company", Ty::Str, "Petrol Arrows, Watanya, TAQA or Petromin"),
+            req("effective_from", Ty::Date, "the first trip date it prices; one version per company per date"),
+            req(
+                "method",
+                Ty::Enum(&["per_1000l_fee", "band_per_1000l", "per_km"]),
+                "per_1000l_fee: tank litres × the route's fee / 1000 (Petrol Arrows); band_per_1000l: tank litres × the band's rate / 1000, the band being the route's fee (Watanya); per_km: per_km_rate × the trip's furthest drop km (TAQA, Petromin)",
+            ),
+            f("per_km_rate", Ty::Num, "per_km only: EGP per km"),
+            req("vat_rate", Ty::Num, "a fraction: 0.14 for 14%, 0 for none"),
+            f("rental_mode", Ty::Enum(&["none", "monthly_taper", "per_car_day"]), "default none"),
+            f("rental_amount", Ty::Num, "monthly_taper: EGP per car-month; per_car_day: EGP per car-day"),
+            f("rental_full_days", Ty::Int, "monthly_taper only: days worked in a month that earn the full rental"),
+            f("notes", Ty::Str, "why the price changed"),
+            f(
+                "bands",
+                Ty::List(BAND_FIELDS),
+                "band_per_1000l only, and required for it: the WHOLE band table of the new version — every band, not just the ones that change (a band left out has no rate and its trips go unpriced). Copy the rest from pricing_rules.",
+            ),
+        ],
+        ..BASE
+    },
+    Kind {
+        name: "reprice_trips",
+        what: "Re-price every trip dated from..to (optionally one company) under the pricing version in force on its date, and recompute those months' truck rental. Use it after a create_pricing_rule dated in the past, or after correcting fee mappings. FalconGo refuses (409) a range that touches a frozen, closed month unless include_frozen is true.",
+        method: "POST",
+        path: "/pricing/reprice",
+        fields: &[
+            req("from", Ty::Date, ""),
+            req("to", Ty::Date, ""),
+            f("company", Ty::Str, "only this company; all when left out"),
+            f("include_frozen", Ty::Bool, "re-open closed months, re-price them and freeze them again"),
+        ],
         ..BASE
     },
     // ── Speed violations ─────────────────────────────────────────────────
@@ -588,7 +633,7 @@ pub const KINDS: &[Kind] = &[
 
 /// Kinds with a nested body the catalog cannot express.
 pub const SPECIAL: &[(&str, &str)] = &[
-    ("create_trip", "Record a trip: one truck, one driver, a company and terminal, and 1–4 containers each with a drop-off point and receipt number. Revenue and distance come from the fee mappings."),
+    ("create_trip", "Record a trip: one truck, one driver, a company and terminal, and 1–4 containers each with a drop-off point and receipt number. FalconGo prices it on write from the pricing rules and the routes' fee mappings."),
     ("update_parent_trip", "Change a whole trip's truck, driver, company, terminal or date; every container follows."),
 ];
 
@@ -805,6 +850,58 @@ mod tests {
         merge_into(&mut p.body, &p.meta, &json!({ "name": "Ali", "social_security_no": "2990101" }));
         assert_eq!(p.body["social_security_number"], "2990101");
         assert_eq!(p.body["ID"], 5);
+    }
+
+    #[test]
+    fn a_pricing_rule_carries_its_band_table_as_a_list() {
+        let p = plan(
+            "create_pricing_rule",
+            &json!({ "company": "Watanya", "effective_from": "2026-11-01", "method": "band_per_1000l",
+                     "vat_rate": "0.14", "notes": "band 5 up",
+                     "bands": [{ "band": 1, "rate_per_1000l": 104.5 }, { "band": "5", "rate_per_1000l": "190" }] }),
+        )
+        .unwrap();
+        assert_eq!((p.method, p.path.as_str()), ("POST", "/pricing/rules"));
+        assert_eq!(p.record, Record::None);
+        assert_eq!(p.body["vat_rate"], 0.14);
+        assert_eq!(p.body["bands"], json!([{ "band": 1, "rate_per_1000l": 104.5 }, { "band": 5, "rate_per_1000l": 190.0 }]));
+
+        let missing_rate = plan(
+            "create_pricing_rule",
+            &json!({ "company": "Watanya", "effective_from": "2026-11-01", "method": "band_per_1000l",
+                     "vat_rate": 0.14, "bands": [{ "band": 5 }] }),
+        );
+        assert!(missing_rate.unwrap_err().contains("bands`[0].rate_per_1000l is required"));
+        let stray = plan(
+            "create_pricing_rule",
+            &json!({ "company": "Watanya", "effective_from": "2026-11-01", "method": "band_per_1000l",
+                     "vat_rate": 0.14, "bands": [{ "band": 5, "rate_per_1000l": 190, "fee": 3 }] }),
+        );
+        assert!(stray.unwrap_err().contains("does not take `fee`"));
+        let bad_method = plan(
+            "create_pricing_rule",
+            &json!({ "company": "TAQA", "effective_from": "2026-11-01", "method": "per_trip", "vat_rate": 0.14 }),
+        );
+        assert!(bad_method.is_err());
+    }
+
+    #[test]
+    fn a_reprice_is_a_range_and_never_a_revenue_edit() {
+        let p = plan("reprice_trips", &json!({ "from": "2026-10-01", "to": "2026-10-31", "company": "TAQA" })).unwrap();
+        assert_eq!(p.path, "/pricing/reprice");
+        assert_eq!(p.body, json!({ "from": "2026-10-01", "to": "2026-10-31", "company": "TAQA" }));
+        assert!(plan("reprice_trips", &json!({ "from": "2026-10-01" })).is_err());
+        // Revenue is FalconGo's to compute; a trip edit cannot carry it.
+        let e = plan("update_trip", &json!({ "id": 3, "revenue": 5000 })).unwrap_err();
+        assert!(e.contains("does not take `revenue`"), "{e}");
+    }
+
+    #[test]
+    fn describe_lists_a_bands_fields() {
+        let d = crate::advisor::actions::describe(&["create_pricing_rule".to_string()]);
+        let bands = &d["create_pricing_rule"]["params"]["properties"]["bands"];
+        assert_eq!(bands["type"], "array");
+        assert_eq!(bands["items"]["required"], json!(["band", "rate_per_1000l"]));
     }
 
     #[test]

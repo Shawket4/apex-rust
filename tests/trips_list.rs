@@ -12,6 +12,11 @@ use support::seed_trip_fixture;
 const FROM: &str = "2025-05-01";
 const TO: &str = "2025-06-30";
 
+/// The seed TAQA rule's taper (43000 per car-month at 28 days, 43000/28 per
+/// day short). Used only to state the figures FalconGo stores; apex-rust has
+/// no copy of the rule.
+const TAQA_RENTAL_PER_DAY: f64 = 43_000.0 / 28.0;
+
 /// Filters over the whole fixture window, one page big enough to hold it.
 fn all() -> TripListFilters {
     TripListFilters {
@@ -40,12 +45,12 @@ fn find<'a>(rows: &'a [TripListRow], receipt_no: &str) -> &'a TripListRow {
 /* Revenue                                                                   */
 /* ------------------------------------------------------------------------ */
 
-/// The reason the endpoint exists: a trip carries the revenue its own company's
-/// formula produces, computed by the same module statistics uses.
+/// The reason the endpoint exists: a trip carries the revenue FalconGo stored
+/// for it, read through the same chain statistics sums.
 #[tokio::test]
-async fn rows_carry_revenue_from_their_company_formula() {
+async fn rows_carry_the_revenue_falcongo_stored() {
     let pool = db("apex_trips_revenue").await;
-    let (rows, _) = list_trips(&pool, &all(), true).await.unwrap();
+    let (rows, _) = list_trips(&pool, &all(), 4).await.unwrap();
 
     // Petrol Arrows: volume * fee / 1000 = 40000 * 30.5 / 1000.
     let pa = find(&rows, "PA1");
@@ -68,13 +73,54 @@ async fn rows_carry_revenue_from_their_company_formula() {
     assert_eq!(unmapped.distance, 0.0);
 }
 
+/// The list reads the stored figure, not the route's current price. Changing a
+/// fee mapping or adding a new rule version moves nothing until FalconGo
+/// re-prices — which is the point of storing revenue at all: a trip keeps the
+/// price it was billed at.
+#[tokio::test]
+async fn a_price_change_does_not_rewrite_history() {
+    use apex::db::stats_queries::get_petrol_arrows_stats;
+
+    let pool = db("apex_trips_stored_not_live").await;
+    sqlx::raw_sql(
+        "UPDATE fee_mappings SET fee = 999 WHERE drop_off_point = 'PA-Near';
+         INSERT INTO pricing_rules (company, effective_from, method, vat_rate)
+         VALUES ('Petrol Arrows', '2025-05-01', 'per_1000l_fee', 0.14);",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let (rows, _) = list_trips(&pool, &all(), 4).await.unwrap();
+    assert_eq!(find(&rows, "PA1").revenue, Some(1220.0));
+    assert_eq!(find(&rows, "PA1").allocated_vat, Some(0.0));
+    let near = get_petrol_arrows_stats(&pool, FROM, TO, true).await.unwrap();
+    let near = near.iter().find(|g| g.group_name == "PA-Near").unwrap();
+    assert!((near.total_revenue - 2318.0).abs() < 0.001, "{}", near.total_revenue);
+}
+
+/// Petrol Arrows' fee is its price per 1,000 L, so it is money: withheld below
+/// permission 3, where it used to reach every level. Watanya's is a band
+/// number — a route category — and stays.
+#[tokio::test]
+async fn a_price_shaped_fee_is_withheld_below_3() {
+    let pool = db("apex_trips_fee_gate").await;
+    for (permission, pa_fee) in [(1, 0.0), (2, 0.0), (3, 30.5), (4, 30.5)] {
+        let (rows, _) = list_trips(&pool, &all(), permission).await.unwrap();
+        assert_eq!(find(&rows, "PA1").fee, pa_fee, "permission {permission}");
+        assert_eq!(find(&rows, "WA2").fee, 2.0, "permission {permission}");
+        // Per-trip money stays a level-4 disclosure.
+        assert_eq!(find(&rows, "PA1").revenue.is_some(), permission >= 4);
+    }
+}
+
 /// A Petromin car that ran twice in one day earns ONE car-day between the two
 /// trips, so each carries half of it. Charging each row the full 2,000 is the
 /// obvious way to get this wrong.
 #[tokio::test]
 async fn a_shared_car_day_is_split_not_duplicated() {
     let pool = db("apex_trips_carday").await;
-    let (rows, _) = list_trips(&pool, &all(), true).await.unwrap();
+    let (rows, _) = list_trips(&pool, &all(), 4).await.unwrap();
 
     // PM1 and PM2: same car, same day. 2000 / 2 rows.
     assert_eq!(find(&rows, "PM1").allocated_rental, Some(1000.0));
@@ -91,7 +137,7 @@ async fn a_shared_car_day_is_split_not_duplicated() {
 #[tokio::test]
 async fn revenue_is_absent_not_zero_without_permission() {
     let pool = db("apex_trips_noperm").await;
-    let (rows, _) = list_trips(&pool, &all(), false).await.unwrap();
+    let (rows, _) = list_trips(&pool, &all(), 1).await.unwrap();
 
     assert!(!rows.is_empty());
     for row in &rows {
@@ -114,14 +160,14 @@ async fn revenue_is_absent_not_zero_without_permission() {
 async fn searching_does_not_change_what_a_trip_earned() {
     let pool = db("apex_trips_search_stable").await;
 
-    let (all_rows, _) = list_trips(&pool, &all(), true).await.unwrap();
+    let (all_rows, _) = list_trips(&pool, &all(), 4).await.unwrap();
     let baseline = find(&all_rows, "PM1").allocated_rental;
 
     let narrowed = TripListFilters {
         search: Some("PM1".into()),
         ..all()
     };
-    let (found, total) = list_trips(&pool, &narrowed, true).await.unwrap();
+    let (found, total) = list_trips(&pool, &narrowed, 4).await.unwrap();
 
     assert_eq!(total, 1, "search should match exactly one row");
     assert_eq!(
@@ -151,7 +197,7 @@ async fn a_page_brings_every_sibling_container() {
             ..all()
         }
         .normalized();
-        let (rows, _) = list_trips(&pool, &filters, true).await.unwrap();
+        let (rows, _) = list_trips(&pool, &filters, 4).await.unwrap();
         if rows.iter().any(|r| r.parent_trip_id == Some(9001)) {
             let containers: Vec<_> = rows
                 .iter()
@@ -190,7 +236,7 @@ async fn containers_carry_their_parent_and_its_receipts() {
     .await
     .unwrap();
 
-    let (rows, _) = list_trips(&pool, &all(), true).await.unwrap();
+    let (rows, _) = list_trips(&pool, &all(), 4).await.unwrap();
     let container = find(&rows, "WAC1");
 
     let parent = container.parent_trip.as_ref().expect("parent header missing");
@@ -247,18 +293,18 @@ async fn receipt_status_follows_the_latest_step() {
         ..all()
     };
 
-    let (office, _) = list_trips(&pool, &status("in_office"), true).await.unwrap();
+    let (office, _) = list_trips(&pool, &status("in_office"), 4).await.unwrap();
     assert_eq!(office.len(), 1);
     assert_eq!(office[0].receipt_no, "PA1");
     // Both steps come back on the row, in order.
     assert_eq!(office[0].receipt_steps.len(), 2);
     assert_eq!(office[0].receipt_steps[0].location, "Garage");
 
-    let (garage, _) = list_trips(&pool, &status("in_garage"), true).await.unwrap();
+    let (garage, _) = list_trips(&pool, &status("in_garage"), 4).await.unwrap();
     assert_eq!(garage.len(), 1, "a receipt that moved on is still 'in garage'");
     assert_eq!(garage[0].receipt_no, "PA2");
 
-    let (pending, _) = list_trips(&pool, &status("pending"), true).await.unwrap();
+    let (pending, _) = list_trips(&pool, &status("pending"), 4).await.unwrap();
     assert!(pending.iter().all(|r| r.receipt_steps.is_empty()));
     assert!(pending.iter().any(|r| r.receipt_no == "PA3"));
 }
@@ -281,15 +327,15 @@ async fn missing_data_filter_finds_unregistered_rows() {
         ..all()
     };
 
-    let (driver, _) = list_trips(&pool, &missing("driver"), true).await.unwrap();
+    let (driver, _) = list_trips(&pool, &missing("driver"), 4).await.unwrap();
     assert_eq!(driver.len(), 1);
     assert_eq!(driver[0].receipt_no, "PA1");
 
-    let (route, _) = list_trips(&pool, &missing("route"), true).await.unwrap();
+    let (route, _) = list_trips(&pool, &missing("route"), 4).await.unwrap();
     assert_eq!(route.len(), 1);
     assert_eq!(route[0].receipt_no, "PA2");
 
-    let (any, total) = list_trips(&pool, &missing("any"), true).await.unwrap();
+    let (any, total) = list_trips(&pool, &missing("any"), 4).await.unwrap();
     assert_eq!(total, 2);
     assert_eq!(any.len(), 2);
 }
@@ -304,7 +350,7 @@ async fn missing_data_filter_finds_unregistered_rows() {
 async fn paging_covers_every_row_exactly_once() {
     let pool = db("apex_trips_paging").await;
 
-    let (_, total) = list_trips(&pool, &all(), true).await.unwrap();
+    let (_, total) = list_trips(&pool, &all(), 4).await.unwrap();
     assert!(total > 10, "fixture should span several pages");
 
     let mut seen: Vec<i64> = Vec::new();
@@ -315,7 +361,7 @@ async fn paging_covers_every_row_exactly_once() {
             ..all()
         }
         .normalized();
-        let (rows, page_total) = list_trips(&pool, &filters, true).await.unwrap();
+        let (rows, page_total) = list_trips(&pool, &filters, 4).await.unwrap();
         assert_eq!(page_total, total, "total drifted between pages");
         seen.extend(rows.iter().map(|r| r.id));
     }
@@ -368,7 +414,6 @@ async fn page_size_is_capped() {
 /// one rental, and the trips list agrees with all of it.
 #[tokio::test]
 async fn a_car_at_two_terminals_in_one_day_is_rented_for_one_day() {
-    use apex::db::revenue::TAQA_RENTAL_PER_DAY;
     use apex::db::stats_queries::get_taqa_stats;
 
     let pool = support::fresh_db("apex_trips_two_terminals").await;
@@ -389,6 +434,22 @@ async fn a_car_at_two_terminals_in_one_day_is_rented_for_one_day() {
     .execute(&pool)
     .await
     .unwrap();
+
+    // What FalconGo's engine stores for this month: 100 km x 50.5 on every
+    // row (each is its own trip), and ONE tapered rental for the car's ten
+    // distinct dates, split between the terminals by the days each saw
+    // (Alex 10, Suez 1, of 11 terminal-days).
+    let one_rental = 43_000.0 - (28.0 - 10.0) * TAQA_RENTAL_PER_DAY;
+    let mut priced: Vec<(String, Option<f64>, f64, Option<f64>)> =
+        (0..10).map(|n| (format!("A{n}"), Some(5050.0), 707.0, Some(100.0))).collect();
+    priced.push(("S1".into(), Some(5050.0), 707.0, Some(100.0)));
+    let priced: Vec<_> = priced.iter().map(|(r, b, v, k)| (r.as_str(), *b, *v, *k)).collect();
+    support::store_priced(&pool, &priced).await;
+    for (terminal, days) in [("Alex", 10), ("Suez", 1)] {
+        let share = one_rental * days as f64 / 11.0;
+        support::store_truck_month(&pool, "SPLIT-1", "TAQA", terminal, "2025-05-01", days, 10,
+            10.0 * days as f64 / 11.0, share, share * 0.14).await;
+    }
 
     let stats = get_taqa_stats(&pool, "2025-05-01", "2025-05-31", true)
         .await
@@ -434,7 +495,7 @@ async fn a_car_at_two_terminals_in_one_day_is_rented_for_one_day() {
         ..Default::default()
     }
     .normalized();
-    let (rows, _) = list_trips(&pool, &filters, true).await.unwrap();
+    let (rows, _) = list_trips(&pool, &filters, 4).await.unwrap();
     let list_rental: f64 = rows.iter().filter_map(|r| r.allocated_rental).sum();
     assert!(
         (list_rental - stats_rental).abs() < 0.01,
@@ -688,7 +749,6 @@ async fn the_route_resolves_alongside_the_banksms_scopes() {
 /// trip's share does not move when the caller changes the date range.
 #[tokio::test]
 async fn a_days_rental_is_split_only_between_that_days_trips() {
-    use apex::db::revenue::TAQA_RENTAL_PER_DAY;
     use apex::db::stats_queries::get_taqa_stats;
 
     let pool = support::fresh_db("apex_taqa_day_share").await;
@@ -710,6 +770,17 @@ async fn a_days_rental_is_split_only_between_that_days_trips() {
     .await
     .unwrap();
 
+    // Stored by FalconGo: every row its own 100 km trip, and the car's one
+    // tapered rental for ten distinct dates.
+    let mut priced: Vec<(String, Option<f64>, f64, Option<f64>)> =
+        (0..10).map(|n| (format!("D{n}"), Some(5050.0), 707.0, Some(100.0))).collect();
+    priced.push(("D9b".into(), Some(5050.0), 707.0, Some(100.0)));
+    let priced: Vec<_> = priced.iter().map(|(r, b, v, k)| (r.as_str(), *b, *v, *k)).collect();
+    support::store_priced(&pool, &priced).await;
+    let rental = 43_000.0 - (28.0 - 10.0) * TAQA_RENTAL_PER_DAY;
+    support::store_truck_month(&pool, "DAY-1", "TAQA", "Suez", "2025-05-01", 10, 10, 10.0,
+        rental, rental * 0.14).await;
+
     let filters = TripListFilters {
         page: 1,
         limit: MAX_LIMIT,
@@ -719,7 +790,7 @@ async fn a_days_rental_is_split_only_between_that_days_trips() {
         ..Default::default()
     }
     .normalized();
-    let (rows, _) = list_trips(&pool, &filters, true).await.unwrap();
+    let (rows, _) = list_trips(&pool, &filters, 4).await.unwrap();
     assert_eq!(rows.len(), 11, "expected ten days, one of them doubled");
 
     let share = |receipt: &str| {
@@ -823,7 +894,7 @@ async fn a_trips_distance_is_its_furthest_drop() {
         ..Default::default()
     }
     .normalized();
-    let (rows, _) = list_trips(&pool, &filters, true).await.unwrap();
+    let (rows, _) = list_trips(&pool, &filters, 4).await.unwrap();
     let m2 = rows.iter().find(|r| r.receipt_no == "M2").unwrap();
     assert_eq!(m2.distance, 300.0, "the furthest container keeps its distance");
 }
@@ -836,8 +907,8 @@ async fn a_trips_distance_is_its_furthest_drop() {
 /// twice — worth about 53,000 EGP across 2026 before this changed.
 #[tokio::test]
 async fn taqa_bills_the_furthest_receipt_only() {
-    use apex::db::revenue::TAQA_RATE_PER_KM;
     use apex::db::stats_queries::get_taqa_stats;
+    const TAQA_RATE_PER_KM: f64 = 50.5;
 
     let pool = support::fresh_db("apex_taqa_furthest_billing").await;
     sqlx::raw_sql(
@@ -853,6 +924,13 @@ async fn taqa_bills_the_furthest_receipt_only() {
     .execute(&pool)
     .await
     .unwrap();
+
+    // FalconGo prices the logical trip once, on its furthest drop: FAR
+    // carries 374 km x 50.5 and priced_km 374; NEAR is stored at 0, not NULL.
+    support::store_priced(&pool, &[
+        ("FAR", Some(374.0 * TAQA_RATE_PER_KM), 374.0 * TAQA_RATE_PER_KM * 0.14, Some(374.0)),
+        ("NEAR", Some(0.0), 0.0, Some(0.0)),
+    ]).await;
 
     let stats = get_taqa_stats(&pool, "2025-05-01", "2025-05-31", true)
         .await
@@ -880,7 +958,7 @@ async fn taqa_bills_the_furthest_receipt_only() {
         ..Default::default()
     }
     .normalized();
-    let (rows, _) = list_trips(&pool, &filters, true).await.unwrap();
+    let (rows, _) = list_trips(&pool, &filters, 4).await.unwrap();
 
     let far = rows.iter().find(|r| r.receipt_no == "FAR").unwrap();
     let near = rows.iter().find(|r| r.receipt_no == "NEAR").unwrap();
