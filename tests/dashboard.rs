@@ -42,7 +42,7 @@ async fn db(name: &str) -> PgPool {
          UNION ALL
          SELECT 'split','out', 300, 'EGP', '2025-05-13T09:00:00Z'::timestamptz, 'Labor', id FROM parent;
 
-         -- An unpaid advance and a paid one; only the unpaid counts.
+         -- An advance in May and one in April; a May window sees only the first.
          INSERT INTO drivers (id, name) VALUES (901, 'سائق تجريبي');
          INSERT INTO loans (driver_id, amount, method, date, is_paid, kind)
          VALUES (901, 750, 'cash', '2025-05-01', false, 'advance'),
@@ -93,15 +93,23 @@ async fn the_payload_says_what_the_tables_say() {
     assert!(month["trips"].as_i64().unwrap() > 0);
     assert!(month["litres"].as_i64().unwrap() > 0);
 
-    // Cash out: 1000 + 250 + the split PARENT's 600 counted once via its
-    // children (300 Maintenance + 300 Labor) — never both layers, and never
-    // the out-of-window 9999.
+    // Cash out is everything that left in the window: the bank ledger — 1000
+    // + 250 + the split PARENT's 600 counted once via its children (300
+    // Maintenance + 300 Labor), never both layers, never the out-of-window
+    // 9999 — plus the advances issued in May (750; April's 400 is outside the
+    // window). No PetroApp fuel in the fixture.
     let money = &body["money"];
-    assert_eq!(money["cash_out"].as_str().unwrap(), "1850.0000");
+    assert_eq!(money["cash_out_bank"].as_str().unwrap(), "1850.00", "{money}");
+    assert_eq!(money["cash_out_fuel"].as_str().unwrap(), "0.00");
+    assert_eq!(money["cash_out_advances"].as_str().unwrap(), "750.00");
+    assert_eq!(money["cash_out"].as_str().unwrap(), "2600.00");
 
-    // Advances: only the unpaid row.
-    assert_eq!(money["advances_outstanding"].as_str().unwrap(), "750.00");
-    assert_eq!(money["advances_count"].as_i64().unwrap(), 1);
+    // Owed: advances issued in the window, whether or not marked paid
+    // (payroll recovers them outside this system).
+    let owed = &money["owed"];
+    assert_eq!(owed["driver_advances"].as_str().unwrap(), "750.00", "{owed}");
+    assert_eq!(owed["driver_advances_count"].as_i64().unwrap(), 1);
+    assert_eq!(owed["total"].as_str().unwrap(), "750.00");
 
     // Revenue is a decimal string and positive — the exact figure is pinned by
     // the revenue parity suite; here we only assert it arrived as money should.
@@ -188,7 +196,8 @@ async fn drawers_open_onto_real_detail() {
     assert!(!trips["companies"].as_array().unwrap().is_empty());
     assert!(!trips["daily"].as_array().unwrap().is_empty());
 
-    let adv = get_json!(app, 4, "/api/v1/dashboard/advances");
+    // The month's advances: May's 750, not April's 400.
+    let adv = get_json!(app, 4, "/api/v1/dashboard/advances?month=2025-05");
     let parties = adv["parties"].as_array().unwrap();
     assert_eq!(parties.len(), 1);
     assert_eq!(parties[0]["name"], "سائق تجريبي");
