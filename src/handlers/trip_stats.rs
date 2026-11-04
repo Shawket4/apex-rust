@@ -166,12 +166,30 @@ pub async fn get_trip_statistics(
 
     let car_totals = calculate_car_totals(&statistics);
 
+    // Drivers over the companies the car totals came from, so the Drivers and
+    // Cars tabs add up to the same figures.
+    let car_companies: Vec<String> = statistics
+        .iter()
+        .filter(|s| s.route_details.as_ref().is_some_and(|r| !r.is_empty()))
+        .map(|s| s.company.clone())
+        .collect();
+    let driver_totals = get_driver_totals(
+        pool.get_ref(),
+        &query.start_date,
+        &query.end_date,
+        &car_companies,
+        has_financial_access,
+    )
+    .await
+    .map_err(actix_web::error::ErrorInternalServerError)?;
+
     let response_data = TripStatisticsResponse {
         message: "Trip statistics retrieved successfully".to_string(),
         data: statistics,
         stats_by_date,
         has_financial_access,
         car_totals,
+        driver_totals,
     };
 
     response(&response_data, use_msgpack).map_err(actix_web::error::ErrorInternalServerError)

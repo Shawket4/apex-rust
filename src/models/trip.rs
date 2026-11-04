@@ -132,6 +132,19 @@ pub struct CarTotal {
     pub rent: f64,
 }
 
+/// [`CarTotal`] per driver: the same stored rows, grouped by the name recorded
+/// on the trip instead of the plate, so the two lists add up to the same
+/// figures. An empty `driver_name` collects the rows that recorded no driver.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct DriverTotal {
+    pub driver_name: String,
+    pub liters: f64,
+    pub distance: f64,
+    pub base_revenue: f64,
+    pub vat: f64,
+    pub rent: f64,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct TripStatisticsResponse {
     pub message: String,
@@ -142,4 +155,6 @@ pub struct TripStatisticsResponse {
     pub has_financial_access: bool,
     #[serde(rename = "carTotals")]
     pub car_totals: Vec<CarTotal>,
+    #[serde(rename = "driverTotals")]
+    pub driver_totals: Vec<DriverTotal>,
 }
