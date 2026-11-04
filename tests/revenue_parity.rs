@@ -439,7 +439,7 @@ async fn every_statistics_query_executes() {
     // already-fetched rows, and this test is about SQL reaching the database
     // intact.
     use apex::db::stats_queries::{
-        get_companies, get_route_details, get_stats_by_date, get_trip_counts,
+        get_companies, get_driver_totals, get_route_details, get_stats_by_date, get_trip_counts,
     };
 
     let pool = support::fresh_db("apex_all_queries").await;
@@ -480,6 +480,9 @@ async fn every_statistics_query_executes() {
         get_stats_by_date(&pool, FROM, TO, Some("Watanya"), financial)
             .await
             .unwrap_or_else(|e| panic!("stats by date, filtered (financial={financial}): {e}"));
+        get_driver_totals(&pool, FROM, TO, &companies, financial)
+            .await
+            .unwrap_or_else(|e| panic!("driver totals (financial={financial}): {e}"));
     }
 
 }
@@ -550,4 +553,93 @@ async fn prices_are_withheld_below_3() {
     // At 3 the per-km rate in force at the end of the range is shown.
     let taqa = get_route_details(&pool, "TAQA", FROM, TO, true).await.unwrap();
     assert_eq!(taqa[0].fee, Some(50.5));
+}
+
+/// The Drivers tab is the Cars tab's rows grouped by the trip's driver name:
+/// over the same window the two lists add up to the same liters, distance and
+/// money, and a driver's figures are the trips they drove whatever the car or
+/// company.
+///
+/// The fixture's rows carry no driver, so this names some: Ahmed drives PA-A
+/// for Petrol Arrows and TQ-A for TAQA in May (one spelling padded, to pin the
+/// trim), Karim drives TQ-A in June, and the Watanya container trip has its
+/// own driver. Everything else is left without one.
+#[tokio::test]
+async fn driver_totals_add_up_to_the_car_totals() {
+    use apex::db::stats_queries::{get_driver_totals, get_route_details};
+
+    let pool = support::fresh_db("apex_driver_totals").await;
+    seed(&pool).await;
+    sqlx::raw_sql(
+        r#"
+        UPDATE trips SET driver_name = 'Ahmed'    WHERE receipt_no IN ('PA1', 'PA2');
+        UPDATE trips SET driver_name = '  Ahmed ' WHERE car_no_plate = 'TQ-A' AND date LIKE '2025-05-%';
+        UPDATE trips SET driver_name = 'Karim'    WHERE car_no_plate = 'TQ-A' AND date LIKE '2025-06-%';
+        UPDATE trips SET driver_name = 'Container Driver' WHERE parent_trip_id = 9001;
+        "#,
+    )
+    .execute(&pool)
+    .await
+    .expect("name the drivers");
+
+    let companies: Vec<String> = ["Petrol Arrows", "Watanya", "TAQA", "Petromin"]
+        .map(String::from)
+        .to_vec();
+
+    let (mut liters, mut distance, mut base, mut vat, mut rent) = (0.0, 0.0, 0.0, 0.0, 0.0);
+    for company in &companies {
+        for route in get_route_details(&pool, company, FROM, TO, true).await.unwrap() {
+            for car in route.cars {
+                liters += car.total_volume;
+                distance += car.total_distance;
+                base += car.total_revenue.unwrap_or(0.0);
+                vat += car.vat.unwrap_or(0.0);
+                rent += car.car_rental.unwrap_or(0.0);
+            }
+        }
+    }
+
+    let drivers = get_driver_totals(&pool, FROM, TO, &companies, true).await.unwrap();
+    let sum = |f: fn(&apex::models::DriverTotal) -> f64| money(drivers.iter().map(f).sum());
+    assert_eq!(sum(|d| d.liters), money(liters), "liters");
+    assert_eq!(sum(|d| d.distance), money(distance), "distance");
+    assert_eq!(sum(|d| d.base_revenue), money(base), "base revenue");
+    assert_eq!(sum(|d| d.vat), money(vat), "vat");
+    assert_eq!(sum(|d| d.rent), money(rent), "rent");
+
+    let names: Vec<&str> = drivers.iter().map(|d| d.driver_name.as_str()).collect();
+    assert_eq!(names, ["", "Ahmed", "Container Driver", "Karim"], "one row per trimmed name");
+    let get = |name: &str| drivers.iter().find(|d| d.driver_name == name).unwrap();
+
+    // Two cars, two companies.
+    let ahmed = get("Ahmed");
+    assert_eq!(money(ahmed.liters), money(76_000.0 + 28.0 * 30_000.0));
+    assert_eq!(money(ahmed.distance), money(2.0 * 120.0 + 28.0 * 210.0));
+    assert_eq!(money(ahmed.base_revenue), money(2_318.0 + 28.0 * 10_605.0));
+    assert_eq!(money(ahmed.rent), money(43_000.0), "TQ-A's whole May");
+    assert!(ahmed.vat > 0.0);
+
+    // The same car in June is another driver's, rental and all.
+    let karim = get("Karim");
+    assert_eq!(money(karim.liters), money(3.0 * 30_000.0));
+    assert_eq!(money(karim.rent), money(4_607.142857));
+
+    // Three receipts, one journey.
+    let containers = get("Container Driver");
+    assert_eq!(money(containers.liters), money(30_000.0));
+    assert_eq!(money(containers.distance), money(100.0));
+
+    // Money is withheld below permission 3; the work is not.
+    let blind = get_driver_totals(&pool, FROM, TO, &companies, false).await.unwrap();
+    assert_eq!(blind.len(), drivers.len());
+    for d in &blind {
+        assert_eq!((d.base_revenue, d.vat, d.rent), (0.0, 0.0, 0.0), "money leaked for {:?}", d.driver_name);
+    }
+    assert_eq!(money(blind.iter().map(|d| d.liters).sum()), money(liters));
+
+    // A company filter narrows the drivers to it.
+    let taqa = get_driver_totals(&pool, FROM, TO, &["TAQA".to_string()], true).await.unwrap();
+    let names: Vec<&str> = taqa.iter().map(|d| d.driver_name.as_str()).collect();
+    assert_eq!(names, ["", "Ahmed", "Karim"]);
+    assert_eq!(get_driver_totals(&pool, FROM, TO, &[], true).await.unwrap().len(), 0);
 }

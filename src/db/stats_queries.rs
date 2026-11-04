@@ -791,6 +791,61 @@ pub fn calculate_car_totals(statistics: &[TripStatistics]) -> Vec<CarTotal> {
     car_totals_map.into_values().collect()
 }
 
+/// Per-driver totals over `companies`: the rows the car totals are built from,
+/// grouped by the driver name on the trip.
+///
+/// Callers pass the companies whose routes produced car totals, so the two
+/// lists cover the same rows and add up to the same liters, distance and money.
+/// Distance is the logical trip's furthest drop, once, as in the routes; the
+/// money is zero below permission 3, as the cars' is.
+pub async fn get_driver_totals(
+    pool: &PgPool,
+    start_date: &str,
+    end_date: &str,
+    companies: &[String],
+    has_financial_access: bool,
+) -> Result<Vec<DriverTotal>> {
+    if companies.is_empty() {
+        return Ok(vec![]);
+    }
+    let query = format!(
+        r#"
+        WITH {cte}
+        SELECT
+            TRIM(COALESCE(driver_name, ''))             AS driver_name,
+            COALESCE(SUM(tank_capacity), 0.0)::float8   AS liters,
+            COALESCE(SUM(trip_distance), 0.0)::float8   AS distance,
+            CASE WHEN $4 THEN COALESCE(SUM(revenue_base), 0.0) ELSE 0.0 END::float8     AS base_revenue,
+            CASE WHEN $4 THEN COALESCE(SUM(allocated_vat), 0.0) ELSE 0.0 END::float8    AS vat,
+            CASE WHEN $4 THEN COALESCE(SUM(allocated_rental), 0.0) ELSE 0.0 END::float8 AS rent
+        FROM revenue
+        GROUP BY 1
+        ORDER BY 1
+        "#,
+        cte = per_row_revenue_cte("t.company = ANY($3) AND t.date BETWEEN $1 AND $2"),
+    );
+
+    let rows = sqlx::query(&query)
+        .bind(start_date)
+        .bind(end_date)
+        .bind(companies)
+        .bind(has_financial_access)
+        .fetch_all(pool)
+        .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(|row| DriverTotal {
+            driver_name: row.get("driver_name"),
+            liters: row.get("liters"),
+            distance: row.get("distance"),
+            base_revenue: row.get("base_revenue"),
+            vat: row.get("vat"),
+            rent: row.get("rent"),
+        })
+        .collect())
+}
+
 /// Count logical trips and receipts for a company over a date range.
 ///
 /// Two numbers that are easy to conflate and are both wanted:
