@@ -132,12 +132,17 @@ pub struct CarTotal {
     pub rent: f64,
 }
 
-/// [`CarTotal`] per driver: the same stored rows, grouped by the name recorded
-/// on the trip instead of the plate, so the two lists add up to the same
-/// figures. An empty `driver_name` collects the rows that recorded no driver.
+/// [`CarTotal`] per driver: the same stored rows, grouped by driver instead of
+/// plate, so the two lists add up to the same figures. An empty `driver_name`
+/// collects the rows that recorded no driver.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct DriverTotal {
+    /// `None` for trips that recorded no driver ID and matched no driver by name.
+    pub driver_id: Option<i64>,
+    /// The driver's current name.
     pub driver_name: String,
+    /// Every other name this driver's trips recorded: earlier names, typos.
+    pub other_names: Vec<String>,
     pub liters: f64,
     pub distance: f64,
     pub base_revenue: f64,

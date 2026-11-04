@@ -555,15 +555,19 @@ async fn prices_are_withheld_below_3() {
     assert_eq!(taqa[0].fee, Some(50.5));
 }
 
-/// The Drivers tab is the Cars tab's rows grouped by the trip's driver name:
-/// over the same window the two lists add up to the same liters, distance and
-/// money, and a driver's figures are the trips they drove whatever the car or
-/// company.
+/// The Drivers tab is the Cars tab's rows grouped by driver: over the same
+/// window the two lists add up to the same liters, distance and money, and a
+/// driver's figures are the trips they drove whatever the car or company.
 ///
-/// The fixture's rows carry no driver, so this names some: Ahmed drives PA-A
-/// for Petrol Arrows and TQ-A for TAQA in May (one spelling padded, to pin the
-/// trim), Karim drives TQ-A in June, and the Watanya container trip has its
-/// own driver. Everything else is left without one.
+/// A driver is their ID. Driver 1 was renamed from "Ahmed" to "Ahmed Samir":
+/// PA-A's trips still carry the old name, TQ-A's May trips the new one
+/// (padded, to pin the trim), and PM-A's legacy trips carry no ID, only the
+/// old name, which only driver 1 has gone by. All of it is one row under the
+/// current name, the old one listed beside it. Driver 2 (Karim) drives TQ-A in
+/// June and PM-B without an ID. Driver 99 is no longer on file, so goes by the
+/// name of their latest trip. "Mona" is two drivers on file, so WA-A's trips,
+/// which carry the name and no ID, are not pinned on either. The Watanya
+/// container trip names someone with no ID at all.
 #[tokio::test]
 async fn driver_totals_add_up_to_the_car_totals() {
     use apex::db::stats_queries::{get_driver_totals, get_route_details};
@@ -572,9 +576,19 @@ async fn driver_totals_add_up_to_the_car_totals() {
     seed(&pool).await;
     sqlx::raw_sql(
         r#"
-        UPDATE trips SET driver_name = 'Ahmed'    WHERE receipt_no IN ('PA1', 'PA2');
-        UPDATE trips SET driver_name = '  Ahmed ' WHERE car_no_plate = 'TQ-A' AND date LIKE '2025-05-%';
-        UPDATE trips SET driver_name = 'Karim'    WHERE car_no_plate = 'TQ-A' AND date LIKE '2025-06-%';
+        INSERT INTO drivers (id, name) VALUES
+            (1, 'Ahmed Samir'), (2, 'Karim'), (3, 'Mona'), (4, 'Mona');
+        UPDATE trips SET driver_id = 1, driver_name = 'Ahmed'
+         WHERE receipt_no IN ('PA1', 'PA2');
+        UPDATE trips SET driver_id = 1, driver_name = '  Ahmed Samir '
+         WHERE car_no_plate = 'TQ-A' AND date LIKE '2025-05-%';
+        UPDATE trips SET driver_id = 0, driver_name = 'Ahmed' WHERE car_no_plate = 'PM-A';
+        UPDATE trips SET driver_id = 2, driver_name = 'Karim'
+         WHERE car_no_plate = 'TQ-A' AND date LIKE '2025-06-%';
+        UPDATE trips SET driver_name = 'Karim' WHERE car_no_plate = 'PM-B';
+        UPDATE trips SET driver_id = 99, driver_name = 'Old Name'   WHERE receipt_no = 'WA3';
+        UPDATE trips SET driver_id = 99, driver_name = 'Newer Name' WHERE receipt_no = 'WA4';
+        UPDATE trips SET driver_name = 'Mona' WHERE car_no_plate = 'WA-A';
         UPDATE trips SET driver_name = 'Container Driver' WHERE parent_trip_id = 9001;
         "#,
     )
@@ -607,22 +621,41 @@ async fn driver_totals_add_up_to_the_car_totals() {
     assert_eq!(sum(|d| d.vat), money(vat), "vat");
     assert_eq!(sum(|d| d.rent), money(rent), "rent");
 
-    let names: Vec<&str> = drivers.iter().map(|d| d.driver_name.as_str()).collect();
-    assert_eq!(names, ["", "Ahmed", "Container Driver", "Karim"], "one row per trimmed name");
+    let rows: Vec<(Option<i64>, &str, Vec<&str>)> = drivers
+        .iter()
+        .map(|d| {
+            (d.driver_id, d.driver_name.as_str(), d.other_names.iter().map(String::as_str).collect())
+        })
+        .collect();
+    assert_eq!(
+        rows,
+        [
+            (None, "", vec![]),
+            (Some(1), "Ahmed Samir", vec!["Ahmed"]),
+            (None, "Container Driver", vec![]),
+            (Some(2), "Karim", vec![]),
+            (None, "Mona", vec![]),
+            (Some(99), "Newer Name", vec!["Old Name"]),
+        ],
+        "one row per driver ID, under the current name"
+    );
     let get = |name: &str| drivers.iter().find(|d| d.driver_name == name).unwrap();
 
-    // Two cars, two companies.
-    let ahmed = get("Ahmed");
-    assert_eq!(money(ahmed.liters), money(76_000.0 + 28.0 * 30_000.0));
-    assert_eq!(money(ahmed.distance), money(2.0 * 120.0 + 28.0 * 210.0));
-    assert_eq!(money(ahmed.base_revenue), money(2_318.0 + 28.0 * 10_605.0));
-    assert_eq!(money(ahmed.rent), money(43_000.0), "TQ-A's whole May");
+    // Old name, new name and no ID: two cars, three companies, one driver.
+    let ahmed = get("Ahmed Samir");
+    assert_eq!(money(ahmed.liters), money(76_000.0 + 28.0 * 30_000.0 + 3.0 * 20_000.0));
+    assert_eq!(money(ahmed.distance), money(2.0 * 120.0 + 28.0 * 210.0 + 3.0 * 180.0));
+    assert_eq!(money(ahmed.base_revenue), money(2_318.0 + 28.0 * 10_605.0 + 3.0 * 7_650.0));
+    assert_eq!(money(ahmed.rent), money(43_000.0 + 4_000.0), "TQ-A's whole May, PM-A's two days");
     assert!(ahmed.vat > 0.0);
 
     // The same car in June is another driver's, rental and all.
     let karim = get("Karim");
-    assert_eq!(money(karim.liters), money(3.0 * 30_000.0));
-    assert_eq!(money(karim.rent), money(4_607.142857));
+    assert_eq!(money(karim.liters), money(3.0 * 30_000.0 + 20_000.0));
+    assert_eq!(money(karim.rent), money(4_607.142857 + 2_000.0));
+
+    assert_eq!(money(get("Newer Name").liters), money(60_000.0));
+    assert_eq!(money(get("Mona").liters), money(80_000.0));
 
     // Three receipts, one journey.
     let containers = get("Container Driver");
@@ -640,6 +673,6 @@ async fn driver_totals_add_up_to_the_car_totals() {
     // A company filter narrows the drivers to it.
     let taqa = get_driver_totals(&pool, FROM, TO, &["TAQA".to_string()], true).await.unwrap();
     let names: Vec<&str> = taqa.iter().map(|d| d.driver_name.as_str()).collect();
-    assert_eq!(names, ["", "Ahmed", "Karim"]);
+    assert_eq!(names, ["", "Ahmed Samir", "Karim"]);
     assert_eq!(get_driver_totals(&pool, FROM, TO, &[], true).await.unwrap().len(), 0);
 }

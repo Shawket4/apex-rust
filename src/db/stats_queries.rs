@@ -792,7 +792,14 @@ pub fn calculate_car_totals(statistics: &[TripStatistics]) -> Vec<CarTotal> {
 }
 
 /// Per-driver totals over `companies`: the rows the car totals are built from,
-/// grouped by the driver name on the trip.
+/// grouped by driver.
+///
+/// A driver is their ID, not the name on the trip, so a renamed driver is one
+/// row under their current name (`drivers.name`), with every other name their
+/// trips recorded in `other_names`. A trip without an ID joins the driver whose
+/// current or recorded names include its own, when exactly one does; otherwise
+/// it is grouped by its name, and trips that name nobody share the row with an
+/// empty name.
 ///
 /// Callers pass the companies whose routes produced car totals, so the two
 /// lists cover the same rows and add up to the same liters, distance and money.
@@ -810,17 +817,50 @@ pub async fn get_driver_totals(
     }
     let query = format!(
         r#"
-        WITH {cte}
+        WITH {cte},
+        -- Every name a driver ID goes by: the current one and each one its
+        -- trips recorded, over all time.
+        known_names AS (
+            SELECT d.id::bigint AS driver_id, TRIM(d.name) AS name
+              FROM drivers d
+             WHERE TRIM(COALESCE(d.name, '')) <> ''
+            UNION
+            SELECT k.driver_id::bigint, TRIM(k.driver_name)
+              FROM trips k
+             WHERE k.deleted_at IS NULL AND k.driver_id > 0
+               AND TRIM(COALESCE(k.driver_name, '')) <> ''
+        ),
+        unique_names AS (
+            SELECT name, MIN(driver_id) AS driver_id
+              FROM known_names
+             GROUP BY name
+            HAVING COUNT(DISTINCT driver_id) = 1
+        ),
+        keyed AS (
+            SELECT r.*,
+                   TRIM(COALESCE(r.driver_name, '')) AS trip_driver,
+                   COALESCE(NULLIF(r.driver_id, 0)::bigint, u.driver_id) AS resolved_id
+              FROM revenue r
+              LEFT JOIN unique_names u
+                ON COALESCE(r.driver_id, 0) = 0
+               AND u.name = TRIM(COALESCE(r.driver_name, ''))
+        )
         SELECT
-            TRIM(COALESCE(driver_name, ''))             AS driver_name,
-            COALESCE(SUM(tank_capacity), 0.0)::float8   AS liters,
-            COALESCE(SUM(trip_distance), 0.0)::float8   AS distance,
-            CASE WHEN $4 THEN COALESCE(SUM(revenue_base), 0.0) ELSE 0.0 END::float8     AS base_revenue,
-            CASE WHEN $4 THEN COALESCE(SUM(allocated_vat), 0.0) ELSE 0.0 END::float8    AS vat,
-            CASE WHEN $4 THEN COALESCE(SUM(allocated_rental), 0.0) ELSE 0.0 END::float8 AS rent
-        FROM revenue
-        GROUP BY 1
-        ORDER BY 1
+            k.resolved_id                                AS driver_id,
+            CASE WHEN k.resolved_id IS NULL THEN k.trip_driver ELSE '' END AS loose_name,
+            MAX(TRIM(d.name))                            AS current_name,
+            (ARRAY_AGG(k.trip_driver ORDER BY k.date DESC, k.id DESC)
+                FILTER (WHERE k.trip_driver <> ''))[1]   AS latest_name,
+            COALESCE(ARRAY_AGG(DISTINCT k.trip_driver)
+                FILTER (WHERE k.trip_driver <> ''), '{{}}') AS names,
+            COALESCE(SUM(k.tank_capacity), 0.0)::float8  AS liters,
+            COALESCE(SUM(k.trip_distance), 0.0)::float8  AS distance,
+            CASE WHEN $4 THEN COALESCE(SUM(k.revenue_base), 0.0) ELSE 0.0 END::float8     AS base_revenue,
+            CASE WHEN $4 THEN COALESCE(SUM(k.allocated_vat), 0.0) ELSE 0.0 END::float8    AS vat,
+            CASE WHEN $4 THEN COALESCE(SUM(k.allocated_rental), 0.0) ELSE 0.0 END::float8 AS rent
+        FROM keyed k
+        LEFT JOIN drivers d ON d.id = k.resolved_id
+        GROUP BY 1, 2
         "#,
         cte = per_row_revenue_cte("t.company = ANY($3) AND t.date BETWEEN $1 AND $2"),
     );
@@ -833,17 +873,35 @@ pub async fn get_driver_totals(
         .fetch_all(pool)
         .await?;
 
-    Ok(rows
+    let mut drivers: Vec<DriverTotal> = rows
         .into_iter()
-        .map(|row| DriverTotal {
-            driver_name: row.get("driver_name"),
-            liters: row.get("liters"),
-            distance: row.get("distance"),
-            base_revenue: row.get("base_revenue"),
-            vat: row.get("vat"),
-            rent: row.get("rent"),
+        .map(|row| {
+            let current: Option<String> = row.get("current_name");
+            let latest: Option<String> = row.get("latest_name");
+            let loose: String = row.get("loose_name");
+            // The driver's name now; a driver no longer on file goes by the
+            // name their latest trip recorded.
+            let driver_name = current
+                .filter(|n| !n.is_empty())
+                .or(latest)
+                .unwrap_or(loose);
+            let mut other_names: Vec<String> = row.get("names");
+            other_names.retain(|n| *n != driver_name);
+            other_names.sort();
+            DriverTotal {
+                driver_id: row.get("driver_id"),
+                driver_name,
+                other_names,
+                liters: row.get("liters"),
+                distance: row.get("distance"),
+                base_revenue: row.get("base_revenue"),
+                vat: row.get("vat"),
+                rent: row.get("rent"),
+            }
         })
-        .collect())
+        .collect();
+    drivers.sort_by(|a, b| a.driver_name.cmp(&b.driver_name).then(a.driver_id.cmp(&b.driver_id)));
+    Ok(drivers)
 }
 
 /// Count logical trips and receipts for a company over a date range.
