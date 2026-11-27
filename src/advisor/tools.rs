@@ -721,7 +721,7 @@ async fn route_options(ctx: &ToolCtx<'_>, args: &Value) -> ToolResult {
     let here = live.map(|(p, _)| p);
 
     // Empty km to each terminal, once per terminal; road distance for the
-    // nearest few when OSRM is configured, straight-line otherwise.
+    // nearest few when routing is configured, straight-line otherwise.
     let mut terminals: Vec<(String, Option<(f64, f64)>)> = Vec::new();
     for r in &routes {
         if !terminals.iter().any(|(n, _)| n == &r.terminal) {
@@ -737,7 +737,7 @@ async fn route_options(ctx: &ToolCtx<'_>, args: &Value) -> ToolResult {
         by_air.sort_by(|a, b| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal));
         for (idx, (name, pos, air)) in by_air.into_iter().enumerate() {
             let road = if idx < 6 {
-                upstream::osrm_route(&ctx.adv.http, &ctx.adv.cfg, here, pos).await
+                upstream::road_route(&ctx.adv.http, &ctx.adv.cfg, here, pos).await
             } else {
                 None
             };

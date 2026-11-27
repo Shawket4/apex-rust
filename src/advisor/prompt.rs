@@ -142,7 +142,8 @@ rate_per_1000l (EGP per 1,000 L).
 - parent_trips (a truck's run, 1-4 trips): car_id, driver_id, company, terminal, \
 terminal_id, date (text), author, overwriter.
 - fee_mappings: company, terminal, terminal_id, drop_off_point, distance (km), fee (meaning \
-differs per company), osrm_distance, osrm_duration. Coordinates are NOT here.
+differs per company), osrm_distance, osrm_duration (the truck road route, km and minutes; \
+legacy column names). Coordinates are NOT here.
 - terminals: name, address, latitude, longitude, radius_m, pin_source. terminal_companies: \
 terminal_id, company. drop_off_points: name, latitude, longitude, radius_m, pin_source.
 - fuel_events: car_id, car_no_plate, date (text), time, liters, price_per_liter, price, \
