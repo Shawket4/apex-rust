@@ -39,7 +39,7 @@ pub struct AdvisorConfig {
     pub falcon_api_url: String,
     /// etit-proxy root (its routes are under `/api/v1`).
     pub etit_proxy_url: String,
-    /// etit-proxy's `X-Admin-Token`, for OSRM routing. Optional: without it
+    /// etit-proxy's `X-Admin-Token`, for truck routing. Optional: without it
     /// route estimates fall back to straight-line distance.
     pub etit_admin_token: Option<String>,
     /// maint-rust root, including `/api/maint`.

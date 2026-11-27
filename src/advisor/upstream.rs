@@ -50,10 +50,12 @@ pub async fn etit_get(
     read_json(resp, "etit-proxy").await
 }
 
-/// Road distance and time between two points through etit-proxy's OSRM.
-/// `None` when the admin token is not configured or routing failed — the
-/// caller falls back to straight-line distance.
-pub async fn osrm_route(
+/// Truck road distance and time between two points, for a truck leaving now,
+/// through etit-proxy (Valhalla: tanker size, weight and hazmat, and the
+/// time-of-day bans as they stand at this moment). `None` when the admin token
+/// is not configured or routing failed; the caller falls back to
+/// straight-line distance.
+pub async fn road_route(
     http: &reqwest::Client,
     cfg: &AdvisorConfig,
     from: (f64, f64),
@@ -66,12 +68,12 @@ pub async fn osrm_route(
         .json(&json!({
             "from_lat": from.0, "from_lng": from.1,
             "to_lat": to.0, "to_lng": to.1,
-            "restricted": true,
+            "restricted": false,
         }))
         .send()
         .await
         .ok()?;
-    let v = read_json(resp, "osrm").await.ok()?;
+    let v = read_json(resp, "routing").await.ok()?;
     Some((v.get("distanceKm")?.as_f64()?, v.get("durationMin")?.as_f64()?))
 }
 
